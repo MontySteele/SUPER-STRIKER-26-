@@ -131,6 +131,8 @@
   animation: replayBlink 1.1s steps(2) infinite;
 }
 .replay-on .replay-bug { display: block; }
+/* replays show recorded footage — live-position nameplates would detach */
+.replay-on .nameplate { display: none !important; }
 @keyframes replayBlink { 50% { opacity: 0.55; } }
 
 /* ---------- goal banner ---------- */
@@ -285,7 +287,8 @@
   grid-template-columns: repeat(6, 172px);
   gap: 8px;
   max-height: 62vh;
-  overflow-y: auto;
+  max-width: 96vw; /* small windows: scroll, don't strand cells off-screen */
+  overflow: auto;
   padding: 6px;
 }
 .team-cell {

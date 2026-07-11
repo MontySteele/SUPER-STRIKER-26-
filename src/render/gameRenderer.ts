@@ -199,7 +199,10 @@ export class GameRenderer {
     } else {
       if (this.replayBuf.length < 1.5 * REPLAY_FPS) return false;
       this.manualReplay = true;
-      this.beginPasses(this.replayBuf.slice(), [{ mode: 'cine', rate: 0.5, from: 0 }]);
+      // last ~4.5s at 0.6x ≈ 7.5s of wall clock — long enough to relive the
+      // moment, short enough that a frozen match doesn't feel hung
+      this.beginPasses(this.replayBuf.slice(-Math.floor(4.5 * REPLAY_FPS)),
+        [{ mode: 'cine', rate: 0.6, from: 0 }]);
     }
     return true;
   }

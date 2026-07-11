@@ -3,6 +3,7 @@
 // is simulated the moment you move on.
 
 import { findTeam } from '../data/loader';
+import { esc } from './escape';
 import type { Fixture, Stage, Tournament } from '../sim/tournament';
 
 const STAGE_LABEL: Record<string, string> = {
@@ -83,7 +84,7 @@ export class TournamentUI {
     const top = this.tournament.topScorers(n);
     if (!top.length) return '';
     const items = top.map((s) =>
-      `${s.name.split(' ').pop()?.toUpperCase()} <small>(${this.code(s.teamId)})</small> ${s.goals}`,
+      `${esc(s.name.split(' ').pop()?.toUpperCase() ?? '')} <small>(${this.code(s.teamId)})</small> ${s.goals}`,
     ).join(' · ');
     return `<div class="tour-note boot">👟 GOLDEN BOOT — ${items}</div>`;
   }
@@ -196,7 +197,7 @@ export class TournamentUI {
     const mine = champ && champ.id === t.state.playerTeamId;
     const boot = t.topScorers(1)[0];
     const bootLine = boot
-      ? `<div class="champ-boot">👟 GOLDEN BOOT: ${boot.name.toUpperCase()} (${this.code(boot.teamId)}) — ${boot.goals} GOALS</div>`
+      ? `<div class="champ-boot">👟 GOLDEN BOOT: ${esc(boot.name.toUpperCase())} (${this.code(boot.teamId)}) — ${boot.goals} GOALS</div>`
       : '';
     this.root.innerHTML = `
       <div class="menu-screen">

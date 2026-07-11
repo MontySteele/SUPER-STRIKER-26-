@@ -212,10 +212,16 @@ function startAttract(): void {
   });
   attractRenderer = new GameRenderer(canvas, attractMatch,
     Math.random() < 0.5 ? 'night' : 'sunset', Math.random() < 0.5 ? 'national' : 'mega');
+  // the renderer needs the events or attract goals are 12s of statues —
+  // wired, they get the full celebration + two-angle replay show
+  const m = attractMatch, r = attractRenderer;
+  m.events.on((e) => r.onEvent(e));
   attractLast = performance.now();
   attractAcc = 0;
   attractRaf = requestAnimationFrame(attractLoop);
-  (window as unknown as Record<string, unknown>).__ss26Attract = { match: attractMatch };
+  (window as unknown as Record<string, unknown>).__ss26Attract = {
+    match: attractMatch, renderer: attractRenderer,
+  };
 }
 
 function stopAttract(): void {

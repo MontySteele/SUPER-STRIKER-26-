@@ -6,6 +6,7 @@ import type { Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
 import { overall } from '../data/loader';
+import { esc } from './escape';
 import type { TeamData } from '../data/types';
 
 /** One line of the match story shown on break/full-time cards. */
@@ -113,7 +114,7 @@ export class HUD {
         .reduce((a, b) => (b.star || (!a.star && overall(b) > overall(a)) ? b : a));
       return `<div class="pm-side">
         <div class="pm-team" style="border-color:${t.kit.home}">${t.name.toUpperCase()}</div>
-        <div class="pm-info">${t.style.toUpperCase()} · ${t.formation} · ★ ${star.name.split(' ').pop()?.toUpperCase()}</div>
+        <div class="pm-info">${t.style.toUpperCase()} · ${t.formation} · ★ ${esc(star.name.split(' ').pop()?.toUpperCase() ?? '')}</div>
       </div>`;
     };
     const mid = this.match.mode === 'golden'
@@ -282,7 +283,7 @@ export class HUD {
       : s.icon === 'yellow' ? '<span class="st-card y"></span>'
       : '<span class="st-card r"></span>';
     const rows = this.story.map((s) => {
-      const surname = s.name.split(' ').pop()?.toUpperCase() ?? '';
+      const surname = esc(s.name.split(' ').pop()?.toUpperCase() ?? '');
       const og = s.icon === 'og' ? ' <small>(OG)</small>' : '';
       const body = `${icon(s)} ${s.minute}' ${surname}${og}`;
       return `<div class="story-row ${s.teamIdx === 0 ? 'home' : 'away'}">${body}</div>`;

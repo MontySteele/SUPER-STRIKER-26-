@@ -49,7 +49,9 @@ export function updateDefender(
       // tackle radius, so a parked carrier could otherwise never be robbed)
       const target = containTarget(match, team, 1.4);
       const looseTouch = !carrier || dist2({ x: ball.x, y: ball.y }, carrier.pos) > 1.5;
-      const carrierIdle = !!carrier && len2(carrier.vel) < 1.5;
+      // 0.6: truly parked. Higher thresholds also caught sharp turns, traps
+      // and shot-charging humans, who'd get robbed mid-windup.
+      const carrierIdle = !!carrier && len2(carrier.vel) < 0.6;
       p.moveToward(looseTouch || carrierIdle ? { x: ball.x, y: ball.y } : target, 1, false);
     }
   } else {

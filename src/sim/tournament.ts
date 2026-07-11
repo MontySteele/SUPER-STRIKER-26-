@@ -58,6 +58,9 @@ interface SaveState {
   champion?: string;
   /** Golden Boot tally, keyed "teamId|playerName". */
   scorers?: Record<string, number>;
+  /** Team ratings frozen at creation — roster edits mid-run must not
+   *  retroactively reshuffle tiebreaks vs the already-seeded bracket. */
+  ratings?: Record<string, number>;
 }
 
 const LS_KEY = 'ss26.tournament';
@@ -70,8 +73,19 @@ export class Tournament {
   private constructor(state: SaveState) {
     this.state = state;
     this.state.scorers ??= {}; // saves from before the Golden Boot existed
+    this.state.ratings ??= Object.fromEntries(TEAMS.map((t) => [t.id, teamRating(t)]));
     this.rng = new RNG(state.seed ^ 0x5eed);
   }
+
+  private ratingOf(id: string): number {
+    return this.state.ratings?.[id] ?? teamRating(findTeam(id));
+  }
+
+  /** pts → GD → GF → frozen team rating → id as a stable last resort. */
+  private cmp = (a: Standing, b: Standing): number =>
+    b.pts - a.pts || (b.gf - b.ga) - (a.gf - a.ga) || b.gf - a.gf
+    || this.ratingOf(b.teamId) - this.ratingOf(a.teamId)
+    || a.teamId.localeCompare(b.teamId);
 
   static create(playerTeamId: string, difficulty: DifficultyName, halfLengthSec: number, seed: number): Tournament {
     const t = new Tournament({
@@ -296,12 +310,12 @@ export class Tournament {
         else { h.drawn++; aw.drawn++; h.pts++; aw.pts++; }
       }
     }
-    return [...table.values()].sort(cmpStanding);
+    return [...table.values()].sort(this.cmp);
   }
 
   /** The 12 third-placed teams ranked; first 8 qualify. */
   thirdTable(): Standing[] {
-    return GROUP_NAMES.map((g) => this.groupTable(g)[2]).sort(cmpStanding);
+    return GROUP_NAMES.map((g) => this.groupTable(g)[2]).sort(this.cmp);
   }
 
   winnerOf(r: Result): string {
@@ -348,8 +362,8 @@ export class Tournament {
     const runners = GROUP_NAMES.map((g) => this.groupTable(g)[1]);
     const thirds = this.thirdTable().slice(0, 8);
     const seeds = [
-      ...winners.sort(cmpStanding),
-      ...runners.sort(cmpStanding),
+      ...winners.sort(this.cmp),
+      ...runners.sort(this.cmp),
       ...thirds,
     ].map((s) => s.teamId);
     // standard serpentine: seed k vs seed 31-k, laid out so 1 and 2 can only
@@ -361,14 +375,6 @@ export class Tournament {
     }
     this.state.rounds.r32 = round;
   }
-}
-
-function cmpStanding(a: Standing, b: Standing): number {
-  // pts → GD → GF → team rating (better squad edges the tiebreak, which beats
-  // rewarding an alphabetically early id) → id as a stable last resort
-  return b.pts - a.pts || (b.gf - b.ga) - (a.gf - a.ga) || b.gf - a.gf
-    || teamRating(findTeam(b.teamId)) - teamRating(findTeam(a.teamId))
-    || a.teamId.localeCompare(b.teamId);
 }
 
 /** Positions of seeds 0..n-1 down the bracket so 0 and 1 land in opposite halves. */

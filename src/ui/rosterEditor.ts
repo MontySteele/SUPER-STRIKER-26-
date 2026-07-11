@@ -5,6 +5,7 @@
 
 import { TEAMS, overall, teamRating } from '../data/loader';
 import { factoryPlayers, resetTeamRoster, sanitizePlayer, saveTeamRoster, teamEdited } from '../data/roster';
+import { esc } from './escape';
 import type { PlayerData, TeamData } from '../data/types';
 
 const STAT_COLS: [keyof PlayerData, string][] = [
@@ -83,7 +84,7 @@ export class RosterEditor {
           data-row="${i}" data-field="${String(key)}" value="${p[key] as number}"></td>`).join('');
       return `<tr>
         <td><input class="ros-in num" type="number" min="1" max="99" data-row="${i}" data-field="num" value="${p.num}"></td>
-        <td class="tname"><input class="ros-in name" type="text" maxlength="24" data-row="${i}" data-field="name" value="${p.name.replace(/"/g, '&quot;')}"></td>
+        <td class="tname"><input class="ros-in name" type="text" maxlength="24" data-row="${i}" data-field="name" value="${esc(p.name)}"></td>
         <td>${p.pos}</td>
         ${stats}
         <td><button class="ros-star${p.star ? ' on' : ''}" data-row="${i}" title="star player: +10 to everything">★</button></td>

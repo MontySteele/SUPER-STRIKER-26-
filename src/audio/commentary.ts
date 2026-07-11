@@ -28,6 +28,7 @@ export class Commentary {
   private supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
   private voice: SpeechSynthesisVoice | null = null;
   private currentPriority: Priority = 0;
+  private current: SpeechSynthesisUtterance | null = null;
   private lastLowAt = -1e9;
 
   constructor() {
@@ -46,6 +47,7 @@ export class Commentary {
   stop(): void {
     if (this.supported) window.speechSynthesis.cancel();
     this.currentPriority = 0;
+    this.current = null;
   }
 
   private pickVoice(): void {
@@ -78,8 +80,15 @@ export class Commentary {
     u.rate = 1.12;
     u.pitch = 1.0;
     u.volume = 1.0;
-    u.onend = () => { this.currentPriority = 0; };
-    u.onerror = () => { this.currentPriority = 0; };
+    // a cancelled utterance's onend fires AFTER the replacement started —
+    // only the live utterance may release the priority, or chatter can
+    // interrupt a goal call
+    this.current = u;
+    const release = (): void => {
+      if (this.current === u) { this.currentPriority = 0; this.current = null; }
+    };
+    u.onend = release;
+    u.onerror = release;
     synth.speak(u);
   }
 

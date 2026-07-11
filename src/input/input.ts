@@ -87,7 +87,15 @@ export class InputHub {
   onAnyButton: (() => void) | null = null;
 
   constructor() {
+    // typing in a text field (roster editor) must never be swallowed by the
+    // game bindings — WASD/JKLI/Space are half the alphabet's best letters
+    const typing = (e: KeyboardEvent): boolean => {
+      const t = e.target;
+      return t instanceof HTMLElement
+        && (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t.isContentEditable);
+    };
     window.addEventListener('keydown', (e) => {
+      if (typing(e)) return;
       const mapped = KEY_MAP[e.code];
       if (mapped) e.preventDefault();
       if (this.keys.has(e.code)) return;
@@ -97,6 +105,7 @@ export class InputHub {
       this.onAnyButton?.();
     });
     window.addEventListener('keyup', (e) => {
+      if (typing(e)) return;
       this.keys.delete(e.code);
       const mapped = KEY_MAP[e.code];
       if (mapped === 'sprint') this.keyboard.sprintHeld = false;
