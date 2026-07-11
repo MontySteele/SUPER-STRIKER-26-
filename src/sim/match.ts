@@ -99,6 +99,8 @@ export class Match {
 
   possessionTeam = 0;
   controlled: [PlayerEntity | null, PlayerEntity | null] = [null, null];
+  /** Every goal of the match, in order — feeds the tournament Golden Boot. */
+  goalLog: { teamIdx: number; scorerName: string; ownGoal: boolean; minute: number }[] = [];
 
   private cpuDecisionTimers = [0, 0];
   /** Seconds of possession without reaching the final third (per team). */
@@ -858,10 +860,10 @@ export class Match {
     this.ball.owner = null;
     scorer.playAnim('celebrate', 2.5);
     this.keepers[1 - scoringTeam].keeper.playAnim('dejected', 2.5);
+    const scorerName = ownGoal ? lt!.data.name : scorer.data.name;
+    this.goalLog.push({ teamIdx: scoringTeam, scorerName, ownGoal, minute: this.displayMinute() });
     this.events.emit({
-      type: 'goal', teamIdx: scoringTeam,
-      scorerName: ownGoal ? lt!.data.name : scorer.data.name,
-      ownGoal,
+      type: 'goal', teamIdx: scoringTeam, scorerName, ownGoal,
       minute: this.displayMinute(),
     });
   }

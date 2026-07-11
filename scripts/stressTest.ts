@@ -218,6 +218,15 @@ for (const seed of [1111, 2222, 3333, 4444]) {
   if (t.state.stage !== 'done' || !t.state.champion) { fail(`tournament stuck (seed ${seed}, stage ${t.state.stage})`); continue; }
   const r32 = t.state.rounds.r32 ?? [];
   if (new Set(r32).size !== 32) fail(`r32 not 32 unique (seed ${seed})`);
+  // golden boot: a full 104-match tournament must produce scorers, and the
+  // tally must equal the goals actually recorded in results
+  const boot = t.topScorers(1)[0];
+  if (!boot) fail(`no golden boot scorer (seed ${seed})`);
+  else if (boot.goals < 2 || boot.goals > 30) fail(`odd top scorer tally ${boot.goals} (seed ${seed})`);
+  const totalGoals = Object.values(t.state.results).flat()
+    .reduce((s, r) => s + r.homeGoals + r.awayGoals, 0);
+  const credited = Object.values(t.state.scorers ?? {}).reduce((s, n) => s + n, 0);
+  if (credited !== totalGoals) fail(`boot tally ${credited} != goals ${totalGoals} (seed ${seed})`);
   // knockout rounds shrink correctly and the champion appeared in every round he played
   for (const [stage, n] of [['r16', 16], ['qf', 8], ['sf', 4], ['final', 2]] as [keyof typeof t.state.rounds, number][]) {
     const round = t.state.rounds[stage] ?? [];

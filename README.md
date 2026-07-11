@@ -61,7 +61,8 @@ link. Notes:
 | Pause / quit | **Esc** (pad: Start) |
 
 Gamepads are auto-detected (standard mapping: LS move, A pass, B loft, X shoot,
-Y through, RT sprint, LB switch, Back replay, Start pause). Menus: WASD + J
+Y through, RT sprint, LB switch, Back replay, Start pause) — with **rumble**:
+kicks, tackles, the post, and goals all speak through the pad. Menus: WASD + J
 confirm, K back. On the full-time card, **L** replays the last goal.
 
 ## Modes
@@ -72,7 +73,10 @@ confirm, K back. On the full-time card, **L** replays the last goal.
 - **Tournament** — the full 48-team format: 12 groups of 4, top two + 8 best
   third-placers into a 32-team knockout. Group tables and a broadcast-style
   bracket; every other match is simulated from team ratings. Knockout draws go
-  to extra time, then penalties. Progress auto-saves to localStorage.
+  to extra time, then penalties. A **Golden Boot** race tracks every scorer in
+  the tournament — your goals count under their real scorers, simulated ones
+  are attributed by position and star quality. Progress auto-saves to
+  localStorage.
 - **Golden Goal** — party mode: no clock, next goal wins, winner takes the
   bragging rights. 2P when a gamepad is plugged in, otherwise you vs the CPU.
 - **Penalty Shootout** — straight to the spot. Aim with the stick (the reticle
@@ -106,7 +110,9 @@ confirm, K back. On the full-time card, **L** replays the last goal.
   (**R**) of the last six seconds, half-time / full-time cards with a match
   story timeline (goals and cards on a minute line) plus possession, shots,
   corners and fouls, a pre-match TACTICS strip naming each side's style and
-  star man, a glossy score bug, and an always-correct ticker.
+  star man, a glossy score bug, and an always-correct ticker. And from the
+  moment it loads, an **attract mode**: a live CPU-vs-CPU match plays behind
+  the menus, arcade-classic style.
 - **The voice:** real speech-synthesis commentary (browser SpeechSynthesis —
   still zero assets) calling goals by name, saves, cards, penalties and the
   final whistle, with priority rules so the big calls interrupt the small

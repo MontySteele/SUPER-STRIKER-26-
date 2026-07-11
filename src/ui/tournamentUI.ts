@@ -78,6 +78,16 @@ export class TournamentUI {
   private code(id: string): string { return findTeam(id).code; }
   private kit(id: string): string { return findTeam(id).kit.home; }
 
+  /** One-line Golden Boot strip (top scorers so far). */
+  private goldenBootHtml(n = 4): string {
+    const top = this.tournament.topScorers(n);
+    if (!top.length) return '';
+    const items = top.map((s) =>
+      `${s.name.split(' ').pop()?.toUpperCase()} <small>(${this.code(s.teamId)})</small> ${s.goals}`,
+    ).join(' · ');
+    return `<div class="tour-note boot">👟 GOLDEN BOOT — ${items}</div>`;
+  }
+
   private renderGroups(): void {
     const t = this.tournament;
     const me = t.state.playerTeamId;
@@ -99,6 +109,7 @@ export class TournamentUI {
     this.root.innerHTML = `
       <div class="menu-screen tour-screen">
         ${this.header(STAGE_LABEL[t.state.stage], action)}
+        ${this.goldenBootHtml()}
         <div class="tour-main">
           <div class="tour-left">
             <div class="tour-sub">GROUP ${myGroup} — YOUR GROUP</div>
@@ -173,6 +184,7 @@ export class TournamentUI {
       <div class="menu-screen tour-screen">
         ${this.header(STAGE_LABEL[t.state.stage], action)}
         ${t.playerAlive() ? '' : '<div class="tour-note out">YOU ARE OUT — but the show goes on. Sim to the final.</div>'}
+        ${this.goldenBootHtml()}
         <div class="bracket">${cols}</div>
       </div>`;
     this.wire();
@@ -182,12 +194,17 @@ export class TournamentUI {
     const t = this.tournament;
     const champ = t.state.champion ? findTeam(t.state.champion) : null;
     const mine = champ && champ.id === t.state.playerTeamId;
+    const boot = t.topScorers(1)[0];
+    const bootLine = boot
+      ? `<div class="champ-boot">👟 GOLDEN BOOT: ${boot.name.toUpperCase()} (${this.code(boot.teamId)}) — ${boot.goals} GOALS</div>`
+      : '';
     this.root.innerHTML = `
       <div class="menu-screen">
         <div class="menu-h2">WORLD CHAMPIONS</div>
         <div class="champ-card">
           <div class="champ-trophy">🏆</div>
           <div class="champ-name" style="color:${champ?.kit.home ?? '#ffce4a'}">${champ?.name.toUpperCase() ?? '—'}</div>
+          ${bootLine}
           ${mine ? '<div class="champ-you">THAT\'S YOU. TELL YOUR FRIEND.</div>' : ''}
         </div>
         <div class="tour-actions">

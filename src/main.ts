@@ -5,7 +5,8 @@ import './ui/ui.css';
 import { InputHub, type PlayerInput } from './input/input';
 import { Match, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
-import { findTeam } from './data/loader';
+import { TEAMS, findTeam } from './data/loader';
+import type { MatchEvent } from './sim/matchEvents';
 import { GameRenderer } from './render/gameRenderer';
 import type { TimeOfDay } from './render/scene';
 import type { StadiumSize } from './render/stadium';
@@ -79,6 +80,7 @@ function showMenu(): void {
   audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
+  startAttract();
   new Menu(handleMenuResult, () => hub.connectedPads().length);
 }
 
@@ -131,6 +133,7 @@ function showTournamentHub(): void {
   audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
+  if (!attractMatch) startAttract();
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
     tournament,
@@ -175,16 +178,98 @@ function playTournamentFixture(fixture: Fixture): void {
       const penWinnerId = m.shootoutWinner !== null
         ? m.teams[m.shootoutWinner].data.id
         : undefined;
-      tournament.reportPlayerResult(m.teams[0].score, m.teams[1].score, penWinnerId);
+      tournament.reportPlayerResult(m.teams[0].score, m.teams[1].score, penWinnerId, m.goalLog);
       showTournamentHub();
     },
   });
+}
+
+// ---------------------------------------------------------------- attract mode
+
+// A CPU-vs-CPU match plays behind the (now translucent) menus — the game is
+// already on when you arrive, like the arcade classics.
+let attractMatch: Match | null = null;
+let attractRenderer: GameRenderer | null = null;
+let attractRaf = 0;
+let attractLast = 0;
+let attractAcc = 0;
+
+function startAttract(): void {
+  stopAttract();
+  const pool = TEAMS.filter((t) => t.tier >= 3);
+  const home = pool[Math.floor(Math.random() * pool.length)];
+  let away = home;
+  while (away.id === home.id) away = pool[Math.floor(Math.random() * pool.length)];
+  attractMatch = new Match({
+    home, away, seats: [null, null],
+    halfLengthSec: 90, difficulty: 'pro', knockout: false, mode: 'match',
+    seed: (Math.random() * 0xffffffff) >>> 0,
+  });
+  attractRenderer = new GameRenderer(canvas, attractMatch,
+    Math.random() < 0.5 ? 'night' : 'sunset', Math.random() < 0.5 ? 'national' : 'mega');
+  attractLast = performance.now();
+  attractAcc = 0;
+  attractRaf = requestAnimationFrame(attractLoop);
+  (window as unknown as Record<string, unknown>).__ss26Attract = { match: attractMatch };
+}
+
+function stopAttract(): void {
+  cancelAnimationFrame(attractRaf);
+  attractRenderer?.dispose();
+  attractRenderer = null;
+  attractMatch = null;
+  (window as unknown as Record<string, unknown>).__ss26Attract = null;
+}
+
+function attractLoop(now: number): void {
+  attractRaf = requestAnimationFrame(attractLoop);
+  if (!attractMatch || !attractRenderer) return;
+  const dt = Math.min((now - attractLast) / 1000, 0.25);
+  attractLast = now;
+  attractAcc += dt;
+  let steps = 0;
+  while (attractAcc >= SIM_DT && steps < 5) {
+    attractMatch.update();
+    if (attractMatch.phase === 'break') attractMatch.continueFromBreak();
+    attractRenderer.snapshot();
+    attractAcc -= SIM_DT;
+    steps++;
+  }
+  if (attractAcc > SIM_DT * 2) attractAcc = SIM_DT * 2;
+  if (attractMatch.phase === 'fulltime') {
+    startAttract(); // new billing, new venue
+    return;
+  }
+  attractRenderer.update(dt, Math.min(attractAcc / SIM_DT, 1));
+}
+
+// ---------------------------------------------------------------- rumble
+
+/** Haptics: the pad speaks the language of the match (§5 feel). */
+function rumbleFor(e: MatchEvent): void {
+  switch (e.type) {
+    case 'kick': hub.rumble(0, Math.min(0.1 + e.power * 0.35, 0.5), 60); break;
+    case 'shot': hub.rumble(0.45, 0.3, 140); break;
+    case 'tackle': hub.rumble(0.5, 0.2, 110); break;
+    case 'post': hub.rumble(0.8, 0.4, 220); break;
+    case 'goal': hub.rumble(1, 1, 550); break;
+    case 'save': hub.rumble(0.4, 0.3, 130); break;
+    case 'card': hub.rumble(0.3, 0.5, e.color === 'red' ? 350 : 180); break;
+    case 'penaltyAwarded': hub.rumble(0.5, 0.5, 250); break;
+    case 'penKick':
+      hub.rumble(e.result === 'goal' ? 0.9 : 0.5, 0.5, e.result === 'goal' ? 450 : 200);
+      break;
+    case 'shootoutEnd': hub.rumble(1, 1, 700); break;
+    case 'fulltime': hub.rumble(0.4, 0.6, 300); break;
+    default: break;
+  }
 }
 
 // ---------------------------------------------------------------- match loop
 
 function startMatch(config: MatchConfig): void {
   stopLoop();
+  stopAttract();
   currentConfig = config;
   inMenus = false;
   music.stop();
@@ -217,6 +302,7 @@ function startMatch(config: MatchConfig): void {
     audio.onEvent(e);
     r.onEvent(e);
     commentary.onEvent(e, m);
+    rumbleFor(e);
   });
   m.ball.onBounce = (speed) => audio.onEvent({ type: 'bounce', speed });
   r.onReplayStateChange = (on, label) => h.setReplay(on, label);

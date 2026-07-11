@@ -239,10 +239,11 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  /* translucent: the attract-mode match plays underneath */
   background:
-    radial-gradient(ellipse at 50% 115%, rgba(38, 80, 40, 0.55), transparent 55%),
-    radial-gradient(ellipse at 50% -25%, rgba(30, 50, 100, 0.5), transparent 60%),
-    #070a10;
+    radial-gradient(ellipse at 50% 115%, rgba(38, 80, 40, 0.4), transparent 55%),
+    radial-gradient(ellipse at 50% -25%, rgba(30, 50, 100, 0.36), transparent 60%),
+    rgba(7, 10, 16, 0.76);
   pointer-events: auto;
 }
 .menu-title {
@@ -712,6 +713,26 @@
   font-size: 15px;
   animation: replayBlink 1.4s steps(2) infinite;
 }
+.champ-boot {
+  margin-top: 12px;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: #e8ecf4;
+}
+
+/* golden boot strip on the hub */
+.tour-note.boot {
+  color: #ffce4a;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  font-size: 13px;
+  margin: 0 0 10px;
+  background: rgba(8, 10, 14, 0.6);
+  padding: 6px 16px;
+  border-radius: 4px;
+}
+.tour-note.boot small { color: #8a93a8; }
 
 /* bracket density + placeholders */
 .br-box.empty { opacity: 0.3; }

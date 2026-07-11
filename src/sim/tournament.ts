@@ -4,9 +4,18 @@
 // survives a refresh.
 
 import { RNG } from '../core/rng';
-import { TEAMS, findTeam, teamRating } from '../data/loader';
+import { TEAMS, findTeam, pickStartingXI, teamRating } from '../data/loader';
 import type { TeamData } from '../data/types';
 import type { DifficultyName } from './match';
+
+/** One goal from a played (in-engine) match, as recorded by Match.goalLog. */
+export interface GoalRecord {
+  teamIdx: number;
+  scorerName: string;
+  ownGoal: boolean;
+}
+
+export interface Scorer { name: string; teamId: string; goals: number; }
 
 export type Stage = 'md1' | 'md2' | 'md3' | 'r32' | 'r16' | 'qf' | 'sf' | 'final' | 'done';
 const STAGES: Stage[] = ['md1', 'md2', 'md3', 'r32', 'r16', 'qf', 'sf', 'final', 'done'];
@@ -47,6 +56,8 @@ interface SaveState {
   /** knockout brackets: team ids per round, in bracket order (pairs 2k,2k+1) */
   rounds: Partial<Record<Stage, string[]>>;
   champion?: string;
+  /** Golden Boot tally, keyed "teamId|playerName". */
+  scorers?: Record<string, number>;
 }
 
 const LS_KEY = 'ss26.tournament';
@@ -58,6 +69,7 @@ export class Tournament {
 
   private constructor(state: SaveState) {
     this.state = state;
+    this.state.scorers ??= {}; // saves from before the Golden Boot existed
     this.rng = new RNG(state.seed ^ 0x5eed);
   }
 
@@ -149,9 +161,15 @@ export class Tournament {
   }
 
   /** Record the player's in-engine result, then sim the rest of the stage. */
-  reportPlayerResult(homeGoals: number, awayGoals: number, penWinnerId?: string): void {
+  reportPlayerResult(homeGoals: number, awayGoals: number, penWinnerId?: string,
+    goalLog: GoalRecord[] = []): void {
     const f = this.playerFixture();
     if (!f) return;
+    // real scorers from the played match (own goals aren't credited)
+    for (const g of goalLog) {
+      if (g.ownGoal) continue;
+      this.creditGoal(g.teamIdx === 0 ? f.homeId : f.awayId, g.scorerName);
+    }
     this.pushResult(f.stage, {
       homeId: f.homeId, awayId: f.awayId, homeGoals, awayGoals, penWinnerId,
     });
@@ -211,7 +229,45 @@ export class Tournament {
         penWinnerId = rng.next() < pA ? a.id : b.id;
       }
     }
+    this.attributeGoals(a, hg, rng);
+    this.attributeGoals(b, ag, rng);
     return { homeId: a.id, awayId: b.id, homeGoals: hg, awayGoals: ag, penWinnerId };
+  }
+
+  // ------------------------------------------------------------- golden boot
+
+  private creditGoal(teamId: string, playerName: string): void {
+    const key = `${teamId}|${playerName}`;
+    this.state.scorers![key] = (this.state.scorers![key] ?? 0) + 1;
+  }
+
+  /** Deterministic scorer attribution for simmed fixtures (fixtureRng). */
+  private attributeGoals(team: TeamData, goals: number, rng: RNG): void {
+    if (goals <= 0) return;
+    const xi = pickStartingXI(team).filter((p) => p.pos !== 'GK');
+    const weight = (p: (typeof xi)[number]): number =>
+      (p.pos === 'FW' ? 5 : p.pos === 'MF' ? 2.5 : 0.7) * (p.star ? 1.8 : 1);
+    const total = xi.reduce((s, p) => s + weight(p), 0);
+    for (let g = 0; g < goals; g++) {
+      let roll = rng.next() * total;
+      let scorer = xi[xi.length - 1];
+      for (const p of xi) {
+        roll -= weight(p);
+        if (roll <= 0) { scorer = p; break; }
+      }
+      this.creditGoal(team.id, scorer.name);
+    }
+  }
+
+  /** Top Golden Boot scorers, ties broken alphabetically for stability. */
+  topScorers(n = 5): Scorer[] {
+    return Object.entries(this.state.scorers ?? {})
+      .map(([key, goals]) => {
+        const [teamId, ...rest] = key.split('|');
+        return { teamId, name: rest.join('|'), goals };
+      })
+      .sort((a, b) => b.goals - a.goals || a.name.localeCompare(b.name))
+      .slice(0, n);
   }
 
   private poisson(lambda: number, rng: RNG = this.rng): number {

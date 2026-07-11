@@ -114,6 +114,23 @@ export class InputHub {
     });
   }
 
+  /** Haptic pulse on every connected pad — feature-detected, fire and forget. */
+  rumble(strong: number, weak: number, ms: number): void {
+    const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+    for (const gp of pads) {
+      const act = (gp as unknown as {
+        vibrationActuator?: { playEffect?: (type: string, params: Record<string, number>) => Promise<unknown> };
+      } | null)?.vibrationActuator;
+      try {
+        void act?.playEffect?.('dual-rumble', {
+          duration: ms,
+          strongMagnitude: Math.min(Math.max(strong, 0), 1),
+          weakMagnitude: Math.min(Math.max(weak, 0), 1),
+        });
+      } catch { /* actuator can reject mid-effect on some pads — ignore */ }
+    }
+  }
+
   /** Indices of currently connected gamepads. */
   connectedPads(): number[] {
     const out: number[] = [];
