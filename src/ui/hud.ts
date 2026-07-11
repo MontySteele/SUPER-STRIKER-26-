@@ -25,6 +25,8 @@ export class HUD {
   private penBoard!: HTMLElement;
   private penHint!: HTMLElement;
   private controlsTimer = 14;
+  /** Overrides the full-time prompt (tournament mode: J and K both continue). */
+  fulltimeHint: string | null = null;
 
   constructor(private match: Match) {
     this.root = document.getElementById('ui-root')!;
@@ -33,7 +35,9 @@ export class HUD {
 
   private build(): void {
     const [home, away] = this.match.teams;
-    const twoP = this.match.seats[0] !== null && this.match.seats[1] !== null;
+    const seats = this.match.seats;
+    const twoP = seats[0] !== null && seats[1] !== null;
+    const dev = (i: number): string => (seats[i]?.kind === 'pad' ? 'GAMEPAD' : 'KEYBOARD');
     this.root.innerHTML = `
       <div class="letterbox-top"></div>
       <div class="letterbox-bot"></div>
@@ -58,8 +62,8 @@ export class HUD {
       <div class="pen-hint"></div>
       <div class="match-card"></div>
       <div class="controls-card">${twoP
-        ? 'P1 KEYBOARD · P2 GAMEPAD — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT'
-        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE'}</div>
+        ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · PAUSE ESC/START`
+        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · PAUSE ESC'}</div>
       <div class="wipe"></div>
     `;
     this.bugScore = this.root.querySelector('.score')!;
@@ -113,7 +117,9 @@ export class HUD {
         this.goalBanner.classList.remove('show');
         void this.goalBanner.offsetWidth;
         this.goalBanner.classList.add('show');
-        this.pushTicker(`${e.minute}' — GOOOAL! ${e.scorerName} scores for ${teamName(e.teamIdx)}!`);
+        this.pushTicker(e.ownGoal
+          ? `${e.minute}' — OWN GOAL! ${e.scorerName} turns it into his own net!`
+          : `${e.minute}' — GOOOAL! ${e.scorerName} scores for ${teamName(e.teamIdx)}!`);
         break;
       }
       case 'miss':
@@ -187,8 +193,7 @@ export class HUD {
     const hp = Math.round((h.possessionTicks / total) * 100);
     const isFT = title === 'FULL-TIME';
     const hint = isFT
-      ? (this.match.opts.mode === 'shootout' ? 'PRESS J FOR REMATCH · K FOR MENU'
-        : 'PRESS J FOR REMATCH · K FOR MENU')
+      ? (this.fulltimeHint ?? 'PRESS J FOR REMATCH · K FOR MENU')
       : title === 'PENALTIES' ? 'PRESS J FOR THE SHOOTOUT' : 'PRESS J TO CONTINUE';
     const board = this.match.penalty?.board;
     const pens = board && this.match.shootoutWinner !== null
@@ -215,6 +220,20 @@ export class HUD {
 
   hideCard(): void {
     this.card.classList.remove('show');
+  }
+
+  showPauseCard(): void {
+    const [h, a] = this.match.teams;
+    this.card.innerHTML = `
+      <h1>PAUSED</h1>
+      <div class="scoreline">
+        <span style="color:${h.data.kit.home}">■</span> ${h.data.name}
+        ${h.score} - ${a.score}
+        ${a.data.name} <span style="color:${a.data.kit.home}">■</span>
+      </div>
+      <div class="hint">PRESS J TO RESUME · K TO QUIT</div>
+    `;
+    this.card.classList.add('show');
   }
 
   /** Per-frame HUD refresh. screenPos comes from the renderer. */

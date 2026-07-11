@@ -90,7 +90,33 @@ export class SceneManager {
     this.composer.addPass(new ShaderPass(GradeShader));
     this.composer.addPass(new OutputPass());
 
-    window.addEventListener('resize', () => this.onResize());
+    window.addEventListener('resize', this.resizeHandler);
+  }
+
+  private resizeHandler = (): void => this.onResize();
+
+  /**
+   * Release everything the GPU is holding for this match. A tournament run
+   * builds a fresh renderer per match on the same canvas; without this, GPU
+   * memory grows monotonically until the context is lost mid-demo.
+   */
+  dispose(): void {
+    window.removeEventListener('resize', this.resizeHandler);
+    this.scene.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+      const mats = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+      for (const m of mats) {
+        for (const v of Object.values(m)) {
+          if (v instanceof THREE.Texture) v.dispose();
+        }
+        m.dispose();
+      }
+    });
+    this.scene.clear();
+    this.bloom.dispose();
+    this.composer.dispose();
+    this.renderer.dispose();
   }
 
   private applyTimeOfDay(tod: TimeOfDay): void {

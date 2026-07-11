@@ -41,6 +41,7 @@ export class Menu {
   private todIdx = 0;
   private stadiumIdx = 0;
   private keyHandler: (e: KeyboardEvent) => void;
+  private padHandler: () => void;
   private hasSave: boolean;
 
   constructor(
@@ -51,11 +52,17 @@ export class Menu {
     this.hasSave = Tournament.load() !== null;
     this.keyHandler = (e) => this.onKey(e);
     window.addEventListener('keydown', this.keyHandler);
+    // VERSUS unlocks live when a pad is plugged in while the menu is up
+    this.padHandler = () => { if (this.screen === 'mode') this.render(); };
+    window.addEventListener('gamepadconnected', this.padHandler);
+    window.addEventListener('gamepaddisconnected', this.padHandler);
     this.render();
   }
 
   destroy(): void {
     window.removeEventListener('keydown', this.keyHandler);
+    window.removeEventListener('gamepadconnected', this.padHandler);
+    window.removeEventListener('gamepaddisconnected', this.padHandler);
     this.root.innerHTML = '';
   }
 
@@ -136,9 +143,10 @@ export class Menu {
         if (this.focus === rows - 1) this.launch();
         else { this.cycleSetting(this.focus, 1); this.render(); }
       } else if (back) {
-        this.screen = this.mode === 'tournament' && this.hasSave ? 'mode' : 'pickAway';
-        if (this.mode === 'tournament') this.screen = 'pickHome';
+        this.screen = this.mode === 'tournament' ? 'pickHome' : 'pickAway';
+        const prev = this.mode === 'tournament' ? this.home : this.away;
         this.away = null;
+        this.focus = Math.max(0, this.sortedTeams().findIndex((t) => t.id === prev?.id));
         this.render();
       }
     }

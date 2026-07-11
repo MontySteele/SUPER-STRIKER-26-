@@ -151,6 +151,20 @@ console.log('— send-off exclusion —');
   console.log('  send-off exclusion ok');
 }
 
+// --- 3b) keeper send-off: an emergency keeper takes over -----------------------
+{
+  const m = makeMatch('esp', 'por', 61);
+  for (let i = 0; i < 600; i++) m.update();
+  const gk = m.teams[0].keeper;
+  (m as unknown as { sendOff(p: unknown): void }).sendOff(gk);
+  const nk = m.teams[0].keeper;
+  if (nk === gk) fail('GK sent off but no emergency keeper promoted');
+  if (nk.sentOff) fail('promoted keeper is himself sent off');
+  if (!nk.isGK) fail('promoted keeper did not take the GK role');
+  runToFulltime(m, undefined, 'gk-redcard');
+  console.log('  emergency keeper ok');
+}
+
 // --- 4) forced in-match penalty: converts or restarts, match continues --------
 console.log('— in-match penalty resolution —');
 for (const seed of [70, 71, 72, 73]) {

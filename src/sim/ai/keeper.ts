@@ -59,11 +59,11 @@ export class KeeperBrain {
         k.stop();
         if (this.holdTimer <= 0) {
           // distribute: lofted ball toward a wide midfielder upfield
-          const mates = this.team.players.filter((p) => !p.isGK && Math.abs(p.pos.y) > 8);
+          const mates = this.team.players.filter((p) => !p.isGK && !p.sentOff && Math.abs(p.pos.y) > 8);
           const target = mates.length
             ? mates.reduce((a, b) => ((a.pos.x - k.pos.x) * this.team.attackDir >
                 (b.pos.x - k.pos.x) * this.team.attackDir ? a : b))
-            : this.team.players[5];
+            : this.team.players.find((p) => !p.isGK && !p.sentOff) ?? this.team.players[5];
           const dir = norm2(sub2(target.pos, k.pos));
           ball.pos.z = 0.4;
           ball.kick({ x: dir.x * 0.75, y: dir.y * 0.75, z: 0.6 }, 26, k);
@@ -156,7 +156,7 @@ export class KeeperBrain {
   private noDefenderBetween(match: Match, carrier: PlayerEntity): boolean {
     const gx = this.goalX();
     for (const p of this.team.players) {
-      if (p.isGK) continue;
+      if (p.isGK || p.sentOff) continue;
       const between = (p.pos.x - carrier.pos.x) * Math.sign(gx - carrier.pos.x) > 0.5 &&
         Math.abs(p.pos.x - gx) < Math.abs(carrier.pos.x - gx);
       if (between && Math.abs(p.pos.y - carrier.pos.y * 0.5) < 8) return false;

@@ -57,6 +57,7 @@ link. Notes:
 | Through ball | **I** |
 | Sprint | **Shift** (hold) |
 | Switch player | **Space** |
+| Pause / quit | **Esc** (pad: Start) |
 
 Gamepads are auto-detected (standard mapping: LS move, A pass, B loft, X shoot,
 Y through, RT sprint, LB switch). Menus: WASD + J confirm, K back.

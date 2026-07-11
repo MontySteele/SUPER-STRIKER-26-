@@ -119,7 +119,9 @@ export class GameRenderer {
       const scorer = this.match.allPlayers.find(
         (p) => p.data.name === e.scorerName && p.teamIdx === e.teamIdx,
       );
+      // own goals name a player on the other team — fall back to the ball
       if (scorer) this.cam.subject.set(scorer.pos.x, 0, scorer.pos.y);
+      else this.cam.subject.set(this.match.ball.pos.x, 0, this.match.ball.pos.y);
       this.cam.replayGoalSide = Math.sign(this.match.ball.pos.x) || 1;
       this.cam.setMode('celebration');
       // freeze the replay clip now
@@ -129,8 +131,16 @@ export class GameRenderer {
     }
   }
 
+  private removeConfetti(): void {
+    if (!this.confetti) return;
+    this.sceneMgr.scene.remove(this.confetti);
+    this.confetti.geometry.dispose();
+    (this.confetti.material as THREE.Material).dispose();
+    this.confetti = null;
+  }
+
   private spawnConfetti(teamIdx: number): void {
-    if (this.confetti) this.sceneMgr.scene.remove(this.confetti);
+    this.removeConfetti();
     const N = 380;
     const pos = new Float32Array(N * 3);
     const vel = new Float32Array(N * 3);
@@ -262,15 +272,18 @@ export class GameRenderer {
       }
       posAttr.needsUpdate = true;
       (this.confetti.material as THREE.PointsMaterial).opacity = Math.max(0, 1 - this.confettiT / 6);
-      if (this.confettiT > 6) {
-        this.sceneMgr.scene.remove(this.confetti);
-        this.confetti = null;
-      }
+      if (this.confettiT > 6) this.removeConfetti();
     }
 
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
     this.sceneMgr.render();
+  }
+
+  /** Release all GPU resources — call when the match ends. */
+  dispose(): void {
+    this.removeConfetti();
+    this.sceneMgr.dispose();
   }
 
   /** Project a sim position to screen % for HTML nameplates. */

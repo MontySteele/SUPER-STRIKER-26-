@@ -33,10 +33,9 @@ export class OffsideTracker {
       this.pendingReceiver = null;
       return true;
     }
-    // any other touch (defender interception, different teammate) resets it
-    if (this.pendingReceiver && toucher.teamIdx !== this.pendingReceiver.teamIdx) {
-      this.pendingReceiver = null;
-    }
+    // any other touch (defender interception, different teammate) resets it —
+    // a new phase of play has started, the old flag no longer applies
+    this.pendingReceiver = null;
     return false;
   }
 }

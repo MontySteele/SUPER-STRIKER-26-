@@ -44,8 +44,30 @@ export class Team {
     });
   }
 
+  /** Index of the current keeper — changes if the GK is sent off. */
+  keeperIdx = 0;
+
   get keeper(): PlayerEntity {
-    return this.players[0];
+    return this.players[this.keeperIdx];
+  }
+
+  /**
+   * GK sent off: an outfielder pulls on the gloves (there are no subs in
+   * '26 — chaos is the feature). Returns the promoted player, if any.
+   */
+  promoteEmergencyKeeper(): PlayerEntity | null {
+    let best: PlayerEntity | null = null;
+    let bestK = -1;
+    for (const p of this.players) {
+      if (p.sentOff || p.isGK) continue;
+      const k = p.data.keeping;
+      if (k > bestK) { best = p; bestK = k; }
+    }
+    if (best) {
+      best.role = 'GK';
+      this.keeperIdx = this.players.indexOf(best);
+    }
+    return best;
   }
 
   star(): PlayerEntity | undefined {
@@ -71,12 +93,13 @@ export class Team {
       p.actionAnim = 'none';
     }
     if (kickingOff) {
-      // two most advanced players step to the centre spot
-      const fwds = [...this.players].sort(
+      // two most advanced players step to the centre spot (never a sent-off
+      // ghost — he's parked in the tunnel and must stay there)
+      const fwds = this.players.filter((p) => !p.sentOff).sort(
         (a, b) => (b.pos.x - a.pos.x) * this.attackDir,
       ).slice(0, 2);
       fwds[0].pos = { x: -0.5 * this.attackDir, y: 0.3 };
-      fwds[1].pos = { x: -1.5 * this.attackDir, y: -6 };
+      if (fwds[1]) fwds[1].pos = { x: -1.5 * this.attackDir, y: -6 };
     }
   }
 }

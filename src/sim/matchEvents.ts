@@ -4,7 +4,7 @@ import type { PenResult } from './penalty';
 
 export type MatchEvent =
   | { type: 'kickoff'; half: number }
-  | { type: 'goal'; teamIdx: number; scorerName: string; minute: number }
+  | { type: 'goal'; teamIdx: number; scorerName: string; ownGoal?: boolean; minute: number }
   | { type: 'shot'; teamIdx: number; onTarget: boolean; shooterName: string }
   | { type: 'save'; keeperName: string; teamIdx: number }
   | { type: 'post' }

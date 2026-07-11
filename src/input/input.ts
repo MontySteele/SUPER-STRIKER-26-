@@ -2,13 +2,13 @@
 // (§3.4): keyboard vs gamepad, or two gamepads. Actions buffer for 150ms so a
 // pass queued during a receive animation fires the instant the touch completes.
 
-export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics';
+export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics' | 'pause';
 export type DeviceKind = 'merged' | 'keyboard' | 'pad';
 
 export interface Stick { x: number; y: number; }
 
 const BUFFER_MS = 150;
-const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics'];
+const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics', 'pause'];
 
 interface ActionState {
   held: boolean;
@@ -47,6 +47,18 @@ class DeviceState {
       this.actions[a].releasedAt = -1;
     }
   }
+
+  /** Drop ALL state without emitting release edges (blur / pad unplug). */
+  neutralize(): void {
+    this.sprintHeld = false;
+    this.stick = { x: 0, y: 0 };
+    for (const a of ACTIONS) {
+      const s = this.actions[a];
+      s.held = false;
+      s.pressedAt = -1;
+      s.releasedAt = -1;
+    }
+  }
 }
 
 const KEY_MAP: Record<string, Action | 'sprint' | 'up' | 'down' | 'left' | 'right'> = {
@@ -55,11 +67,14 @@ const KEY_MAP: Record<string, Action | 'sprint' | 'up' | 'down' | 'left' | 'righ
   KeyJ: 'pass', KeyK: 'loft', KeyL: 'shoot', KeyI: 'through',
   Space: 'switch', Tab: 'tactics',
   ShiftLeft: 'sprint', ShiftRight: 'sprint',
+  Escape: 'pause', KeyP: 'pause',
 };
 
-// Standard mapping: 0=A pass, 1=B loft, 2=X shoot, 3=Y through, 4=LB switch, 7=RT sprint
+// Standard mapping: 0=A pass, 1=B loft, 2=X shoot, 3=Y through, 4=LB switch,
+// 7=RT sprint, 9=Start pause
 const PAD_MAP: [number, Action | 'sprint'][] = [
   [0, 'pass'], [1, 'loft'], [2, 'shoot'], [3, 'through'], [4, 'switch'], [7, 'sprint'],
+  [9, 'pause'],
 ];
 
 export class InputHub {
@@ -86,6 +101,16 @@ export class InputHub {
       if (mapped === 'sprint') this.keyboard.sprintHeld = false;
       else if (mapped && !isDir(mapped)) this.keyboard.release(mapped);
     });
+    // Alt-tab with a key held: the keyup never arrives, so drop everything on
+    // focus loss — otherwise the player sprints into the corner flag forever.
+    const dropKeys = (): void => {
+      this.keys.clear();
+      this.keyboard.neutralize();
+    };
+    window.addEventListener('blur', dropKeys);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) dropKeys();
+    });
   }
 
   /** Indices of currently connected gamepads. */
@@ -105,6 +130,15 @@ export class InputHub {
   /** Poll gamepad edges once per frame (the Gamepad API has no button events). */
   pollGamepads(): void {
     const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+    // a pad yanked mid-match must go neutral, not freeze at its last state
+    const seen = new Set<number>();
+    for (const gp of pads) if (gp) seen.add(gp.index);
+    for (const [idx, dev] of this.pads) {
+      if (!seen.has(idx)) {
+        dev.neutralize();
+        this.prevPadButtons.delete(idx);
+      }
+    }
     for (const gp of pads) {
       if (!gp) continue;
       const dev = this.pad(gp.index);
@@ -175,7 +209,7 @@ function isDir(m: string): m is 'up' | 'down' | 'left' | 'right' {
 
 /** One player's view of the hub. The whole sim reads inputs through this. */
 export class PlayerInput {
-  constructor(private hub: InputHub, private kind: DeviceKind, private padIndex: number) {}
+  constructor(private hub: InputHub, readonly kind: DeviceKind, private padIndex: number) {}
 
   private devices(): DeviceState[] {
     if (this.kind === 'keyboard') return [this.hub.keyboard];

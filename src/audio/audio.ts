@@ -10,31 +10,66 @@ export class AudioEngine {
   private murmurGain!: GainNode;
   private anticipationGain!: GainNode;
   private duck!: GainNode;
+  private crowdBus!: GainNode;
   private excitement = 0;      // 0..1 target from buildup events
   private eruption = 0;        // spikes on goals/shots, decays
-  private started = false;
+  private crowdOn = true;
+
+  constructor() {
+    // Autoplay policy: only a real user gesture can start audio, and gamepad
+    // polling is NOT a gesture — so listen for genuine ones ourselves and
+    // keep resuming until the context actually runs.
+    const gesture = (): void => this.unlock();
+    window.addEventListener('keydown', gesture);
+    window.addEventListener('pointerdown', gesture);
+  }
 
   /** Shared context for the music player (null until unlocked). */
   context(): AudioContext | null {
     return this.ctx;
   }
 
-  /** Must be called from a user gesture. */
+  /**
+   * Safe to call from anywhere, any number of times: builds the graph once,
+   * and resumes a context the browser created in the suspended state.
+   */
   unlock(): void {
-    if (this.started) return;
-    this.started = true;
+    if (this.ctx) {
+      if (this.ctx.state === 'suspended') void this.ctx.resume();
+      return;
+    }
     this.ctx = new AudioContext();
     const ctx = this.ctx;
+    if (ctx.state === 'suspended') void ctx.resume();
     this.master = ctx.createGain();
     this.master.gain.value = 0.7;
+    // brick-wall-ish limiter so stacked roars/whistles don't crackle
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -8;
+    limiter.knee.value = 4;
+    limiter.ratio.value = 16;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
     this.duck = ctx.createGain();
     this.duck.connect(this.master);
-    this.master.connect(ctx.destination);
+    this.master.connect(limiter);
+    limiter.connect(ctx.destination);
+    this.crowdBus = ctx.createGain();
+    this.crowdBus.connect(this.duck);
 
     // --- murmur bed: brown noise through a low bandpass
     this.murmurGain = this.makeCrowdLayer(320, 0.7, 0.28);
     // --- anticipation layer: brighter, voice-band noise
     this.anticipationGain = this.makeCrowdLayer(850, 1.4, 0.0);
+    this.crowdBus.gain.value = this.crowdOn ? 1 : 0;
+  }
+
+  /** Crowd bed on during matches, off under the menu music. */
+  setCrowd(on: boolean): void {
+    this.crowdOn = on;
+    if (!this.ctx) return;
+    this.crowdBus.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.25);
+    if (!on) { this.excitement = 0; this.eruption = 0; }
   }
 
   private noiseBuffer(seconds: number, brown: boolean): AudioBuffer {
@@ -73,7 +108,7 @@ export class AudioEngine {
     lfo.connect(lfoGain);
     lfoGain.connect(g.gain);
     lfo.start();
-    src.connect(bp).connect(g).connect(this.duck);
+    src.connect(bp).connect(g).connect(this.crowdBus);
     src.start();
     return g;
   }

@@ -32,6 +32,9 @@ export function cpuOnBallDecision(match: Match, carrier: PlayerEntity): void {
   const distGoal = dist2(carrier.pos, { x: goalX, y: 0 });
   const pressure = nearestOpponentDist(match, carrier);
   const inOwnThird = carrier.pos.x * team.attackDir < -HALF_L / 3;
+  // patience runs out: after ~10s of possession that never reaches the final
+  // third, sideways recycling loses value and forward options gain it
+  const urgency = clamp(match.buildupTime[carrier.teamIdx] / 10, 0, 1);
 
   const dirGoal = norm2(sub2({ x: goalX, y: carrier.pos.y * 0.3 }, carrier.pos));
 
@@ -39,23 +42,30 @@ export function cpuOnBallDecision(match: Match, carrier: PlayerEntity): void {
   const shootScore = (() => {
     if (distGoal > 34) return 0;
     const open = laneOpenness(match, carrier.pos, { x: goalX, y: 0 }, carrier.teamIdx);
-    const angle = 1 - clamp(Math.abs(carrier.pos.y) / 26, 0, 1);
+    const angle = 1 - clamp(Math.abs(carrier.pos.y) / 30, 0, 1);
     const skill = effectiveRating(carrier.data, 'shooting') / 99;
-    const inBox = distGoal < 17 && Math.abs(carrier.pos.y) < 20 ? 1.6 : 0;
-    return ((1 - distGoal / 38) * 3.4 + inBox) * angle * (0.45 + open) * (0.5 + skill) * bias.shoot;
+    const inBox = distGoal < 17 && Math.abs(carrier.pos.y) < 20 ? 1.8 : 0;
+    // every factor is floored: a purely multiplicative gate collapses to ~0
+    // against a set defense and good teams end matches with zero shots
+    return ((1 - distGoal / 40) * 3.0 + inBox)
+      * (0.55 + angle * 0.6) * (0.7 + open * 0.6) * (0.55 + skill * 0.6) * bias.shoot;
   })();
 
   const fwd = bestPassTarget(match, carrier, dirGoal, { preferForward: true });
-  const forwardScore = fwd ? (fwd.score / 8) * 1.25 * bias.forward * (pressure < 4 ? 1.25 : 1) : 0;
+  const forwardScore = fwd
+    ? (fwd.score / 8) * 1.25 * bias.forward * (pressure < 4 ? 1.25 : 1) * (1 + urgency * 0.6)
+    : 0;
 
   const anyDir = norm2({ x: team.attackDir * 0.3 + rng.noise() * 0.5, y: rng.noise() });
   const safe = bestPassTarget(match, carrier, anyDir, { maxDist: 26 });
-  const safeScore = safe ? (safe.score / 8) * (safe.openness * 1.3) * bias.safe * (pressure < 3.5 ? 1.5 : 0.9) : 0;
+  const safeScore = safe
+    ? (safe.score / 8) * (safe.openness * 1.3) * bias.safe * (pressure < 3.5 ? 1.5 : 0.9) * (1 - urgency * 0.55)
+    : 0;
 
   const throughScore = (() => {
     let best = 0;
     for (const mate of team.players) {
-      if (mate === carrier || mate.isGK) continue;
+      if (mate === carrier || mate.isGK || mate.sentOff) continue;
       const adv = (mate.pos.x - carrier.pos.x) * team.attackDir;
       if (adv < 4) continue;
       const running = mate.vel.x * team.attackDir > 2.5 ? 1.4 : 1;
@@ -64,14 +74,14 @@ export function cpuOnBallDecision(match: Match, carrier: PlayerEntity): void {
       }, carrier.teamIdx);
       best = Math.max(best, (adv / 30) * running * space);
     }
-    return best * 2.1 * bias.through;
+    return best * 2.1 * bias.through * (1 + urgency * 0.7);
   })();
 
   const dribbleScore = (() => {
     const ahead: V2 = { x: carrier.pos.x + dirGoal.x * 8, y: carrier.pos.y + dirGoal.y * 8 };
     const open = laneOpenness(match, carrier.pos, ahead, carrier.teamIdx);
     const pace = effectiveRating(carrier.data, 'pace') / 99;
-    return open * (0.5 + pace * 0.9) * 1.35 * bias.dribble * (pressure > 3 ? 1.15 : 0.55);
+    return open * (0.5 + pace * 0.9) * 1.35 * bias.dribble * (pressure > 3 ? 1.15 : 0.55) * (1 + urgency * 0.5);
   })();
 
   const crossScore = (() => {
@@ -130,6 +140,7 @@ export function cpuDribble(match: Match, carrier: PlayerEntity): void {
   let veer: V2 = { x: 0, y: 0 };
   let nd = 1e9;
   for (const opp of match.teams[1 - carrier.teamIdx].players) {
+    if (opp.sentOff) continue;
     const d = dist2(opp.pos, carrier.pos);
     if (d < nd) { nd = d; veer = norm2(sub2(carrier.pos, opp.pos)); }
   }
@@ -142,6 +153,7 @@ export function cpuDribble(match: Match, carrier: PlayerEntity): void {
 export function nearestOpponentDist(match: Match, p: PlayerEntity): number {
   let nd = 1e9;
   for (const opp of match.teams[1 - p.teamIdx].players) {
+    if (opp.sentOff) continue;
     const d = dist2(opp.pos, p.pos);
     if (d < nd) nd = d;
   }

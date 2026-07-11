@@ -177,34 +177,47 @@ export class Tournament {
 
   // ------------------------------------------------------------- lightweight sim
 
+  /**
+   * Per-fixture RNG: the shared stream's position is not persisted, so a
+   * mid-tournament reload would replay earlier draws. Hashing (seed, fixture)
+   * makes every simmed result reload-stable.
+   */
+  private fixtureRng(f: Fixture): RNG {
+    let h = this.state.seed ^ 0x9e3779b9;
+    const s = `${f.stage}:${f.homeId}:${f.awayId}`;
+    for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+    return new RNG(h >>> 0);
+  }
+
   private simMatch(f: Fixture, knockout: boolean): Result {
+    const rng = this.fixtureRng(f);
     const a = findTeam(f.homeId), b = findTeam(f.awayId);
     const ra = teamRating(a), rb = teamRating(b);
     const adv = (ra - rb) / 11;
     const xgA = Math.min(Math.max(1.25 + adv * 0.6, 0.2), 4.2);
     const xgB = Math.min(Math.max(1.25 - adv * 0.6, 0.2), 4.2);
-    let hg = this.poisson(xgA);
-    let ag = this.poisson(xgB);
+    let hg = this.poisson(xgA, rng);
+    let ag = this.poisson(xgB, rng);
     let penWinnerId: string | undefined;
     if (knockout && hg === ag) {
       // extra time: one side may nick it
-      if (this.rng.next() < 0.42) {
-        if (this.rng.next() < 0.5 + adv * 0.1) hg++; else ag++;
+      if (rng.next() < 0.42) {
+        if (rng.next() < 0.5 + adv * 0.1) hg++; else ag++;
       } else {
         // penalties: keeper quality tilts the coin slightly
         const ka = a.players.reduce((m, p) => Math.max(m, p.keeping), 0);
         const kb = b.players.reduce((m, p) => Math.max(m, p.keeping), 0);
         const pA = 0.5 + (ka - kb) / 400 + adv * 0.04;
-        penWinnerId = this.rng.next() < pA ? a.id : b.id;
+        penWinnerId = rng.next() < pA ? a.id : b.id;
       }
     }
     return { homeId: a.id, awayId: b.id, homeGoals: hg, awayGoals: ag, penWinnerId };
   }
 
-  private poisson(lambda: number): number {
+  private poisson(lambda: number, rng: RNG = this.rng): number {
     const l = Math.exp(-lambda);
     let k = 0, p = 1;
-    do { k++; p *= this.rng.next(); } while (p > l && k < 9);
+    do { k++; p *= rng.next(); } while (p > l && k < 9);
     return k - 1;
   }
 
@@ -295,7 +308,10 @@ export class Tournament {
 }
 
 function cmpStanding(a: Standing, b: Standing): number {
+  // pts → GD → GF → team rating (better squad edges the tiebreak, which beats
+  // rewarding an alphabetically early id) → id as a stable last resort
   return b.pts - a.pts || (b.gf - b.ga) - (a.gf - a.ga) || b.gf - a.gf
+    || teamRating(findTeam(b.teamId)) - teamRating(findTeam(a.teamId))
     || a.teamId.localeCompare(b.teamId);
 }
 

@@ -19,6 +19,7 @@ export function laneOpenness(match: Match, from: V2, to: V2, teamIdx: number): n
   let worst = 1;
   const passLen = dist2(from, to);
   for (const opp of match.teams[1 - teamIdx].players) {
+    if (opp.sentOff) continue;
     const alongDist = dist2(opp.pos, from);
     if (alongDist > passLen + 2) continue;
     const d = distToSegment(opp.pos, from, to);

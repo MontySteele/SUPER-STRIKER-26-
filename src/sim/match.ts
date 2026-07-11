@@ -101,6 +101,8 @@ export class Match {
   controlled: [PlayerEntity | null, PlayerEntity | null] = [null, null];
 
   private cpuDecisionTimers = [0, 0];
+  /** Seconds of possession without reaching the final third (per team). */
+  buildupTime = [0, 0];
   private activeShot: ActiveShot | null = null;
   private shotCharging = [false, false];
   private buildupTimer = 0;
@@ -231,7 +233,10 @@ export class Match {
       ? (seat.consumePress('pass', 600) || this.phaseTimer > 4)
       : this.phaseTimer > 1.4);
     if (go) {
-      const mate = t.players.filter((p) => p.role === 'MF' && !p.sentOff)
+      // never the taker himself (norm2(0,0) would launch the ball vertically)
+      const pool = t.players.filter((p) => p !== taker && p.role === 'MF' && !p.sentOff);
+      const fallback = t.players.filter((p) => p !== taker && !p.isGK && !p.sentOff);
+      const mate = (pool.length ? pool : fallback)
         .reduce((a, b) => (dist2(a.pos, taker.pos) < dist2(b.pos, taker.pos) ? a : b));
       const dir = norm2(sub2(mate.pos, taker.pos));
       this.ball.kick({ x: dir.x, y: dir.y, z: 0.02 }, 9, taker);
@@ -617,6 +622,16 @@ export class Match {
   private sendOff(p: PlayerEntity): void {
     p.sentOff = true;
     if (this.ball.owner === p) this.ball.owner = null;
+    const team = this.teams[p.teamIdx];
+    // a red-carded keeper can't play on: an outfielder pulls on the gloves
+    if (p === team.keeper) {
+      const promoted = team.promoteEmergencyKeeper();
+      if (promoted) {
+        const brain = this.keepers[p.teamIdx];
+        brain.keeper = promoted;
+        brain.state = 'position';
+      }
+    }
     // walks (teleports) to the tunnel
     p.pos = { x: clamp(p.pos.x, -30, 30), y: (HALF_W + 6) * Math.sign(p.pos.y || 1) };
     p.vel = v2();
@@ -647,7 +662,8 @@ export class Match {
     const pen = this.penalty;
     this.penalty = null;
     if (result === 'goal') {
-      this.ball.lastTouch = pen?.taker ?? this.teams[teamIdx].players[10];
+      this.ball.lastTouch = pen?.taker
+        ?? this.nearestOutfield(this.teams[teamIdx], v2(HALF_L * this.teams[teamIdx].attackDir, 0));
       this.scoreGoal(this.teams[teamIdx].attackDir);
     } else {
       // saved or missed: defending team restarts with a goal kick
@@ -663,6 +679,17 @@ export class Match {
   private updateAI(dt: number): void {
     const owner = this.ball.owner;
     const ballV: V2 = { x: this.ball.pos.x, y: this.ball.pos.y };
+
+    // build-up urgency: possession that isn't reaching the final third loses
+    // patience — without this, possession sides recycle sideways forever and
+    // finish matches with zero shots
+    if (owner && !owner.isGK) {
+      const t = this.teams[owner.teamIdx];
+      const inFinalThird = owner.pos.x * t.attackDir > HALF_L / 3;
+      if (inFinalThird) this.buildupTime[owner.teamIdx] = 0;
+      else this.buildupTime[owner.teamIdx] += dt;
+      this.buildupTime[1 - owner.teamIdx] = 0;
+    }
 
     for (const team of this.teams) {
       const attacking = this.possessionTeam === team.idx;
@@ -806,9 +833,12 @@ export class Match {
     const scoringTeam = this.teams[0].attackDir === side ? 0 : 1;
     const team = this.teams[scoringTeam];
     team.score++;
-    const scorer = this.ball.lastTouch && this.ball.lastTouch.teamIdx === scoringTeam
-      ? this.ball.lastTouch
-      : team.players[team.players.length - 1];
+    const lt = this.ball.lastTouch;
+    const ownGoal = !!lt && lt.teamIdx !== scoringTeam;
+    // own goal: credit the unlucky defender, celebrate whoever's nearest —
+    // never a random opposition player who didn't touch it
+    const scorer = !ownGoal && lt ? lt
+      : this.nearestOutfield(team, { x: HALF_L * side, y: 0 });
     this.activeShot = null;
     this.lastGoalTeamIdx = scoringTeam;
     this.phase = 'goalseq';
@@ -817,7 +847,9 @@ export class Match {
     scorer.playAnim('celebrate', 2.5);
     this.keepers[1 - scoringTeam].keeper.playAnim('dejected', 2.5);
     this.events.emit({
-      type: 'goal', teamIdx: scoringTeam, scorerName: scorer.data.name,
+      type: 'goal', teamIdx: scoringTeam,
+      scorerName: ownGoal ? lt!.data.name : scorer.data.name,
+      ownGoal,
       minute: this.displayMinute(),
     });
   }

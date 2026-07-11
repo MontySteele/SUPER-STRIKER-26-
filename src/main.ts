@@ -52,12 +52,18 @@ let accumulator = 0;
 let lastTime = performance.now();
 let rafId = 0;
 
+let paused = false;
+let lastPhase = '';
+let cardGraceUntil = 0;
+
 function stopLoop(): void {
   cancelAnimationFrame(rafId);
   match = null;
+  renderer?.dispose();
   renderer = null;
   hudUI?.destroy();
   hudUI = null;
+  paused = false;
 }
 
 // ---------------------------------------------------------------- menus
@@ -65,6 +71,7 @@ function stopLoop(): void {
 function showMenu(): void {
   stopLoop();
   inMenus = true;
+  audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
   new Menu(handleMenuResult, () => hub.connectedPads().length);
@@ -112,13 +119,19 @@ function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
 function showTournamentHub(): void {
   stopLoop();
   inMenus = true;
+  audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
     tournament,
     (fixture) => playTournamentFixture(fixture),
-    () => { tournament?.save(); showMenu(); },
+    () => {
+      // a finished run should not haunt the menu as CONTINUE TOURNAMENT
+      if (tournament?.state.stage === 'done') Tournament.clear();
+      else tournament?.save();
+      showMenu();
+    },
   );
   ui.render();
 }
@@ -180,6 +193,11 @@ function startMatch(config: MatchConfig): void {
 
   renderer = new GameRenderer(canvas, match, config.timeOfDay, config.stadium);
   hudUI = new HUD(match);
+  hudUI.fulltimeHint = config.onDone ? 'PRESS J TO CONTINUE' : null;
+  audio.setCrowd(true);
+  hub.clearAll();
+  paused = false;
+  lastPhase = '';
 
   const m = match, r = renderer, h = hudUI;
   m.events.on((e) => {
@@ -195,7 +213,9 @@ function startMatch(config: MatchConfig): void {
   lastTime = performance.now();
   rafId = requestAnimationFrame(loop);
   // debug hook for automated testing
-  (window as unknown as Record<string, unknown>).__ss26 = { match: m, renderer: r, hub, tournament };
+  (window as unknown as Record<string, unknown>).__ss26 = {
+    match: m, renderer: r, hub, tournament, isPaused: () => paused,
+  };
 }
 
 function loop(now: number): void {
@@ -207,43 +227,74 @@ function loop(now: number): void {
 
   hub.pollGamepads();
 
+  // a whistle can land while a gameplay button edge is still buffered — clear
+  // it on phase entry and give the card a beat on screen, or the half-time /
+  // full-time card gets skipped by a press meant for the pitch
+  if (match.phase !== lastPhase) {
+    if (match.phase === 'break' || match.phase === 'fulltime') {
+      hub.clearAll();
+      cardGraceUntil = now + 700;
+    }
+    lastPhase = match.phase;
+  }
+
   if (match.phase === 'break') {
-    if (hub.anyPress(['pass'])) {
+    if (now >= cardGraceUntil && hub.anyPress(['pass'])) {
       hudUI.hideCard();
       hudUI.playWipe();
       match.continueFromBreak();
     }
   } else if (match.phase === 'fulltime') {
-    if (currentConfig?.onDone) {
-      if (hub.anyPress(['pass', 'loft'])) {
-        const done = currentConfig.onDone;
-        const m = match;
-        hudUI.hideCard();
-        done(m);
-        return;
+    if (now >= cardGraceUntil) {
+      if (currentConfig?.onDone) {
+        if (hub.anyPress(['pass', 'loft'])) {
+          const done = currentConfig.onDone;
+          const m = match;
+          hudUI.hideCard();
+          done(m);
+          return;
+        }
+      } else {
+        if (hub.anyPress(['pass'])) {
+          hudUI.hideCard();
+          if (currentConfig) startMatch(currentConfig);
+          return;
+        }
+        if (hub.anyPress(['loft'])) {
+          showMenu();
+          return;
+        }
       }
-    } else {
-      if (hub.anyPress(['pass'])) {
-        hudUI.hideCard();
-        if (currentConfig) startMatch(currentConfig);
-        return;
-      }
-      if (hub.anyPress(['loft'])) {
-        showMenu();
-        return;
-      }
+    }
+  } else if (paused) {
+    if (hub.anyPress(['pass', 'pause'])) {
+      paused = false;
+      hudUI.hideCard();
+      hub.clearAll();
+    } else if (hub.anyPress(['loft'])) {
+      if (currentConfig?.onDone && tournament) showTournamentHub();
+      else showMenu();
+      return;
     }
   } else {
-    accumulator += frameDt;
-    let steps = 0;
-    while (accumulator >= SIM_DT && steps < 5) {
-      match.update();
-      renderer.snapshot();
-      accumulator -= SIM_DT;
-      steps++;
+    // UI-length window: the press must survive to the next frame even on a
+    // machine that hitches (gameplay never consumes the pause action)
+    if (hub.anyPress(['pause'])) {
+      paused = true;
+      hudUI.showPauseCard();
+      hub.clearAll();
+    } else {
+      accumulator += frameDt;
+      let steps = 0;
+      while (accumulator >= SIM_DT && steps < 5) {
+        match.update();
+        renderer.snapshot();
+        accumulator -= SIM_DT;
+        steps++;
+      }
+      // slow machine: drop unpayable sim debt instead of spiraling
+      if (accumulator > SIM_DT * 2) accumulator = SIM_DT * 2;
     }
-    // slow machine: drop unpayable sim debt instead of spiraling
-    if (accumulator > SIM_DT * 2) accumulator = SIM_DT * 2;
   }
 
   const alpha = Math.min(accumulator / SIM_DT, 1);
