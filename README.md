@@ -12,11 +12,39 @@ npm install
 npm run dev        # → http://localhost:5173
 ```
 
-Or build a static bundle (~190 KB gzipped, no server needed):
+Or build a static bundle (~200 KB gzipped, no server needed):
 
 ```bash
 npm run build && npm run preview
 ```
+
+## Host it for a friend (Cloudflare tunnel)
+
+The build is fully static and self-contained (relative asset paths, zero CDN
+or font requests), so any https origin works. To let someone play from your
+laptop without deploying anything:
+
+```bash
+npm run build
+npm run preview                 # serves dist/ on http://localhost:4173
+# in a second terminal:
+cloudflared tunnel --url http://localhost:4173
+```
+
+`cloudflared` prints a `https://<random>.trycloudflare.com` URL — send that
+link. Notes:
+
+- **Quick tunnels get a new random URL every run**, and tournament saves live
+  in the browser's localStorage *per origin* — so a save made on one tunnel
+  URL won't appear on tomorrow's URL. For a single game night this is fine;
+  for anything longer, use a named tunnel (stable hostname) or just deploy
+  `dist/` to any static host (Cloudflare Pages / GitHub Pages — it's one
+  folder).
+- Everything runs client-side: the tunnel only serves ~200 KB once, then the
+  laptop can even go to sleep. No latency concerns — the game runs on the
+  player's machine.
+- 2-player Versus is couch co-op **on the same machine**: keyboard + a USB/BT
+  gamepad, or two gamepads, plugged into whichever device opened the link.
 
 ## Controls (keyboard)
 
