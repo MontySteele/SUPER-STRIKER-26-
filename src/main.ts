@@ -14,6 +14,7 @@ import { Menu, type MenuResult } from './ui/menu';
 import { TournamentUI } from './ui/tournamentUI';
 import { AudioEngine } from './audio/audio';
 import { MusicPlayer } from './audio/music';
+import { Commentary } from './audio/commentary';
 import { SIM_DT } from './sim/constants';
 import type { TeamData } from './data/types';
 
@@ -21,6 +22,7 @@ const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
 const hub = new InputHub();
 const audio = new AudioEngine();
 const music = new MusicPlayer();
+const commentary = new Commentary();
 
 let inMenus = true;
 hub.onAnyButton = () => {
@@ -38,7 +40,7 @@ interface MatchConfig {
   timeOfDay: TimeOfDay;
   stadium: StadiumSize;
   knockout: boolean;
-  mode: 'match' | 'shootout';
+  mode: 'match' | 'shootout' | 'golden';
   /** what happens after full time on button press */
   onDone: ((m: Match) => void) | null; // null = default rematch/menu choice
 }
@@ -53,6 +55,7 @@ let lastTime = performance.now();
 let rafId = 0;
 
 let paused = false;
+let replayWatch = false; // user-triggered replay: sim frozen while it plays
 let lastPhase = '';
 let cardGraceUntil = 0;
 
@@ -64,6 +67,7 @@ function stopLoop(): void {
   hudUI?.destroy();
   hudUI = null;
   paused = false;
+  replayWatch = false;
 }
 
 // ---------------------------------------------------------------- menus
@@ -71,6 +75,7 @@ function stopLoop(): void {
 function showMenu(): void {
   stopLoop();
   inMenus = true;
+  commentary.stop();
   audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
@@ -81,14 +86,17 @@ function handleMenuResult(r: MenuResult): void {
   switch (r.kind) {
     case 'kickoff':
     case 'versus':
-    case 'shootout': {
-      const seats = makeSeats(r.kind === 'versus');
+    case 'shootout':
+    case 'golden': {
+      // golden goal is a party mode: 2P when a pad is plugged in, else vs CPU
+      const twoP = r.kind === 'versus' || (r.kind === 'golden' && hub.connectedPads().length > 0);
+      const seats = makeSeats(twoP);
       startMatch({
         home: r.home, away: r.away, seats,
         halfLengthSec: r.halfLengthSec, difficulty: r.difficulty,
         timeOfDay: r.timeOfDay, stadium: r.stadium,
         knockout: false,
-        mode: r.kind === 'shootout' ? 'shootout' : 'match',
+        mode: r.kind === 'shootout' ? 'shootout' : r.kind === 'golden' ? 'golden' : 'match',
         onDone: null,
       });
       break;
@@ -119,6 +127,7 @@ function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
 function showTournamentHub(): void {
   stopLoop();
   inMenus = true;
+  commentary.stop();
   audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
@@ -195,18 +204,22 @@ function startMatch(config: MatchConfig): void {
   hudUI = new HUD(match);
   hudUI.fulltimeHint = config.onDone ? 'PRESS J TO CONTINUE' : null;
   audio.setCrowd(true);
+  commentary.refresh();
   hub.clearAll();
   paused = false;
+  replayWatch = false;
   lastPhase = '';
 
   const m = match, r = renderer, h = hudUI;
+  h.canReplayGoal = () => r.hasGoalClip();
   m.events.on((e) => {
     h.onEvent(e);
     audio.onEvent(e);
     r.onEvent(e);
+    commentary.onEvent(e, m);
   });
   m.ball.onBounce = (speed) => audio.onEvent({ type: 'bounce', speed });
-  r.onReplayStateChange = (on) => h.setReplay(on);
+  r.onReplayStateChange = (on, label) => h.setReplay(on, label);
 
   h.playWipe();
   accumulator = 0;
@@ -238,7 +251,21 @@ function loop(now: number): void {
     lastPhase = match.phase;
   }
 
-  if (match.phase === 'break') {
+  if (replayWatch) {
+    // user replay: sim stays frozen; any button cuts it short
+    if (hub.anyPress(['pass', 'loft', 'shoot', 'pause', 'replay'])) {
+      renderer.stopManualReplay();
+    }
+    if (!renderer.isReplaying()) {
+      replayWatch = false;
+      hub.clearAll();
+      hudUI.playWipe();
+      if (match.phase === 'fulltime') {
+        hudUI.showFulltimeCard();
+        cardGraceUntil = now + 700;
+      }
+    }
+  } else if (match.phase === 'break') {
     if (now >= cardGraceUntil && hub.anyPress(['pass'])) {
       hudUI.hideCard();
       hudUI.playWipe();
@@ -246,6 +273,18 @@ function loop(now: number): void {
     }
   } else if (match.phase === 'fulltime') {
     if (now >= cardGraceUntil) {
+      if (hub.anyPress(['shoot']) && renderer.hasGoalClip()) {
+        // watch the goal again from the full-time card
+        hudUI.hideCard();
+        if (renderer.startManualReplay('goal')) {
+          replayWatch = true;
+          hudUI.playWipe();
+          hub.clearAll();
+        } else {
+          hudUI.showFulltimeCard();
+        }
+        return;
+      }
       if (currentConfig?.onDone) {
         if (hub.anyPress(['pass', 'loft'])) {
           const done = currentConfig.onDone;
@@ -282,6 +321,14 @@ function loop(now: number): void {
     if (hub.anyPress(['pause'])) {
       paused = true;
       hudUI.showPauseCard();
+      hub.clearAll();
+    } else if ((match.phase === 'play' || match.phase === 'restart')
+      && hub.anyPress(['replay'], 2000)
+      && renderer.startManualReplay('live')) {
+      // on-demand instant replay of the last few seconds (short press window:
+      // a stale buffered press must not yank us out of live play)
+      replayWatch = true;
+      hudUI.playWipe();
       hub.clearAll();
     } else {
       accumulator += frameDt;

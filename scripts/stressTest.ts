@@ -64,7 +64,8 @@ function checkInvariants(m: Match, label: string): void {
 }
 
 function makeMatch(homeId: string, awayId: string, seed: number, opts: {
-  difficulty?: DifficultyName; knockout?: boolean; halfLengthSec?: number; mode?: 'match' | 'shootout';
+  difficulty?: DifficultyName; knockout?: boolean; halfLengthSec?: number;
+  mode?: 'match' | 'shootout' | 'golden';
 } = {}): Match {
   return new Match({
     home: findTeam(homeId), away: findTeam(awayId),
@@ -224,6 +225,18 @@ for (const seed of [1111, 2222, 3333, 4444]) {
   }
   console.log(`  seed ${seed}: champion ${findTeam(t.state.champion).code}`);
 }
+
+// --- 8) golden goal: ends at the first goal, never on the clock -------------------
+console.log('— golden goal (6 seeds) —');
+for (let seed = 400; seed < 406; seed++) {
+  const m = runToFulltime(makeMatch('bra', 'ger', seed, { mode: 'golden', halfLengthSec: 60 }),
+    60 * 60 * 30, `gg-s${seed}`).match;
+  const total = m.teams[0].score + m.teams[1].score;
+  if (total !== 1) fail(`golden goal ended with ${total} goals (seed ${seed})`);
+  if (m.winner() === null) fail(`golden goal no winner (seed ${seed})`);
+  if (m.half !== 1) fail(`golden goal changed halves (seed ${seed})`);
+}
+console.log('  all decided by a single goal');
 
 console.log(failures === 0 ? 'STRESS TEST PASS' : `STRESS TEST FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

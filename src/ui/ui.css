@@ -494,6 +494,81 @@
   text-align: center;
 }
 
+/* ---------- M5: pre-match tactics strip ---------- */
+.prematch {
+  position: absolute;
+  top: 84px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 18px;
+  background: linear-gradient(180deg, rgba(18, 22, 30, 0.92), rgba(8, 10, 14, 0.92));
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 5px;
+  padding: 10px 22px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  animation: pmFade 8s ease forwards;
+}
+.prematch.show { display: flex; }
+@keyframes pmFade {
+  0% { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  6% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  88% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.pm-side { text-align: center; min-width: 210px; }
+.pm-team {
+  font-size: 16px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.08em;
+  border-bottom: 3px solid;
+  padding-bottom: 3px;
+  margin-bottom: 4px;
+}
+.pm-info { font-size: 11.5px; font-weight: 700; color: #9aa3b5; letter-spacing: 0.06em; }
+.pm-vs {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.24em;
+  color: #ffce4a;
+}
+.pm-vs.golden { color: #ffce4a; animation: replayBlink 1.2s steps(2) infinite; }
+
+/* ---------- M5: match story timeline ---------- */
+.story {
+  margin: 2px 0 12px;
+  padding: 8px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+.story-row {
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  display: flex;
+}
+.story-row.home { justify-content: flex-start; }
+.story-row.away { justify-content: flex-end; }
+.story-row small { color: #9aa3b5; font-weight: 600; }
+.st-ball { color: #ffce4a; }
+.st-ball.og { color: #d84a3a; }
+.st-card {
+  display: inline-block;
+  width: 9px;
+  height: 13px;
+  border-radius: 2px;
+  margin-right: 2px;
+  vertical-align: -2px;
+}
+.st-card.y { background: linear-gradient(160deg, #ffd83a, #d8a81e); }
+.st-card.r { background: linear-gradient(160deg, #e04432, #a81e14); }
+
 /* ---------- mode select ---------- */
 .mode-row .mode-sub {
   display: block;

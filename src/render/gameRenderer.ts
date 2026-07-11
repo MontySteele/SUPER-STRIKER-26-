@@ -11,7 +11,7 @@ import { buildPitch } from './pitch';
 import { Stadium, type StadiumSize } from './stadium';
 import { PlayerMesh, resolveKits } from './playerMesh';
 import { BallMesh } from './ballMesh';
-import { CameraDirector } from './camera';
+import { CameraDirector, type CamMode } from './camera';
 import { HALF_L } from '../sim/constants';
 
 interface Snap {
@@ -26,6 +26,20 @@ interface ReplayFrame {
   players: Snap[];
   anims: [ActionAnim, number][];
 }
+
+/** One camera angle over some slice of the frozen clip. */
+interface ReplayPass {
+  mode: CamMode;
+  rate: number;   // playback speed (1 = real time)
+  from: number;   // start point as a fraction of the clip
+}
+
+// The goal recap: full build-up from behind the goal, then the strike again
+// from pitch level in heavy slow-mo.
+const GOAL_PASSES: ReplayPass[] = [
+  { mode: 'replay', rate: 0.6, from: 0.2 },
+  { mode: 'replayLow', rate: 0.35, from: 0.62 },
+];
 
 export class GameRenderer {
   sceneMgr: SceneManager;
@@ -45,9 +59,14 @@ export class GameRenderer {
   private replayBuf: ReplayFrame[] = [];
   private replayAccum = 0;
   private goalSeqT = -1; // >= 0 while running the goal presentation
-  private replayFrames: ReplayFrame[] = [];
+  private goalReplayPending = false;
+  private passes: ReplayPass[] = [];
+  private passIdx = 0;
+  private passFrames: ReplayFrame[] = [];
   private replayIdx = 0;
-  onReplayStateChange: ((on: boolean) => void) | null = null;
+  private manualReplay = false; // user-triggered; main freezes the sim for us
+  private lastGoalClip: { frames: ReplayFrame[]; side: number } | null = null;
+  onReplayStateChange: ((on: boolean, label?: string) => void) | null = null;
 
   private confetti: THREE.Points | null = null;
   private confettiVel: Float32Array | null = null;
@@ -124,11 +143,74 @@ export class GameRenderer {
       else this.cam.subject.set(this.match.ball.pos.x, 0, this.match.ball.pos.y);
       this.cam.replayGoalSide = Math.sign(this.match.ball.pos.x) || 1;
       this.cam.setMode('celebration');
-      // freeze the replay clip now
-      this.replayFrames = this.replayBuf.slice(Math.max(0, this.replayBuf.length - 4 * REPLAY_FPS));
-      this.replayIdx = 0;
+      // freeze the clip now — the goal sequence recaps it, and the full-time
+      // card can bring it back
+      this.lastGoalClip = {
+        frames: this.replayBuf.slice(Math.max(0, this.replayBuf.length - 4 * REPLAY_FPS)),
+        side: this.cam.replayGoalSide,
+      };
+      this.goalReplayPending = true;
       this.spawnConfetti(e.teamIdx);
     }
+  }
+
+  // ------------------------------------------------------------- replay passes
+
+  private beginPasses(frames: ReplayFrame[], passes: ReplayPass[]): void {
+    this.passFrames = frames;
+    this.passes = passes;
+    this.startPass(0);
+  }
+
+  private startPass(i: number): void {
+    this.passIdx = i;
+    const p = this.passes[i];
+    this.replayIdx = Math.floor(this.passFrames.length * p.from);
+    this.cam.setMode(p.mode);
+    this.onReplayStateChange?.(true, i === 0 ? 'REPLAY' : `REPLAY · ANGLE ${i + 1}`);
+  }
+
+  private clearPasses(): void {
+    this.passes = [];
+    this.passFrames = [];
+  }
+
+  /** True while a user-triggered replay is playing (main freezes the sim). */
+  isReplaying(): boolean {
+    return this.manualReplay;
+  }
+
+  hasGoalClip(): boolean {
+    return this.lastGoalClip !== null;
+  }
+
+  /**
+   * Start a user-triggered replay: 'live' rewinds the last few seconds of
+   * open play; 'goal' re-runs the multi-angle recap of the last goal.
+   * Returns false when there's nothing worth showing yet.
+   */
+  startManualReplay(source: 'live' | 'goal'): boolean {
+    if (this.manualReplay || this.passes.length > 0) return false;
+    if (source === 'goal') {
+      if (!this.lastGoalClip || this.lastGoalClip.frames.length < 20) return false;
+      this.cam.replayGoalSide = this.lastGoalClip.side;
+      this.manualReplay = true;
+      this.beginPasses(this.lastGoalClip.frames, GOAL_PASSES);
+    } else {
+      if (this.replayBuf.length < 1.5 * REPLAY_FPS) return false;
+      this.manualReplay = true;
+      this.beginPasses(this.replayBuf.slice(), [{ mode: 'cine', rate: 0.5, from: 0 }]);
+    }
+    return true;
+  }
+
+  /** Cut a manual replay short (any button skips). */
+  stopManualReplay(): void {
+    if (!this.manualReplay) return;
+    this.manualReplay = false;
+    this.clearPasses();
+    this.cam.setMode('broadcast');
+    this.onReplayStateChange?.(false);
   }
 
   private removeConfetti(): void {
@@ -174,38 +256,52 @@ export class GameRenderer {
     const inGoalSeq = this.match.phase === 'goalseq';
     if (inGoalSeq && this.goalSeqT >= 0) {
       this.goalSeqT += dtReal;
-      // 0–2.2s celebration orbit → 2.2s+ replay
-      if (this.goalSeqT > 2.2 && this.cam.mode !== 'replay' && this.replayFrames.length) {
-        this.cam.setMode('replay');
-        this.onReplayStateChange?.(true);
+      // 0–2.2s celebration orbit → multi-angle recap
+      if (this.goalSeqT > 2.2 && this.goalReplayPending && this.lastGoalClip) {
+        this.goalReplayPending = false;
+        this.beginPasses(this.lastGoalClip.frames, GOAL_PASSES);
       }
     } else if (this.goalSeqT >= 0 && !inGoalSeq) {
-      // sequence over — back to broadcast (UI wipe covers the cut)
+      // sequence over (or skipped) — back to broadcast (UI wipe covers the cut)
       this.goalSeqT = -1;
-      this.cam.setMode('broadcast');
-      this.onReplayStateChange?.(false);
+      this.goalReplayPending = false;
+      if (!this.manualReplay) {
+        this.clearPasses();
+        this.cam.setMode('broadcast');
+        this.onReplayStateChange?.(false);
+      }
     }
 
-    const replaying = this.cam.mode === 'replay' && this.replayFrames.length > 0;
+    const replaying = this.passes.length > 0;
     let ballX: number, ballY: number, ballZ: number;
 
     if (replaying) {
-      // play the frozen clip at 0.55x
+      const pass = this.passes[this.passIdx];
       this.replayIdx = Math.min(
-        this.replayIdx + dtReal * REPLAY_FPS * 0.55,
-        this.replayFrames.length - 1,
+        this.replayIdx + dtReal * REPLAY_FPS * pass.rate,
+        this.passFrames.length - 1,
       );
-      const f = this.replayFrames[Math.floor(this.replayIdx)];
+      const f = this.passFrames[Math.floor(this.replayIdx)];
       [ballX, ballY, ballZ] = f.ball;
       this.ballMesh.update(ballX, ballY, ballZ);
       f.players.forEach((s, i) => {
         const [anim, animT] = f.anims[i];
         this.playerMeshes[i].update(dtReal, s.x, s.y, 0, s.facing, s.speed, anim, animT);
       });
-      if (this.replayIdx >= this.replayFrames.length - 1) {
-        // hold last frame; celebration cam returns
-        this.cam.setMode('celebration');
-        this.onReplayStateChange?.(false);
+      if (this.replayIdx >= this.passFrames.length - 1) {
+        if (this.passIdx < this.passes.length - 1) {
+          this.startPass(this.passIdx + 1);
+        } else {
+          this.clearPasses();
+          this.onReplayStateChange?.(false);
+          if (this.manualReplay) {
+            this.manualReplay = false;
+            this.cam.setMode('broadcast');
+          } else {
+            // goal sequence: hold on the celebration until the sim moves on
+            this.cam.setMode('celebration');
+          }
+        }
       }
     } else {
       // interpolated live rendering

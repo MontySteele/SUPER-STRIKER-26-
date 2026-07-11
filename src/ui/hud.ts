@@ -5,6 +5,16 @@
 import type { Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
+import { overall } from '../data/loader';
+import type { TeamData } from '../data/types';
+
+/** One line of the match story shown on break/full-time cards. */
+interface StoryEntry {
+  minute: number;
+  teamIdx: number;
+  icon: 'goal' | 'og' | 'yellow' | 'red';
+  name: string;
+}
 
 export class HUD {
   private root: HTMLElement;
@@ -24,9 +34,17 @@ export class HUD {
   private reticle!: HTMLElement;
   private penBoard!: HTMLElement;
   private penHint!: HTMLElement;
+  private replayBug!: HTMLElement;
+  private prematch!: HTMLElement;
   private controlsTimer = 14;
+  private prematchTimer = 8;
   /** Overrides the full-time prompt (tournament mode: J and K both continue). */
   fulltimeHint: string | null = null;
+  /** Set by main: whether a goal clip exists for the L-to-rewatch FT prompt. */
+  canReplayGoal: (() => boolean) | null = null;
+  private story: StoryEntry[] = [];
+  private corners = [0, 0];
+  private fouls = [0, 0];
 
   constructor(private match: Match) {
     this.root = document.getElementById('ui-root')!;
@@ -61,9 +79,10 @@ export class HUD {
       <div class="pen-board"></div>
       <div class="pen-hint"></div>
       <div class="match-card"></div>
+      <div class="prematch">${this.prematchHtml()}</div>
       <div class="controls-card">${twoP
-        ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · PAUSE ESC/START`
-        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · PAUSE ESC'}</div>
+        ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
+        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · REPLAY R · PAUSE ESC'}</div>
       <div class="wipe"></div>
     `;
     this.bugScore = this.root.querySelector('.score')!;
@@ -80,10 +99,32 @@ export class HUD {
     this.reticle = this.root.querySelector('.reticle')!;
     this.penBoard = this.root.querySelector('.pen-board')!;
     this.penHint = this.root.querySelector('.pen-hint')!;
+    this.replayBug = this.root.querySelector('.replay-bug')!;
+    this.prematch = this.root.querySelector('.prematch')!;
+    if (this.match.mode === 'shootout') this.prematchTimer = 0;
+    this.prematch.classList.toggle('show', this.prematchTimer > 0);
   }
 
-  setReplay(on: boolean): void {
+  /** Pre-match tactics strip: styles + star men, the data made visible. */
+  private prematchHtml(): string {
+    const side = (t: TeamData): string => {
+      const star = this.match.teams[t === this.match.teams[0].data ? 0 : 1].players
+        .map((p) => p.data)
+        .reduce((a, b) => (b.star || (!a.star && overall(b) > overall(a)) ? b : a));
+      return `<div class="pm-side">
+        <div class="pm-team" style="border-color:${t.kit.home}">${t.name.toUpperCase()}</div>
+        <div class="pm-info">${t.style.toUpperCase()} · ${t.formation} · ★ ${star.name.split(' ').pop()?.toUpperCase()}</div>
+      </div>`;
+    };
+    const mid = this.match.mode === 'golden'
+      ? '<div class="pm-vs golden">NEXT GOAL WINS</div>'
+      : '<div class="pm-vs">TACTICS</div>';
+    return side(this.match.teams[0].data) + mid + side(this.match.teams[1].data);
+  }
+
+  setReplay(on: boolean, label = 'REPLAY'): void {
     this.root.classList.toggle('replay-on', on);
+    if (on) this.replayBug.textContent = label;
   }
 
   playWipe(): void {
@@ -120,6 +161,10 @@ export class HUD {
         this.pushTicker(e.ownGoal
           ? `${e.minute}' — OWN GOAL! ${e.scorerName} turns it into his own net!`
           : `${e.minute}' — GOOOAL! ${e.scorerName} scores for ${teamName(e.teamIdx)}!`);
+        this.story.push({
+          minute: e.minute, teamIdx: e.teamIdx,
+          icon: e.ownGoal ? 'og' : 'goal', name: e.scorerName,
+        });
         break;
       }
       case 'miss':
@@ -132,6 +177,7 @@ export class HUD {
         this.pushTicker(`OFF THE WOODWORK! The frame says no.`);
         break;
       case 'corner':
+        this.corners[e.teamIdx]++;
         this.pushTicker(`${e.minute}' — Corner to ${teamName(e.teamIdx)}.`);
         this.playWipe();
         break;
@@ -144,6 +190,7 @@ export class HUD {
         this.playWipe();
         break;
       case 'foul':
+        this.fouls[e.teamIdx]++;
         this.pushTicker(`${e.minute}' — Foul by ${e.playerName}.`);
         break;
       case 'card': {
@@ -151,6 +198,7 @@ export class HUD {
         this.pushTicker(e.color === 'red'
           ? `${e.minute}' — RED CARD! ${e.playerName} is OFF!`
           : `${e.minute}' — Yellow card for ${e.playerName}.`);
+        this.story.push({ minute: e.minute, teamIdx: e.teamIdx, icon: e.color, name: e.playerName });
         break;
       }
       case 'penaltyAwarded':
@@ -168,6 +216,7 @@ export class HUD {
         this.pushTicker(`${teamName(e.winnerIdx)} WIN THE SHOOTOUT!`);
         break;
       case 'kickoff':
+        if (e.half === 1 && m.mode === 'golden') this.pushTicker(`GOLDEN GOAL — NEXT GOAL WINS IT ALL!`);
         if (e.half === 2) this.pushTicker(`Second half under way!`);
         if (e.half === 3) this.pushTicker(`Extra time — next 15 minutes decide it… maybe.`);
         break;
@@ -192,30 +241,58 @@ export class HUD {
     const total = Math.max(h.possessionTicks + a.possessionTicks, 1);
     const hp = Math.round((h.possessionTicks / total) * 100);
     const isFT = title === 'FULL-TIME';
-    const hint = isFT
+    let hint = isFT
       ? (this.fulltimeHint ?? 'PRESS J FOR REMATCH · K FOR MENU')
       : title === 'PENALTIES' ? 'PRESS J FOR THE SHOOTOUT' : 'PRESS J TO CONTINUE';
+    if (isFT && this.canReplayGoal?.()) hint += ' · L WATCH THE GOAL';
     const board = this.match.penalty?.board;
     const pens = board && this.match.shootoutWinner !== null
       ? `<div style="font-size:16px;color:#ffce4a;font-weight:800;margin-top:-8px;margin-bottom:10px">
           ${this.match.teams[this.match.shootoutWinner].data.name.toUpperCase()} WIN ${board.scores[0]}–${board.scores[1]} ON PENALTIES</div>`
       : '';
+    this.prematchTimer = 0;
+    this.prematch.classList.remove('show');
     this.card.innerHTML = `
-      <h1>${title}</h1>
+      <h1>${isFT && this.match.mode === 'golden' ? 'GOLDEN GOAL!' : title}</h1>
       <div class="scoreline">
         <span style="color:${h.data.kit.home}">■</span> ${h.data.name}
         ${h.score} - ${a.score}
         ${a.data.name} <span style="color:${a.data.kit.home}">■</span>
       </div>
       ${pens}
+      ${this.storyHtml()}
       <table>
         <tr><td class="val">${hp}%</td><td class="stat">POSSESSION</td><td class="val">${100 - hp}%</td></tr>
         <tr><td class="val">${h.shots}</td><td class="stat">SHOTS</td><td class="val">${a.shots}</td></tr>
         <tr><td class="val">${h.shotsOnTarget}</td><td class="stat">ON TARGET</td><td class="val">${a.shotsOnTarget}</td></tr>
+        <tr><td class="val">${this.corners[0]}</td><td class="stat">CORNERS</td><td class="val">${this.corners[1]}</td></tr>
+        <tr><td class="val">${this.fouls[0]}</td><td class="stat">FOULS</td><td class="val">${this.fouls[1]}</td></tr>
       </table>
       <div class="hint">${hint}</div>
     `;
     this.card.classList.add('show');
+  }
+
+  /** The match story: goals and cards on a minute line, home left, away right. */
+  private storyHtml(): string {
+    if (!this.story.length) return '';
+    const icon = (s: StoryEntry): string =>
+      s.icon === 'goal' ? '<span class="st-ball">●</span>'
+      : s.icon === 'og' ? '<span class="st-ball og">●</span>'
+      : s.icon === 'yellow' ? '<span class="st-card y"></span>'
+      : '<span class="st-card r"></span>';
+    const rows = this.story.map((s) => {
+      const surname = s.name.split(' ').pop()?.toUpperCase() ?? '';
+      const og = s.icon === 'og' ? ' <small>(OG)</small>' : '';
+      const body = `${icon(s)} ${s.minute}' ${surname}${og}`;
+      return `<div class="story-row ${s.teamIdx === 0 ? 'home' : 'away'}">${body}</div>`;
+    }).join('');
+    return `<div class="story">${rows}</div>`;
+  }
+
+  /** Re-show the full-time card (after an L-triggered goal replay). */
+  showFulltimeCard(): void {
+    this.showCard('FULL-TIME');
   }
 
   hideCard(): void {
@@ -284,6 +361,10 @@ export class HUD {
     if (this.controlsTimer > 0) {
       this.controlsTimer -= dt;
       if (this.controlsTimer <= 0) this.controlsCard.style.display = 'none';
+    }
+    if (this.prematchTimer > 0) {
+      this.prematchTimer -= dt;
+      if (this.prematchTimer <= 0) this.prematch.classList.remove('show');
     }
   }
 

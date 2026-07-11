@@ -67,8 +67,8 @@ export interface MatchOptions {
   difficulty: DifficultyName;
   /** knockout: a draw goes to extra time → penalties */
   knockout?: boolean;
-  /** shootout-only mode: straight to penalties, no open play */
-  mode?: 'match' | 'shootout';
+  /** shootout: straight to penalties. golden: no clock, next goal wins. */
+  mode?: 'match' | 'shootout' | 'golden';
   seed?: number;
 }
 
@@ -90,7 +90,7 @@ export class Match {
   clock = 0;          // in-play seconds of the current half
   halfLength: number;
   knockout: boolean;
-  mode: 'match' | 'shootout';
+  mode: 'match' | 'shootout' | 'golden';
   kickoffTeam = 0;
   restart: RestartInfo | null = null;
   penalty: PenaltyController | null = null;
@@ -266,8 +266,10 @@ export class Match {
     this.checkGoalAndBounds(prevZ);
     this.updateStatsAndCrowd(dt);
 
-    // period end (wait for a neutral-ish moment: ball below head height)
-    if (this.clock >= this.halfLenFor(this.half) && this.ball.pos.z < 2 && this.phase === 'play') {
+    // period end (wait for a neutral-ish moment: ball below head height);
+    // golden goal has no clock — it only ends when somebody scores
+    if (this.mode !== 'golden'
+      && this.clock >= this.halfLenFor(this.half) && this.ball.pos.z < 2 && this.phase === 'play') {
       this.endPeriod();
     }
   }
@@ -368,6 +370,12 @@ export class Match {
               y: this.rng.noise(),
             });
             ball.kick({ x: dir.x, y: dir.y, z: 0.08 }, 6 + this.rng.next() * 4, opp);
+            // lock out the ROBBED man, not the tackler — the ball pops loose
+            // at the carrier's feet, and without this he re-collects it before
+            // it can leave his control radius (a parked carrier became
+            // literally undispossessable)
+            ball.noControlPlayer = carrier;
+            ball.noControlTimer = 0.45;
             opp.playAnim('pass', 0.2);
             carrier.actionLock = Math.max(carrier.actionLock, 0.3);
             this.events.emit({ type: 'tackle' });
@@ -575,6 +583,10 @@ export class Match {
         }
         const away = norm2({ x: this.teams[p.teamIdx].attackDir + this.rng.noise(), y: this.rng.noise() * 1.4 });
         this.ball.kick({ x: away.x, y: away.y, z: 0.15 }, 11, p);
+        if (carrier && carrier.teamIdx !== p.teamIdx) {
+          this.ball.noControlPlayer = carrier; // slide winner: same lockout
+          this.ball.noControlTimer = 0.45;
+        }
         this.events.emit({ type: 'tackle' });
         return;
       }
@@ -865,9 +877,11 @@ export class Match {
       b.pos.x = clamp(b.pos.x, -HALF_L - 2, HALF_L + 2);
       b.pos.y = clamp(b.pos.y, -GOAL_HALF_W - 1, GOAL_HALF_W + 1);
     }
-    if (this.phaseTimer > 6.2 || (this.phaseTimer > 1.5 && this.anyButton())) {
+    // long enough for the two-angle recap; any button still skips
+    if (this.phaseTimer > 12.5 || (this.phaseTimer > 1.5 && this.anyButton())) {
+      if (this.mode === 'golden') this.finishMatch();
       // a goal on the final whistle still ends the period
-      if (this.clock >= this.halfLenFor(this.half)) this.endPeriod();
+      else if (this.clock >= this.halfLenFor(this.half)) this.endPeriod();
       else this.setupKickoff(1 - this.lastGoalTeamIdx);
     }
   }

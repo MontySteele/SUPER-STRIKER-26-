@@ -7,8 +7,9 @@ import type { DifficultyName } from '../sim/match';
 import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { Tournament } from '../sim/tournament';
+import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
 
-export type GameMode = 'kickoff' | 'versus' | 'shootout';
+export type GameMode = 'kickoff' | 'versus' | 'shootout' | 'golden';
 
 export type MenuResult =
   | {
@@ -83,6 +84,7 @@ export class Menu {
           : '2P couch play · CONNECT A GAMEPAD', id: 'versus',
         disabled: this.padCount() === 0,
       },
+      { label: 'GOLDEN GOAL', sub: 'Party mode · no clock · next goal wins', id: 'golden' },
       { label: 'TOURNAMENT', sub: '48 teams · groups · knockout · glory', id: 'tournament' },
       { label: 'PENALTY SHOOTOUT', sub: 'Straight to the spot', id: 'shootout' },
     );
@@ -165,17 +167,20 @@ export class Menu {
   }
 
   private settingsRows(): [string, string][] {
+    const commentary: [string, string] = ['COMMENTARY', commentaryEnabled() ? 'ON' : 'OFF'];
     if (this.mode === 'tournament') {
       return [
         ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
+        commentary,
       ];
     }
-    if (this.mode === 'shootout') {
+    if (this.mode === 'shootout' || this.mode === 'golden') {
       return [
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
+        commentary,
       ];
     }
     return [
@@ -183,6 +188,7 @@ export class Menu {
       ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
       ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
       ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
+      commentary,
     ];
   }
 
@@ -193,6 +199,11 @@ export class Menu {
     if (key === 'DIFFICULTY') this.diffIdx = (this.diffIdx + d + DIFF_OPTIONS.length) % DIFF_OPTIONS.length;
     if (key === 'KICK-OFF') this.todIdx = (this.todIdx + d + TOD_OPTIONS.length) % TOD_OPTIONS.length;
     if (key === 'STADIUM') this.stadiumIdx = (this.stadiumIdx + d + STADIUM_OPTIONS.length) % STADIUM_OPTIONS.length;
+    if (key === 'COMMENTARY') {
+      try {
+        localStorage.setItem(COMMENTARY_KEY, commentaryEnabled() ? 'off' : 'on');
+      } catch { /* private browsing: toggle just won't persist */ }
+    }
   }
 
   private pick(team: TeamData): void {
@@ -333,7 +344,8 @@ export class Menu {
   private renderSettings(): void {
     const rows = this.settingsRows();
     const goLabel = this.mode === 'tournament' ? 'START TOURNAMENT'
-      : this.mode === 'shootout' ? 'TO THE SPOT!' : 'KICK OFF!';
+      : this.mode === 'shootout' ? 'TO THE SPOT!'
+      : this.mode === 'golden' ? 'NEXT GOAL WINS!' : 'KICK OFF!';
     const rowsHtml = rows.map(([k, v], i) =>
       `<div class="setting-row${i === this.focus ? ' focus' : ''}" data-row="${i}">
         <span>${k}</span><span class="value">◀ ${v} ▶</span>

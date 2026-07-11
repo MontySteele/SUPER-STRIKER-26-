@@ -2,7 +2,7 @@
 // cover), everyone else keeps shape. Center-backs' line discipline lives in
 // teamShape.ts.
 
-import { dist2, norm2, sub2, type V2 } from '../../core/math';
+import { dist2, len2, norm2, sub2, type V2 } from '../../core/math';
 import { HALF_L } from '../constants';
 import type { PlayerEntity } from '../player';
 import type { Team } from '../team';
@@ -44,10 +44,13 @@ export function updateDefender(
     if (d > 6) {
       p.moveToward({ x: ball.x, y: ball.y }, 1, match.difficulty.cpuSprint && d > 10);
     } else {
-      // jockey goal-side, then step in when the touch is loose
+      // jockey goal-side, then step in when the touch is loose — or when the
+      // carrier just stands there (jockeying at 1.4m sits outside the 1.3m
+      // tackle radius, so a parked carrier could otherwise never be robbed)
       const target = containTarget(match, team, 1.4);
       const looseTouch = !carrier || dist2({ x: ball.x, y: ball.y }, carrier.pos) > 1.5;
-      p.moveToward(looseTouch ? { x: ball.x, y: ball.y } : target, 1, false);
+      const carrierIdle = !!carrier && len2(carrier.vel) < 1.5;
+      p.moveToward(looseTouch || carrierIdle ? { x: ball.x, y: ball.y } : target, 1, false);
     }
   } else {
     // cover: protect the space behind the presser

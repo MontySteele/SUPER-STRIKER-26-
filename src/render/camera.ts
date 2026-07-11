@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { clamp, damp } from '../core/math';
 import { HALF_L } from '../sim/constants';
 
-export type CamMode = 'broadcast' | 'celebration' | 'replay' | 'penalty';
+export type CamMode = 'broadcast' | 'celebration' | 'replay' | 'replayLow' | 'cine' | 'penalty';
 
 export class CameraDirector {
   mode: CamMode = 'broadcast';
@@ -56,6 +56,23 @@ export class CameraDirector {
         ty = 3.4;
         tz = 26;
         lx = ballX; ly = Math.max(ballZ, 0.6); lz = ballY;
+        break;
+      }
+      case 'replayLow': {
+        // second angle: pitch-level from the far post, opposite touchline
+        const gx = HALF_L * this.replayGoalSide;
+        tx = gx - this.replayGoalSide * 9;
+        ty = 1.3;
+        tz = -21;
+        lx = ballX; ly = Math.max(ballZ, 0.8); lz = ballY;
+        break;
+      }
+      case 'cine': {
+        // on-demand replay: low, tight sideline tracker chasing the ball
+        tx = clamp(ballX * 0.92, -46, 46);
+        ty = 3.6 + ballZ * 0.3;
+        tz = 19;
+        lx = ballX; ly = Math.max(ballZ * 0.7, 0.7); lz = ballY;
         break;
       }
       case 'broadcast':

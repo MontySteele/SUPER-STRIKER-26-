@@ -2,13 +2,13 @@
 // (§3.4): keyboard vs gamepad, or two gamepads. Actions buffer for 150ms so a
 // pass queued during a receive animation fires the instant the touch completes.
 
-export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics' | 'pause';
+export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics' | 'pause' | 'replay';
 export type DeviceKind = 'merged' | 'keyboard' | 'pad';
 
 export interface Stick { x: number; y: number; }
 
 const BUFFER_MS = 150;
-const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics', 'pause'];
+const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics', 'pause', 'replay'];
 
 interface ActionState {
   held: boolean;
@@ -68,13 +68,14 @@ const KEY_MAP: Record<string, Action | 'sprint' | 'up' | 'down' | 'left' | 'righ
   Space: 'switch', Tab: 'tactics',
   ShiftLeft: 'sprint', ShiftRight: 'sprint',
   Escape: 'pause', KeyP: 'pause',
+  KeyR: 'replay',
 };
 
 // Standard mapping: 0=A pass, 1=B loft, 2=X shoot, 3=Y through, 4=LB switch,
-// 7=RT sprint, 9=Start pause
+// 7=RT sprint, 8=Back replay, 9=Start pause
 const PAD_MAP: [number, Action | 'sprint'][] = [
   [0, 'pass'], [1, 'loft'], [2, 'shoot'], [3, 'through'], [4, 'switch'], [7, 'sprint'],
-  [9, 'pause'],
+  [8, 'replay'], [9, 'pause'],
 ];
 
 export class InputHub {
