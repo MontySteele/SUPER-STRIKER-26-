@@ -12,6 +12,8 @@ import type { TimeOfDay } from './render/scene';
 import type { StadiumSize } from './render/stadium';
 import { HUD } from './ui/hud';
 import { Menu, type MenuResult } from './ui/menu';
+import { RosterEditor } from './ui/rosterEditor';
+import { applyRosterOverrides } from './data/roster';
 import { TournamentUI } from './ui/tournamentUI';
 import { AudioEngine } from './audio/audio';
 import { MusicPlayer } from './audio/music';
@@ -80,7 +82,7 @@ function showMenu(): void {
   audio.setCrowd(false);
   const ctx = audio.context();
   if (ctx && !music.playing) music.start(ctx);
-  startAttract();
+  if (!attractMatch) startAttract(); // editor exit: don't restart the show
   new Menu(handleMenuResult, () => hub.connectedPads().length);
 }
 
@@ -113,6 +115,9 @@ function handleMenuResult(r: MenuResult): void {
       tournament = Tournament.load();
       if (tournament) showTournamentHub();
       else showMenu();
+      break;
+    case 'editor':
+      new RosterEditor(() => showMenu());
       break;
   }
 }
@@ -436,4 +441,5 @@ function loop(now: number): void {
   audio.update(frameDt);
 }
 
+applyRosterOverrides();
 showMenu();

@@ -125,7 +125,10 @@ confirm, K back. On the full-time card, **L** replays the last goal.
   assets.
 - **The data:** all 48 teams live in `src/data/teams.json` — real 2026 World
   Cup squads with per-player ratings and one star player per team (gold ring,
-  +10 ratings). Don't like the roster? Edit the JSON and put yourself up front.
+  +10 ratings). Don't like the roster? **EDIT TEAMS** on the main menu opens a
+  full roster editor — rename anyone, crank ratings, hand out extra stars.
+  Edits save to your browser and every mode uses them; RESET TO FACTORY
+  restores the real squad any time.
 
 ## Match settings
 

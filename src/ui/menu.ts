@@ -19,7 +19,8 @@ export type MenuResult =
       timeOfDay: TimeOfDay; stadium: StadiumSize;
     }
   | { kind: 'tournament-new'; teamId: string; difficulty: DifficultyName; halfLengthSec: number }
-  | { kind: 'tournament-continue' };
+  | { kind: 'tournament-continue' }
+  | { kind: 'editor' };
 
 type Screen = 'title' | 'mode' | 'pickHome' | 'pickAway' | 'settings';
 
@@ -87,6 +88,7 @@ export class Menu {
       { label: 'GOLDEN GOAL', sub: 'Party mode · no clock · next goal wins', id: 'golden' },
       { label: 'TOURNAMENT', sub: '48 teams · groups · knockout · glory', id: 'tournament' },
       { label: 'PENALTY SHOOTOUT', sub: 'Straight to the spot', id: 'shootout' },
+      { label: 'EDIT TEAMS', sub: 'Rename players, boost ratings — put your friend up front', id: 'editor' },
     );
     return rows;
   }
@@ -158,6 +160,10 @@ export class Menu {
     if (disabled) return;
     if (id === 'tournament-continue') {
       this.finish({ kind: 'tournament-continue' });
+      return;
+    }
+    if (id === 'editor') {
+      this.finish({ kind: 'editor' });
       return;
     }
     this.mode = id as GameMode | 'tournament';

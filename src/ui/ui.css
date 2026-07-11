@@ -721,6 +721,52 @@
   color: #e8ecf4;
 }
 
+/* ---------- roster editor ---------- */
+.roster-wrap {
+  max-height: 62vh;
+  overflow-y: auto;
+  padding: 4px;
+}
+.tour-table.roster th, .tour-table.roster td { padding: 3px 6px; }
+.ros-in {
+  pointer-events: auto;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+  color: #eef1f6;
+  font: inherit;
+  font-weight: 700;
+  padding: 3px 6px;
+}
+.ros-in:focus {
+  outline: none;
+  border-color: #ffce4a;
+  background: rgba(255, 206, 74, 0.12);
+}
+.ros-in.num {
+  width: 44px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.ros-in.name { width: 168px; }
+.ros-star {
+  pointer-events: auto;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.25);
+  font-size: 15px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+.ros-star.on {
+  color: #ffce4a;
+  border-color: #ffce4a;
+  text-shadow: 0 0 8px rgba(255, 206, 74, 0.8);
+}
+.ros-ovr { color: #ffce4a; font-weight: 900; }
+.ros-rating { color: #8a93a8; font-style: normal; font-size: 15px; }
+
 /* golden boot strip on the hub */
 .tour-note.boot {
   color: #ffce4a;
