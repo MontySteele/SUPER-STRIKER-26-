@@ -1,0 +1,25 @@
+{
+  "name": "super-striker-26",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SUPER STRIKER '26 — a browser-based PS3-era football game",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MontySteele/SUPER-STRIKER-26-.git"
+  },
+  "dependencies": {
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4"
+  }
+}
