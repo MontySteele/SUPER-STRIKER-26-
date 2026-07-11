@@ -1,10 +1,10 @@
 // Match HUD: score bug, clock, ticker (the always-correct commentator, §7.3),
-// power bar, nameplate, replay dressing, goal banner, halftime/fulltime cards.
+// power bars (one per seat), penalty reticle + shootout board, card banners,
+// replay dressing, goal banner, break/fulltime cards.
 
 import type { Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
-import type { InputSystem } from '../input/input';
-import { SHOT_MAX_HOLD } from '../sim/constants';
+import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
 
 export class HUD {
   private root: HTMLElement;
@@ -13,22 +13,27 @@ export class HUD {
   private ticker!: HTMLElement;
   private tickerQueue: string[] = [];
   private tickerBusy = false;
-  private powerWrap!: HTMLElement;
-  private powerFill!: HTMLElement;
-  private nameplate!: HTMLElement;
+  private powerWraps: HTMLElement[] = [];
+  private powerFills: HTMLElement[] = [];
+  private nameplates: HTMLElement[] = [];
   private goalBanner!: HTMLElement;
+  private cardFlash!: HTMLElement;
   private card!: HTMLElement;
   private wipe!: HTMLElement;
   private controlsCard!: HTMLElement;
+  private reticle!: HTMLElement;
+  private penBoard!: HTMLElement;
+  private penHint!: HTMLElement;
   private controlsTimer = 14;
 
-  constructor(private match: Match, private input: InputSystem) {
+  constructor(private match: Match) {
     this.root = document.getElementById('ui-root')!;
     this.build();
   }
 
   private build(): void {
     const [home, away] = this.match.teams;
+    const twoP = this.match.seats[0] !== null && this.match.seats[1] !== null;
     this.root.innerHTML = `
       <div class="letterbox-top"></div>
       <div class="letterbox-bot"></div>
@@ -42,23 +47,35 @@ export class HUD {
         <div class="clock">0'</div>
       </div>
       <div class="ticker"></div>
-      <div class="power-wrap"><div class="power-fill"></div></div>
-      <div class="nameplate"></div>
+      <div class="power-wrap p1"><div class="power-fill"></div></div>
+      <div class="power-wrap p2"><div class="power-fill"></div></div>
+      <div class="nameplate np1"></div>
+      <div class="nameplate np2"></div>
       <div class="goal-banner">GOAL!</div>
+      <div class="card-flash"></div>
+      <div class="reticle"></div>
+      <div class="pen-board"></div>
+      <div class="pen-hint"></div>
       <div class="match-card"></div>
-      <div class="controls-card">MOVE WASD &nbsp;·&nbsp; PASS J &nbsp;·&nbsp; LOFT K &nbsp;·&nbsp; SHOOT L (hold) &nbsp;·&nbsp; THROUGH I &nbsp;·&nbsp; SPRINT SHIFT &nbsp;·&nbsp; SWITCH SPACE</div>
+      <div class="controls-card">${twoP
+        ? 'P1 KEYBOARD · P2 GAMEPAD — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT'
+        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE'}</div>
       <div class="wipe"></div>
     `;
     this.bugScore = this.root.querySelector('.score')!;
     this.bugClock = this.root.querySelector('.clock')!;
     this.ticker = this.root.querySelector('.ticker')!;
-    this.powerWrap = this.root.querySelector('.power-wrap')!;
-    this.powerFill = this.root.querySelector('.power-fill')!;
-    this.nameplate = this.root.querySelector('.nameplate')!;
+    this.powerWraps = [...this.root.querySelectorAll<HTMLElement>('.power-wrap')];
+    this.powerFills = [...this.root.querySelectorAll<HTMLElement>('.power-fill')];
+    this.nameplates = [...this.root.querySelectorAll<HTMLElement>('.nameplate')];
     this.goalBanner = this.root.querySelector('.goal-banner')!;
+    this.cardFlash = this.root.querySelector('.card-flash')!;
     this.card = this.root.querySelector('.match-card')!;
     this.wipe = this.root.querySelector('.wipe')!;
     this.controlsCard = this.root.querySelector('.controls-card')!;
+    this.reticle = this.root.querySelector('.reticle')!;
+    this.penBoard = this.root.querySelector('.pen-board')!;
+    this.penHint = this.root.querySelector('.pen-hint')!;
   }
 
   setReplay(on: boolean): void {
@@ -67,7 +84,7 @@ export class HUD {
 
   playWipe(): void {
     this.wipe.classList.remove('go');
-    void this.wipe.offsetWidth; // restart the animation
+    void this.wipe.offsetWidth;
     this.wipe.classList.add('go');
   }
 
@@ -120,11 +137,36 @@ export class HUD {
         this.pushTicker(`${e.minute}' — Flag's up! ${e.playerName} strayed offside.`);
         this.playWipe();
         break;
+      case 'foul':
+        this.pushTicker(`${e.minute}' — Foul by ${e.playerName}.`);
+        break;
+      case 'card': {
+        this.flashCard(e.color);
+        this.pushTicker(e.color === 'red'
+          ? `${e.minute}' — RED CARD! ${e.playerName} is OFF!`
+          : `${e.minute}' — Yellow card for ${e.playerName}.`);
+        break;
+      }
+      case 'penaltyAwarded':
+        this.pushTicker(`${e.minute}' — PENALTY to ${teamName(e.teamIdx)}!`);
+        this.playWipe();
+        break;
+      case 'penKick': {
+        const msg = e.result === 'goal' ? `${e.takerName} buries it!`
+          : e.result === 'saved' ? `SAVED! ${e.takerName} is denied!`
+          : `${e.takerName} misses!`;
+        this.pushTicker(msg);
+        break;
+      }
+      case 'shootoutEnd':
+        this.pushTicker(`${teamName(e.winnerIdx)} WIN THE SHOOTOUT!`);
+        break;
       case 'kickoff':
         if (e.half === 2) this.pushTicker(`Second half under way!`);
+        if (e.half === 3) this.pushTicker(`Extra time — next 15 minutes decide it… maybe.`);
         break;
-      case 'halftime':
-        this.showCard('HALF-TIME');
+      case 'break':
+        this.showCard(e.label);
         break;
       case 'fulltime':
         this.showCard('FULL-TIME');
@@ -134,11 +176,25 @@ export class HUD {
     }
   }
 
+  private flashCard(color: 'yellow' | 'red'): void {
+    this.cardFlash.className = `card-flash show ${color}`;
+    setTimeout(() => this.cardFlash.classList.remove('show'), 1600);
+  }
+
   private showCard(title: string): void {
     const [h, a] = this.match.teams;
     const total = Math.max(h.possessionTicks + a.possessionTicks, 1);
     const hp = Math.round((h.possessionTicks / total) * 100);
-    const hint = title === 'FULL-TIME' ? 'PRESS J FOR REMATCH · K FOR MENU' : 'PRESS J TO CONTINUE';
+    const isFT = title === 'FULL-TIME';
+    const hint = isFT
+      ? (this.match.opts.mode === 'shootout' ? 'PRESS J FOR REMATCH · K FOR MENU'
+        : 'PRESS J FOR REMATCH · K FOR MENU')
+      : title === 'PENALTIES' ? 'PRESS J FOR THE SHOOTOUT' : 'PRESS J TO CONTINUE';
+    const board = this.match.penalty?.board;
+    const pens = board && this.match.shootoutWinner !== null
+      ? `<div style="font-size:16px;color:#ffce4a;font-weight:800;margin-top:-8px;margin-bottom:10px">
+          ${this.match.teams[this.match.shootoutWinner].data.name.toUpperCase()} WIN ${board.scores[0]}–${board.scores[1]} ON PENALTIES</div>`
+      : '';
     this.card.innerHTML = `
       <h1>${title}</h1>
       <div class="scoreline">
@@ -146,6 +202,7 @@ export class HUD {
         ${h.score} - ${a.score}
         ${a.data.name} <span style="color:${a.data.kit.home}">■</span>
       </div>
+      ${pens}
       <table>
         <tr><td class="val">${hp}%</td><td class="stat">POSSESSION</td><td class="val">${100 - hp}%</td></tr>
         <tr><td class="val">${h.shots}</td><td class="stat">SHOTS</td><td class="val">${a.shots}</td></tr>
@@ -160,46 +217,111 @@ export class HUD {
     this.card.classList.remove('show');
   }
 
-  get cardVisible(): boolean {
-    return this.card.classList.contains('show');
-  }
-
   /** Per-frame HUD refresh. screenPos comes from the renderer. */
   update(dt: number, screenPos: (x: number, y: number, z: number) => { x: number; y: number; visible: boolean }): void {
     const m = this.match;
     this.bugScore.textContent = `${m.teams[0].score} - ${m.teams[1].score}`;
-    this.bugClock.textContent = `${m.displayMinute()}'`;
+    const inPens = m.phase === 'shootout' || m.phase === 'penalty';
+    this.bugClock.textContent = m.phase === 'shootout' ? 'PENS' : `${m.displayMinute()}'`;
 
-    // shot power bar
-    const charging = m.humanTeamIdx !== null && this.input.isHeld('shoot')
-      && m.ball.owner === m.controlled && m.controlled !== null;
-    this.powerWrap.classList.toggle('show', !!charging);
-    if (charging) {
-      const p = Math.min(this.input.heldDuration('shoot') / SHOT_MAX_HOLD, 1);
-      this.powerFill.style.width = `${p * 100}%`;
-    }
-
-    // nameplate under the controlled player
-    const ctrl = m.controlled;
-    const inAction = m.phase === 'play' || m.phase === 'restart' || m.phase === 'kickoff';
-    if (ctrl && inAction) {
-      const sp = screenPos(ctrl.pos.x, ctrl.pos.y, 2.6);
-      if (sp.visible) {
-        this.nameplate.style.display = 'block';
-        this.nameplate.style.left = `${sp.x}%`;
-        this.nameplate.style.top = `${sp.y}%`;
-        this.nameplate.textContent = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}`;
-      } else {
-        this.nameplate.style.display = 'none';
+    // shot power bars, one per seat (penalties charge through the same bar)
+    for (let i = 0; i < 2; i++) {
+      const seat = m.seats[i];
+      let frac = -1;
+      if (seat) {
+        const pen = m.penalty;
+        if (inPens && pen && pen.kickingTeam === i && pen.phase === 'aim' && pen.charging) {
+          frac = Math.min(seat.heldDuration('shoot') / 0.9, 1);
+        } else if (!inPens && seat.isHeld('shoot') && m.ball.owner === m.controlled[i]) {
+          frac = Math.min(seat.heldDuration('shoot') / SHOT_MAX_HOLD, 1);
+        }
       }
-    } else {
-      this.nameplate.style.display = 'none';
+      this.powerWraps[i].classList.toggle('show', frac >= 0);
+      if (frac >= 0) this.powerFills[i].style.width = `${frac * 100}%`;
     }
 
-    // fade the controls reminder after a while
+    // nameplates over each controlled player
+    const inAction = m.phase === 'play' || m.phase === 'restart' || m.phase === 'kickoff';
+    for (let i = 0; i < 2; i++) {
+      const ctrl = m.controlled[i];
+      const np = this.nameplates[i];
+      if (ctrl && m.seats[i] && inAction && !ctrl.sentOff) {
+        const sp = screenPos(ctrl.pos.x, ctrl.pos.y, 2.6);
+        if (sp.visible) {
+          np.style.display = 'block';
+          np.style.left = `${sp.x}%`;
+          np.style.top = `${sp.y}%`;
+          np.textContent = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}`;
+        } else {
+          np.style.display = 'none';
+        }
+      } else {
+        np.style.display = 'none';
+      }
+    }
+
+    this.updatePenaltyUI(screenPos);
+
     if (this.controlsTimer > 0) {
       this.controlsTimer -= dt;
       if (this.controlsTimer <= 0) this.controlsCard.style.display = 'none';
+    }
+  }
+
+  private updatePenaltyUI(screenPos: (x: number, y: number, z: number) => { x: number; y: number; visible: boolean }): void {
+    const m = this.match;
+    const pen = m.penalty;
+    const active = pen && (m.phase === 'penalty' || m.phase === 'shootout');
+
+    // reticle: only for a human taker while aiming; fades with difficulty (§6.5)
+    const showReticle = active && pen!.phase === 'aim' && m.seats[pen!.kickingTeam] !== null;
+    if (showReticle) {
+      const gx = HALF_L * pen!.goalSide;
+      const aimY = pen!.aimX * (GOAL_HALF_W - 0.25);
+      const sp = screenPos(gx, aimY, 1.15);
+      this.reticle.style.display = sp.visible ? 'block' : 'none';
+      this.reticle.style.left = `${sp.x}%`;
+      this.reticle.style.top = `${sp.y}%`;
+      const op = m.difficulty.cpuNoise > 1.3 ? 0.9 : m.difficulty.cpuNoise > 0.8 ? 0.55 : 0.25;
+      this.reticle.style.opacity = String(op);
+    } else {
+      this.reticle.style.display = 'none';
+    }
+
+    // hint line
+    if (active && pen!.phase === 'aim') {
+      const takerHuman = m.seats[pen!.kickingTeam] !== null;
+      const keeperHuman = m.seats[1 - pen!.kickingTeam] !== null;
+      this.penHint.style.display = 'block';
+      this.penHint.textContent = takerHuman && keeperHuman
+        ? 'TAKER: AIM ◀ ▶, HOLD SHOOT · KEEPER: PICK A SIDE AS THEY STRIKE'
+        : takerHuman ? 'AIM ◀ ▶ · HOLD SHOOT FOR POWER, RELEASE TO STRIKE'
+        : keeperHuman ? 'PICK A DIVE: HOLD ◀ OR ▶ AS THEY STRIKE' : '';
+    } else {
+      this.penHint.style.display = 'none';
+    }
+
+    // shootout board
+    if (m.phase === 'shootout' && pen?.board) {
+      const b = pen.board;
+      const row = (idx: number): string => {
+        const dots: string[] = [];
+        const n = Math.max(5, b.kicks[0].length, b.kicks[1].length);
+        for (let k = 0; k < n; k++) {
+          const r = b.kicks[idx][k];
+          dots.push(`<span class="pen-dot ${r ?? ''}"></span>`);
+        }
+        const t = m.teams[idx].data;
+        return `<div class="pen-row">
+          <span class="pen-code" style="color:${t.kit.home}">${t.code}</span>
+          <span class="pen-score">${b.scores[idx]}</span>${dots.join('')}
+        </div>`;
+      };
+      this.penBoard.style.display = 'block';
+      this.penBoard.innerHTML = row(0) + row(1)
+        + (b.suddenDeath ? '<div class="pen-sd">SUDDEN DEATH</div>' : '');
+    } else {
+      this.penBoard.style.display = 'none';
     }
   }
 

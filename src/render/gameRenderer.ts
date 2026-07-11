@@ -8,7 +8,7 @@ import type { MatchEvent } from '../sim/matchEvents';
 import type { PlayerEntity, ActionAnim } from '../sim/player';
 import { SceneManager, type TimeOfDay } from './scene';
 import { buildPitch } from './pitch';
-import { Stadium } from './stadium';
+import { Stadium, type StadiumSize } from './stadium';
 import { PlayerMesh, resolveKits } from './playerMesh';
 import { BallMesh } from './ballMesh';
 import { CameraDirector } from './camera';
@@ -33,7 +33,7 @@ export class GameRenderer {
   cam: CameraDirector;
   playerMeshes: PlayerMesh[] = [];
   ballMesh: BallMesh;
-  switchArrow: THREE.Mesh;
+  switchArrows: [THREE.Mesh, THREE.Mesh];
 
   // interpolation snapshots
   private prevSnaps: Snap[] = [];
@@ -53,10 +53,11 @@ export class GameRenderer {
   private confettiVel: Float32Array | null = null;
   private confettiT = 0;
 
-  constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay) {
+  constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
+    stadiumSize: StadiumSize = 'national') {
     this.sceneMgr = new SceneManager(canvas, timeOfDay);
     buildPitch(this.sceneMgr.scene);
-    this.stadium = new Stadium(this.sceneMgr.scene, timeOfDay === 'night');
+    this.stadium = new Stadium(this.sceneMgr.scene, timeOfDay === 'night', stadiumSize);
     this.cam = new CameraDirector(this.sceneMgr.camera);
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
@@ -69,13 +70,17 @@ export class GameRenderer {
     });
     for (const pm of this.playerMeshes) this.sceneMgr.scene.add(pm.root);
 
-    // chunky gold switch indicator (§5)
-    this.switchArrow = new THREE.Mesh(
-      new THREE.ConeGeometry(0.28, 0.5, 4),
-      new THREE.MeshBasicMaterial({ color: 0xffce4a }),
-    );
-    this.switchArrow.rotation.x = Math.PI;
-    this.sceneMgr.scene.add(this.switchArrow);
+    // chunky switch indicators (§5): P1 gold, P2 silver
+    const mkArrow = (color: number): THREE.Mesh => {
+      const m = new THREE.Mesh(
+        new THREE.ConeGeometry(0.28, 0.5, 4),
+        new THREE.MeshBasicMaterial({ color }),
+      );
+      m.rotation.x = Math.PI;
+      this.sceneMgr.scene.add(m);
+      return m;
+    };
+    this.switchArrows = [mkArrow(0xffce4a), mkArrow(0xdde4f0)];
 
     this.snapshot();
     this.snapshot();
@@ -215,15 +220,33 @@ export class GameRenderer {
       this.ballMesh.update(ballX, ballY, ballZ);
     }
 
-    // switch indicator hovers over the controlled player
-    const ctrl = this.match.controlled;
-    if (ctrl && this.match.humanTeamIdx !== null && !replaying) {
-      this.switchArrow.visible = true;
-      const bob = Math.sin(performance.now() * 0.006) * 0.08;
-      this.switchArrow.position.set(ctrl.pos.x, 2.35 + bob, ctrl.pos.y);
-      this.switchArrow.rotation.y += dtReal * 2;
-    } else {
-      this.switchArrow.visible = false;
+    // switch indicators hover over each seat's controlled player
+    for (let i = 0; i < 2; i++) {
+      const ctrl = this.match.controlled[i];
+      const arrow = this.switchArrows[i];
+      if (ctrl && this.match.seats[i] && !replaying && !ctrl.sentOff) {
+        arrow.visible = true;
+        const bob = Math.sin(performance.now() * 0.006 + i * 2) * 0.08;
+        arrow.position.set(ctrl.pos.x, 2.35 + bob, ctrl.pos.y);
+        arrow.rotation.y += dtReal * 2;
+      } else {
+        arrow.visible = false;
+      }
+    }
+
+    // sent-off players leave the pitch (and the scene)
+    const all = this.match.allPlayers;
+    for (let i = 0; i < all.length; i++) {
+      this.playerMeshes[i].root.visible = !all[i].sentOff;
+    }
+
+    // penalty / shootout camera
+    const penPhase = this.match.phase === 'penalty' || this.match.phase === 'shootout';
+    if (penPhase && this.cam.mode !== 'penalty') {
+      this.cam.penaltySide = this.match.penalty?.goalSide ?? 1;
+      this.cam.setMode('penalty');
+    } else if (!penPhase && this.cam.mode === 'penalty') {
+      this.cam.setMode('broadcast');
     }
 
     // confetti physics

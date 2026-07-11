@@ -1,12 +1,13 @@
-// Match orchestrator: fixed-timestep sim, human control, possession model,
-// referee (out of bounds / goals / restarts), and the match state machine.
+// Match orchestrator: fixed-timestep sim, human control (1–2 seats), possession
+// model, referee (bounds / goals / fouls / cards / penalties), extra time and
+// shootouts for knockout draws, and the match state machine.
 
 import { clamp, dist2, len2, norm2, sub2, v2, type V2 } from '../core/math';
 import { EventBus } from '../core/events';
 import { RNG } from '../core/rng';
 import type { TeamData } from '../data/types';
 import { effectiveRating } from '../data/loader';
-import type { InputSystem } from '../input/input';
+import type { PlayerInput } from '../input/input';
 import {
   bestPassTarget, executeLoft, executeShortPass, executeShot, executeThrough,
 } from './actions';
@@ -16,14 +17,18 @@ import { KeeperBrain } from './ai/keeper';
 import { runTarget, shapeTarget } from './ai/teamShape';
 import { Ball } from './ball';
 import {
-  CPU_DECISION_TICK, GOAL_HALF_W, GOAL_HEIGHT, HALF_L, HALF_W,
-  PLAYER_CONTROL_RADIUS, PLAYER_TACKLE_RADIUS, SHOT_MAX_HOLD, SIM_DT, SIX_DEPTH,
+  BOX_DEPTH, BOX_HALF_W, CPU_DECISION_TICK, GOAL_HALF_W, GOAL_HEIGHT, HALF_L,
+  HALF_W, PLAYER_CONTROL_RADIUS, PLAYER_TACKLE_RADIUS, SHOT_MAX_HOLD, SIM_DT,
+  SIX_DEPTH,
 } from './constants';
 import { OffsideTracker } from './offside';
+import { PenaltyController, type PenResult } from './penalty';
 import type { PlayerEntity } from './player';
 import { Team } from './team';
 
-export type MatchPhase = 'kickoff' | 'play' | 'restart' | 'goalseq' | 'halftime' | 'fulltime';
+export type MatchPhase =
+  | 'kickoff' | 'play' | 'restart' | 'goalseq'
+  | 'break' | 'penalty' | 'shootout' | 'fulltime';
 export type RestartKind = 'throwIn' | 'corner' | 'goalKick' | 'freeKick';
 export type DifficultyName = 'amateur' | 'pro' | 'legend';
 
@@ -56,9 +61,14 @@ interface ActiveShot {
 export interface MatchOptions {
   home: TeamData;
   away: TeamData;
-  humanTeamIdx: number | null; // null = CPU vs CPU (attract mode)
+  /** one input seat per team; null = CPU */
+  seats: [PlayerInput | null, PlayerInput | null];
   halfLengthSec: number;       // real seconds per half
   difficulty: DifficultyName;
+  /** knockout: a draw goes to extra time → penalties */
+  knockout?: boolean;
+  /** shootout-only mode: straight to penalties, no open play */
+  mode?: 'match' | 'shootout';
   seed?: number;
 }
 
@@ -70,64 +80,84 @@ export class Match {
   offside = new OffsideTracker();
   keepers: [KeeperBrain, KeeperBrain];
   difficulty: Difficulty;
+  seats: [PlayerInput | null, PlayerInput | null];
 
   phase: MatchPhase = 'kickoff';
   phaseTimer = 0;
+  breakLabel = '';
   half = 1;
   simTime = 0;        // total sim seconds, always advancing
   clock = 0;          // in-play seconds of the current half
   halfLength: number;
+  knockout: boolean;
+  mode: 'match' | 'shootout';
   kickoffTeam = 0;
   restart: RestartInfo | null = null;
+  penalty: PenaltyController | null = null;
+  /** set when a knockout tie was decided on penalties */
+  shootoutWinner: number | null = null;
 
   possessionTeam = 0;
-  humanTeamIdx: number | null;
-  controlled: PlayerEntity | null = null;
+  controlled: [PlayerEntity | null, PlayerEntity | null] = [null, null];
 
   private cpuDecisionTimers = [0, 0];
   private activeShot: ActiveShot | null = null;
-  private shotCharging = false;
+  private shotCharging = [false, false];
   private buildupTimer = 0;
   private prevBallPos: V2 = v2();
   private tackleCooldowns = new Map<PlayerEntity, number>();
-  /** last non-GK player who gained clean control per team, for switch logic */
-  lastPossessor: PlayerEntity | null = null;
+  private deferred: { at: number; fn: () => void }[] = [];
+  private lastGoalTeamIdx = 0;
+  private firstKickoffTeam = 0;
+  /** teamIdx whose penalty resumes as this restart after resolve */
+  private pendingPenaltyTeam: number | null = null;
 
-  constructor(public opts: MatchOptions, private input: InputSystem) {
+  constructor(public opts: MatchOptions) {
     this.rng = new RNG(opts.seed ?? 0xC0FFEE);
+    this.seats = opts.seats;
     this.teams = [
-      new Team(opts.home, 0, 1, opts.humanTeamIdx === 0),
-      new Team(opts.away, 1, -1, opts.humanTeamIdx === 1),
+      new Team(opts.home, 0, 1, opts.seats[0] !== null),
+      new Team(opts.away, 1, -1, opts.seats[1] !== null),
     ];
     this.keepers = [
       new KeeperBrain(this.teams[0], this.teams[0].keeper),
       new KeeperBrain(this.teams[1], this.teams[1].keeper),
     ];
-    this.humanTeamIdx = opts.humanTeamIdx;
     this.halfLength = opts.halfLengthSec;
+    this.knockout = opts.knockout ?? false;
+    this.mode = opts.mode ?? 'match';
     this.difficulty = DIFFICULTIES[opts.difficulty];
     this.offside.match = this;
-    this.setupKickoff(0);
+    if (this.mode === 'shootout') {
+      this.teams[0].lineUp(false);
+      this.teams[1].lineUp(false);
+      this.beginShootout();
+    } else {
+      this.setupKickoff(0);
+    }
   }
 
   get allPlayers(): PlayerEntity[] {
     return [...this.teams[0].players, ...this.teams[1].players];
   }
 
-  humanTeam(): Team | null {
-    return this.humanTeamIdx === null ? null : this.teams[this.humanTeamIdx];
+  private halfLenFor(half: number): number {
+    return half <= 2 ? this.halfLength : this.halfLength / 3;
   }
 
-  /** Display minute for the HUD/ticker (45-min halves compressed). */
+  /** Display minute for the HUD/ticker (45-min halves; 15-min ET periods). */
   displayMinute(): number {
-    const base = this.half === 2 ? 45 : 0;
-    return Math.min(base + Math.floor((this.clock / this.halfLength) * 45), this.half === 2 ? 90 : 45);
+    const bases = [0, 0, 45, 90, 105];
+    const spans = [45, 45, 45, 15, 15];
+    const base = bases[this.half] ?? 0;
+    const span = spans[this.half] ?? 45;
+    return Math.min(base + Math.floor((this.clock / this.halfLenFor(this.half)) * span), base + span);
   }
 
   secondLastDefenderX(teamIdx: number): number {
-    // x of the second-last defender (incl. keeper), in that team's defensive sense
     const t = this.teams[teamIdx];
-    const xs = t.players.map((p) => p.pos.x * -t.attackDir).sort((a, b) => b - a);
+    const xs = t.players.filter((p) => !p.sentOff)
+      .map((p) => p.pos.x * -t.attackDir).sort((a, b) => b - a);
     const second = xs[1] ?? 0;
     return second * -t.attackDir;
   }
@@ -143,15 +173,15 @@ export class Match {
     this.activeShot = null;
     this.teams[0].lineUp(kickingTeam === 0);
     this.teams[1].lineUp(kickingTeam === 1);
-    this.controlled = this.humanTeamIdx !== null
-      ? this.nearestOutfield(this.teams[this.humanTeamIdx], v2(0, 0))
-      : null;
+    for (let i = 0; i < 2; i++) {
+      this.controlled[i] = this.seats[i] ? this.nearestOutfield(this.teams[i], v2(0, 0)) : null;
+      this.shotCharging[i] = false;
+    }
   }
 
   private nearestOutfield(team: Team, to: V2): PlayerEntity {
-    return team.players
-      .filter((p) => !p.isGK)
-      .reduce((a, b) => (dist2(a.pos, to) < dist2(b.pos, to) ? a : b));
+    const pool = team.players.filter((p) => !p.isGK && !p.sentOff);
+    return pool.reduce((a, b) => (dist2(a.pos, to) < dist2(b.pos, to) ? a : b));
   }
 
   // ---------------------------------------------------------------- main tick
@@ -161,12 +191,23 @@ export class Match {
     this.simTime += dt;
     this.phaseTimer += dt;
 
+    // deferred one-shots (slide resolutions, shootout → full time) run in
+    // every phase — a shootout has no 'play' ticks to piggyback on
+    this.deferred = this.deferred.filter((d) => {
+      if (this.simTime >= d.at) { d.fn(); return false; }
+      return true;
+    });
+
     switch (this.phase) {
       case 'kickoff': this.updateKickoff(dt); break;
       case 'play': this.updatePlay(dt); break;
       case 'restart': this.updateRestart(dt); break;
       case 'goalseq': this.updateGoalSeq(dt); break;
-      case 'halftime':
+      case 'penalty':
+      case 'shootout':
+        this.penalty?.update(dt);
+        break;
+      case 'break':
       case 'fulltime':
         break;
     }
@@ -184,22 +225,21 @@ export class Match {
     }
     for (const p of this.allPlayers) p.update(dt);
 
-    const humanKicking = this.humanTeamIdx === this.kickoffTeam;
+    const seat = this.seats[this.kickoffTeam];
     const ready = dist2(taker.pos, v2(0, 0)) < 1.6 && this.phaseTimer > 0.6;
-    const go = ready && (humanKicking
-      ? (this.input.consumePress('pass', 600) || this.phaseTimer > 4)
+    const go = ready && (seat
+      ? (seat.consumePress('pass', 600) || this.phaseTimer > 4)
       : this.phaseTimer > 1.4);
     if (go) {
-      // roll it back to a midfielder
-      const mate = t.players.filter((p) => p.role === 'MF')
+      const mate = t.players.filter((p) => p.role === 'MF' && !p.sentOff)
         .reduce((a, b) => (dist2(a.pos, taker.pos) < dist2(b.pos, taker.pos) ? a : b));
       const dir = norm2(sub2(mate.pos, taker.pos));
       this.ball.kick({ x: dir.x, y: dir.y, z: 0.02 }, 9, taker);
       taker.playAnim('pass', 0.2);
       this.phase = 'play';
       this.events.emit({ type: 'kickoff', half: this.half });
-      if (this.humanTeamIdx !== null) this.controlled = mate.teamIdx === this.humanTeamIdx ? mate : this.controlled;
-      this.input.clearBuffers();
+      if (this.seats[mate.teamIdx]) this.controlled[mate.teamIdx] = mate;
+      seat?.clearBuffers();
     }
   }
 
@@ -221,28 +261,81 @@ export class Match {
     this.checkGoalAndBounds(prevZ);
     this.updateStatsAndCrowd(dt);
 
-    // half/full time (wait for a neutral-ish moment: ball below head height)
-    if (this.clock >= this.halfLength && this.ball.pos.z < 2 && this.phase === 'play') {
-      if (this.half === 1) {
-        this.phase = 'halftime';
-        this.events.emit({ type: 'halftime' });
-      } else {
-        this.phase = 'fulltime';
-        this.events.emit({ type: 'fulltime' });
-      }
+    // period end (wait for a neutral-ish moment: ball below head height)
+    if (this.clock >= this.halfLenFor(this.half) && this.ball.pos.z < 2 && this.phase === 'play') {
+      this.endPeriod();
     }
   }
 
-  /** Resume from the halftime card (UI calls this on button press). */
-  startSecondHalf(): void {
-    if (this.phase !== 'halftime') return;
-    this.half = 2;
-    this.clock = 0;
-    for (const t of this.teams) t.attackDir *= -1;
-    this.setupKickoff(1 - this.firstKickoffTeam);
+  private endPeriod(): void {
+    const tied = this.teams[0].score === this.teams[1].score;
+    if (this.half === 1) {
+      this.enterBreak('HALF-TIME');
+    } else if (this.half === 2) {
+      if (this.knockout && tied) this.enterBreak('EXTRA TIME');
+      else this.finishMatch();
+    } else if (this.half === 3) {
+      this.enterBreak('ET HALF-TIME');
+    } else {
+      if (tied) this.enterBreak('PENALTIES');
+      else this.finishMatch();
+    }
   }
 
-  private firstKickoffTeam = 0;
+  private enterBreak(label: string): void {
+    this.phase = 'break';
+    this.breakLabel = label;
+    this.events.emit({ type: 'break', label });
+  }
+
+  private finishMatch(): void {
+    if (this.phase === 'fulltime') return;
+    // a knockout tie must never slip through to full time undecided
+    if (this.knockout && this.mode === 'match'
+      && this.teams[0].score === this.teams[1].score && this.shootoutWinner === null) {
+      if (this.phase !== 'shootout') this.beginShootout();
+      return;
+    }
+    this.phase = 'fulltime';
+    this.events.emit({ type: 'fulltime' });
+  }
+
+  /** Resume from a break card (UI calls this on button press). */
+  continueFromBreak(): void {
+    if (this.phase !== 'break') return;
+    if (this.breakLabel === 'PENALTIES') {
+      this.beginShootout();
+      return;
+    }
+    this.half++;
+    this.clock = 0;
+    for (const t of this.teams) t.attackDir *= -1;
+    const kicking = this.half === 2 || this.half === 4
+      ? 1 - this.firstKickoffTeam
+      : this.firstKickoffTeam;
+    this.setupKickoff(kicking);
+  }
+
+  private beginShootout(): void {
+    if (this.penalty?.mode === 'shootout') return;
+    this.phase = 'shootout';
+    this.penalty = new PenaltyController(this, 'shootout');
+    this.penalty.startShootout();
+    this.events.on((e) => {
+      if (e.type === 'shootoutEnd') {
+        this.shootoutWinner = e.winnerIdx;
+        // brief beat, then full time
+        this.deferred.push({ at: this.simTime + 2.5, fn: () => this.finishMatch() });
+      }
+    });
+  }
+
+  /** Winner index counting a shootout if one happened (for tournaments). */
+  winner(): number | null {
+    if (this.teams[0].score > this.teams[1].score) return 0;
+    if (this.teams[1].score > this.teams[0].score) return 1;
+    return this.shootoutWinner;
+  }
 
   // ---------------------------------------------------------------- possession
 
@@ -257,7 +350,7 @@ export class Match {
       // tackle contests: nearby opponents nibble at the ball
       const carrier = ball.owner;
       for (const opp of this.teams[1 - carrier.teamIdx].players) {
-        if (opp.diving || (this.tackleCooldowns.get(opp) ?? 0) > 0) continue;
+        if (opp.diving || opp.sentOff || (this.tackleCooldowns.get(opp) ?? 0) > 0) continue;
         const d = dist2(opp.pos, carrier.pos);
         if (d < PLAYER_TACKLE_RADIUS) {
           const def = effectiveRating(opp.data, 'defending');
@@ -265,7 +358,6 @@ export class Match {
           const winChance = clamp(0.25 + (def - ctrl) / 200, 0.08, 0.55) * dt * 3.2;
           this.tackleCooldowns.set(opp, 0.5);
           if (this.rng.next() < winChance) {
-            // poke it loose toward the tackler's attacking side
             const dir = norm2({
               x: this.teams[opp.teamIdx].attackDir + this.rng.noise() * 0.8,
               y: this.rng.noise(),
@@ -285,9 +377,8 @@ export class Match {
     let best: PlayerEntity | null = null;
     let bestD = PLAYER_CONTROL_RADIUS;
     for (const p of this.allPlayers) {
-      if (p.diving) continue;
-      // keepers use hands via KeeperBrain inside the box; feet only for
-      // stray balls at their feet, and only when the ball is slow
+      if (p.diving || p.sentOff) continue;
+      // keepers use hands via KeeperBrain; feet only for slow stray balls
       if (p.isGK && ball.speed() > 6) continue;
       if (ball.noControlPlayer === p) continue;
       if (p.actionAnim === 'slide') continue;
@@ -309,7 +400,6 @@ export class Match {
     const sp = ball.speed();
     const skill = effectiveRating(best.data, 'passing');
     if (sp > 12) {
-      // fast ball: chance of a clean trap vs a heavy deflection
       const trapChance = clamp((skill / 99) * (1 - (sp - 12) / 22), 0.1, 0.92);
       if (this.rng.next() > trapChance) {
         ball.vel.x *= -0.25 + this.rng.noise() * 0.2;
@@ -331,14 +421,12 @@ export class Match {
       this.possessionTeam = best.teamIdx;
       this.events.emit({ type: 'possessionChange', teamIdx: best.teamIdx });
     }
-    this.lastPossessor = best;
-    this.cpuDecisionTimers[best.teamIdx] = CPU_DECISION_TICK * 0.5; // small settle before deciding
-    // shot is dead once anyone controls it
+    this.cpuDecisionTimers[best.teamIdx] = CPU_DECISION_TICK * 0.5;
     if (this.activeShot && best.teamIdx !== this.activeShot.shooter.teamIdx) this.activeShot = null;
-    // auto-switch: human always controls the teammate on the ball
-    if (this.humanTeamIdx !== null && best.teamIdx === this.humanTeamIdx) {
-      this.controlled = best;
-      this.shotCharging = false;
+    // auto-switch: humans always control the teammate on the ball
+    if (this.seats[best.teamIdx]) {
+      this.controlled[best.teamIdx] = best;
+      this.shotCharging[best.teamIdx] = false;
     }
   }
 
@@ -358,7 +446,6 @@ export class Match {
     const d = dist2({ x: ball.pos.x, y: ball.pos.y }, foot);
 
     if (owner.sprinting && speed > 5.5) {
-      // sprint knock-on: push it 2–3m ahead and chase (emergent tackles live here)
       ball.kick(
         { x: Math.cos(owner.facing), y: Math.sin(owner.facing), z: 0.01 },
         speed * 1.18 + 1.2, owner,
@@ -371,7 +458,6 @@ export class Match {
       ball.owner = null; // lost it (turn too sharp)
       return;
     }
-    // close control: spring the ball toward the foot point
     const pull = clamp(d * 14, 0, speed + 7);
     const dir = norm2(sub2(foot, { x: ball.pos.x, y: ball.pos.y }));
     ball.vel.x = owner.vel.x + dir.x * pull;
@@ -382,21 +468,26 @@ export class Match {
   // ---------------------------------------------------------------- human control
 
   private updateHumanControl(dt: number): void {
-    const team = this.humanTeam();
-    if (!team || !this.controlled) return;
-    const p = this.controlled;
-    const stick = this.input.getStick();
+    for (let i = 0; i < 2; i++) {
+      const seat = this.seats[i];
+      const p = this.controlled[i];
+      if (!seat || !p || p.sentOff) continue;
+      this.updateSeat(dt, i, seat, p);
+    }
+  }
+
+  private updateSeat(dt: number, teamIdx: number, seat: PlayerInput, p: PlayerEntity): void {
+    const team = this.teams[teamIdx];
+    const stick = seat.getStick();
     const stickV: V2 = { x: stick.x, y: stick.y };
     const stickLen = len2(stickV);
-    const sprint = this.input.isSprinting();
+    const sprint = seat.isSprinting();
     const onBall = this.ball.owner === p;
 
-    // movement (stick is screen-space; camera looks down +y → sim x = screen x, sim y = screen y)
     if (p.diving) return;
     if (stickLen > 0.15) {
       p.moveDir(norm2(stickV), clamp(stickLen, 0, 1), sprint);
     } else if (!onBall) {
-      // no input off-ball: drift gently toward shape so the player isn't stranded
       const tgt = shapeTarget(this, team, p);
       if (dist2(p.pos, tgt) > 6) p.moveToward(tgt, 0.5); else p.stop();
     } else {
@@ -406,117 +497,190 @@ export class Match {
     const aimDir: V2 = stickLen > 0.15 ? norm2(stickV) : { x: Math.cos(p.facing), y: Math.sin(p.facing) };
 
     if (onBall) {
-      // --- shooting: hold to power, fires on release (or auto at max hold)
-      if (this.input.isHeld('shoot')) this.shotCharging = true;
-      const rel = this.input.consumeRelease('shoot');
-      const held = this.input.heldDuration('shoot');
-      if (rel || (this.shotCharging && held >= SHOT_MAX_HOLD)) {
+      if (seat.isHeld('shoot')) this.shotCharging[teamIdx] = true;
+      const rel = seat.consumeRelease('shoot');
+      const held = seat.heldDuration('shoot');
+      if (rel || (this.shotCharging[teamIdx] && held >= SHOT_MAX_HOLD)) {
         const heldFor = rel ? rel.heldFor : SHOT_MAX_HOLD;
-        this.shotCharging = false;
-        this.input.clearBuffers();
+        this.shotCharging[teamIdx] = false;
+        seat.clearBuffers();
         const power = clamp(heldFor / SHOT_MAX_HOLD, 0.15, 1);
-        const aimY = this.lateralAim(team, aimDir);
-        executeShot(this, p, aimY, power);
+        executeShot(this, p, clamp(aimDir.y * 1.4, -1, 1), power);
         return;
       }
-      if (this.shotCharging) return; // don't pass while charging a shot
+      if (this.shotCharging[teamIdx]) return; // don't pass while charging
 
-      if (this.input.consumePress('pass')) {
+      if (seat.consumePress('pass')) {
         const target = bestPassTarget(this, p, aimDir, {});
         if (target) executeShortPass(this, p, target);
-        else executeThrough(this, p, aimDir); // nobody near the cone: hopeful ball
+        else executeThrough(this, p, aimDir);
         return;
       }
-      if (this.input.consumePress('loft')) { executeLoft(this, p, aimDir); return; }
-      if (this.input.consumePress('through')) { executeThrough(this, p, aimDir); return; }
+      if (seat.consumePress('loft')) { executeLoft(this, p, aimDir); return; }
+      if (seat.consumePress('through')) { executeThrough(this, p, aimDir); return; }
     } else {
-      this.shotCharging = false;
-      // --- defense: switch, pressure, slide tackle
-      if (this.input.consumePress('switch')) this.switchPlayer(team);
-      if (this.input.isHeld('pass')) {
-        // pressure assist: controlled player homes in on the ball
+      this.shotCharging[teamIdx] = false;
+      if (seat.consumePress('switch')) this.switchPlayer(team, teamIdx);
+      if (seat.isHeld('pass')) {
         p.moveToward({ x: this.ball.pos.x, y: this.ball.pos.y }, 1, sprint);
       }
-      if (this.input.consumePress('shoot')) this.slideTackle(p);
+      if (seat.consumePress('shoot')) this.trySlide(p);
     }
   }
 
-  /**
-   * Stick direction → -1..1 across the goal mouth. The camera sits on the +y
-   * sideline, so screen-vertical IS pitch y — stick y aims across the goal
-   * directly, whichever end we attack.
-   */
-  private lateralAim(team: Team, aimDir: V2): number {
-    return clamp(aimDir.y * 1.4, -1, 1);
-  }
-
-  private switchPlayer(team: Team): void {
-    // best-positioned defender (§5): near the ball AND goal-side of it
+  private switchPlayer(team: Team, teamIdx: number): void {
     const ball = this.ball.pos;
     const ownGoalX = -HALF_L * team.attackDir;
     let best: PlayerEntity | null = null;
     let bestScore = Infinity;
     for (const p of team.players) {
-      if (p.isGK || p === this.controlled) continue;
+      if (p.isGK || p.sentOff || p === this.controlled[teamIdx]) continue;
       const d = dist2(p.pos, { x: ball.x, y: ball.y });
       const goalSide = (p.pos.x - ball.x) * Math.sign(ownGoalX - ball.x) > 0;
       const score = d + (goalSide ? 0 : 9);
       if (score < bestScore) { bestScore = score; best = p; }
     }
-    if (best) this.controlled = best;
+    if (best) this.controlled[teamIdx] = best;
   }
 
-  private slideTackle(p: PlayerEntity): void {
-    if (p.actionLock > 0) return;
+  // ---------------------------------------------------------------- tackles & fouls
+
+  /** Slide tackle: shared by human input and desperate CPU defenders. */
+  trySlide(p: PlayerEntity): void {
+    if (p.actionLock > 0 || p.sentOff) return;
     const ballV: V2 = { x: this.ball.pos.x, y: this.ball.pos.y };
     if (dist2(p.pos, ballV) > 4.5) return;
     p.playAnim('slide', 0.75);
     const dir = norm2(sub2(ballV, p.pos));
     p.vel = { x: dir.x * 9, y: dir.y * 9 };
-    // resolve after a beat: if the lunge reaches the ball, poke it clear
+    this.tackleCooldowns.set(p, 1.2);
     const check = (): void => {
+      if (this.phase !== 'play') return;
       const d = dist2(p.pos, { x: this.ball.pos.x, y: this.ball.pos.y });
+      const carrier = this.ball.owner;
       if (d < PLAYER_TACKLE_RADIUS + 0.4 && this.ball.pos.z < 0.9) {
+        // reached the ball — but sliding through a man in possession is a
+        // gamble: low Defending goes through the player first
+        if (carrier && carrier.teamIdx !== p.teamIdx && dist2(p.pos, carrier.pos) < 1.7) {
+          const def = effectiveRating(p.data, 'defending') / 99;
+          if (this.rng.next() < 0.5 - def * 0.3) {
+            this.callFoul(carrier, p);
+            return;
+          }
+        }
         const away = norm2({ x: this.teams[p.teamIdx].attackDir + this.rng.noise(), y: this.rng.noise() * 1.4 });
         this.ball.kick({ x: away.x, y: away.y, z: 0.15 }, 11, p);
         this.events.emit({ type: 'tackle' });
+        return;
+      }
+      if (carrier && carrier.teamIdx !== p.teamIdx && dist2(p.pos, carrier.pos) < 1.4) {
+        this.callFoul(carrier, p); // missed everything but the ankles
       }
     };
     this.deferred.push({ at: this.simTime + 0.22, fn: check });
   }
 
-  private deferred: { at: number; fn: () => void }[] = [];
+  private callFoul(victim: PlayerEntity, offender: PlayerEntity): void {
+    const offTeam = this.teams[offender.teamIdx];
+    const minute = this.displayMinute();
+    this.events.emit({ type: 'foul', teamIdx: offender.teamIdx, playerName: offender.data.name, minute });
+    victim.actionLock = Math.max(victim.actionLock, 0.5);
+    this.ball.owner = null;
+
+    // from behind risks cards (§6.4)
+    const toOff = norm2(sub2(offender.pos, victim.pos));
+    const fromBehind = Math.cos(victim.facing) * toOff.x + Math.sin(victim.facing) * toOff.y < -0.2;
+    if (fromBehind || this.rng.next() < 0.25) {
+      offender.yellows++;
+      const straightRed = this.rng.next() < 0.1;
+      const secondYellow = offender.yellows >= 2;
+      if (straightRed || secondYellow) {
+        this.events.emit({ type: 'card', color: 'red', teamIdx: offender.teamIdx, playerName: offender.data.name, minute });
+        this.sendOff(offender);
+      } else {
+        this.events.emit({ type: 'card', color: 'yellow', teamIdx: offender.teamIdx, playerName: offender.data.name, minute });
+      }
+    }
+
+    // in the offender's own box → penalty
+    const ownGoalSide = Math.sign(-HALF_L * offTeam.attackDir);
+    const inBox = victim.pos.x * ownGoalSide > HALF_L - BOX_DEPTH
+      && Math.abs(victim.pos.y) < BOX_HALF_W;
+    if (inBox) {
+      this.events.emit({ type: 'penaltyAwarded', teamIdx: victim.teamIdx, minute });
+      this.beginPenalty(victim.teamIdx);
+    } else {
+      this.beginRestart('freeKick', victim.teamIdx, v2(victim.pos.x, victim.pos.y));
+    }
+  }
+
+  private sendOff(p: PlayerEntity): void {
+    p.sentOff = true;
+    if (this.ball.owner === p) this.ball.owner = null;
+    // walks (teleports) to the tunnel
+    p.pos = { x: clamp(p.pos.x, -30, 30), y: (HALF_W + 6) * Math.sign(p.pos.y || 1) };
+    p.vel = v2();
+    p.stop();
+    for (let i = 0; i < 2; i++) {
+      if (this.controlled[i] === p) {
+        this.controlled[i] = this.nearestOutfield(this.teams[i], p.pos);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- penalties (in-match)
+
+  private beginPenalty(teamIdx: number): void {
+    this.phase = 'penalty';
+    this.phaseTimer = 0;
+    this.pendingPenaltyTeam = teamIdx;
+    this.activeShot = null;
+    this.offside.clear();
+    this.penalty = new PenaltyController(this, 'single');
+    this.penalty.startSingle(teamIdx);
+  }
+
+  /** Called by PenaltyController when an in-match kick resolves. */
+  resolveSinglePenalty(result: PenResult): void {
+    const teamIdx = this.pendingPenaltyTeam ?? 0;
+    this.pendingPenaltyTeam = null;
+    const pen = this.penalty;
+    this.penalty = null;
+    if (result === 'goal') {
+      this.ball.lastTouch = pen?.taker ?? this.teams[teamIdx].players[10];
+      this.scoreGoal(this.teams[teamIdx].attackDir);
+    } else {
+      // saved or missed: defending team restarts with a goal kick
+      const defending = 1 - teamIdx;
+      const gx = Math.sign(this.teams[teamIdx].attackDir) * (HALF_L - SIX_DEPTH);
+      this.events.emit({ type: 'goalKick', teamIdx: defending });
+      this.beginRestart('goalKick', defending, v2(gx, 4));
+    }
+  }
 
   // ---------------------------------------------------------------- CPU AI
 
   private updateAI(dt: number): void {
-    // run deferred one-shots (slide tackle resolution)
-    this.deferred = this.deferred.filter((d) => {
-      if (this.simTime >= d.at) { d.fn(); return false; }
-      return true;
-    });
-
     const owner = this.ball.owner;
     const ballV: V2 = { x: this.ball.pos.x, y: this.ball.pos.y };
 
     for (const team of this.teams) {
       const attacking = this.possessionTeam === team.idx;
       const defense = attacking ? null : assignDefense(this, team);
-      // designated loose-ball chasers (both teams send their closest)
       const chasers = new Set<PlayerEntity>();
       if (!owner) {
-        const sorted = team.players.filter((p) => !p.isGK && !p.diving)
+        const sorted = team.players.filter((p) => !p.isGK && !p.diving && !p.sentOff)
           .sort((a, b) => dist2(a.pos, ballV) - dist2(b.pos, ballV));
         for (const c of sorted.slice(0, 2)) chasers.add(c);
       }
 
       for (const p of team.players) {
         if (p.isGK) continue; // KeeperBrain owns the keeper
-        if (this.humanTeamIdx === team.idx && p === this.controlled) continue;
+        if (p.sentOff) { p.stop(); continue; }
+        if (this.seats[team.idx] && p === this.controlled[team.idx]) continue;
         if (p.diving) continue;
 
         if (owner === p) {
-          // CPU ball carrier
           this.cpuDecisionTimers[team.idx] -= dt;
           cpuDribble(this, p);
           if (this.cpuDecisionTimers[team.idx] <= 0) {
@@ -527,7 +691,6 @@ export class Match {
         }
 
         if (chasers.has(p)) {
-          // intercept: run to where the ball is going
           const lead = clamp(dist2(p.pos, ballV) * 0.12, 0, 0.9);
           p.moveToward({
             x: ballV.x + this.ball.vel.x * lead,
@@ -536,10 +699,13 @@ export class Match {
           continue;
         }
 
-        if (defense && defense.presser === p) { updateDefender(this, team, p, 'press'); continue; }
+        if (defense && defense.presser === p) {
+          updateDefender(this, team, p, 'press');
+          this.maybeCpuSlide(dt, team, p, owner);
+          continue;
+        }
         if (defense && defense.cover === p) { updateDefender(this, team, p, 'cover'); continue; }
 
-        // attacking runs override shape in the final third
         if (attacking && owner && owner.teamIdx === team.idx) {
           const rt = runTarget(this, team, p, owner);
           if (rt) { p.moveToward(rt, 1, p.stamina > 0.3); continue; }
@@ -547,6 +713,19 @@ export class Match {
 
         p.moveToward(shapeTarget(this, team, p), 0.9);
       }
+    }
+  }
+
+  /** Desperate CPU slide when the carrier is getting away. */
+  private maybeCpuSlide(dt: number, team: Team, p: PlayerEntity, carrier: PlayerEntity | null): void {
+    if (!carrier || this.seats[team.idx]) return; // human team defends manually
+    if ((this.tackleCooldowns.get(p) ?? 0) > 0 || p.actionLock > 0) return;
+    const d = dist2(p.pos, carrier.pos);
+    if (d < 1.4 || d > 3.6) return;
+    const escaping = len2(carrier.vel) > 4.2;
+    const inOwnHalfish = carrier.pos.x * -team.attackDir > -10;
+    if (escaping && inOwnHalfish && this.rng.next() < dt * 4) {
+      this.trySlide(p);
     }
   }
 
@@ -568,35 +747,29 @@ export class Match {
     const prev = this.prevBallPos;
     const cur = ball.pos;
 
-    // goal-line / goal-frame crossings on either end
     for (const side of [1, -1]) {
       const planeX = HALF_L * side;
-      if ((prev.x - planeX) * (cur.x - planeX) < 0 || Math.abs(cur.x) > HALF_L) {
-        const crossed = (prev.x - planeX) * (cur.x - planeX) < 0;
-        if (crossed) {
-          const t = (planeX - prev.x) / (cur.x - prev.x);
-          const yAt = prev.y + (cur.y - prev.y) * t;
-          const zAt = prevZ + (cur.z - prevZ) * t;
-          const movingIn = (cur.x - prev.x) * side > 0;
-          if (movingIn && Math.abs(yAt) < GOAL_HALF_W && zAt < GOAL_HEIGHT) {
-            // woodwork: clip near the frame edges
-            const nearPost = GOAL_HALF_W - Math.abs(yAt) < 0.18;
-            const nearBar = GOAL_HEIGHT - zAt < 0.15 && zAt > GOAL_HEIGHT - 0.4;
-            if (nearPost || nearBar) {
-              ball.vel.x *= -0.55;
-              ball.vel.y += this.rng.noise() * 2;
-              ball.pos.x = planeX - side * 0.3;
-              this.events.emit({ type: 'post' });
-              return;
-            }
-            this.scoreGoal(side);
+      if ((prev.x - planeX) * (cur.x - planeX) < 0) {
+        const t = (planeX - prev.x) / (cur.x - prev.x);
+        const yAt = prev.y + (cur.y - prev.y) * t;
+        const zAt = prevZ + (cur.z - prevZ) * t;
+        const movingIn = (cur.x - prev.x) * side > 0;
+        if (movingIn && Math.abs(yAt) < GOAL_HALF_W && zAt < GOAL_HEIGHT) {
+          const nearPost = GOAL_HALF_W - Math.abs(yAt) < 0.18;
+          const nearBar = GOAL_HEIGHT - zAt < 0.15 && zAt > GOAL_HEIGHT - 0.4;
+          if (nearPost || nearBar) {
+            ball.vel.x *= -0.55;
+            ball.vel.y += this.rng.noise() * 2;
+            ball.pos.x = planeX - side * 0.3;
+            this.events.emit({ type: 'post' });
             return;
           }
+          this.scoreGoal(side);
+          return;
         }
       }
     }
 
-    // out of bounds
     if (Math.abs(cur.y) > HALF_W + 0.2) {
       const touchTeam = ball.lastTouch?.teamIdx ?? 0;
       const throwTeam = 1 - touchTeam;
@@ -606,10 +779,9 @@ export class Match {
       return;
     }
     if (Math.abs(cur.x) > HALF_L + 0.6) {
-      const side = Math.sign(cur.x); // which end
-      const defendingTeam = this.teams[0].attackDir === side ? 1 : 0; // team defending that end
+      const side = Math.sign(cur.x);
+      const defendingTeam = this.teams[0].attackDir === side ? 1 : 0;
       const touchTeam = ball.lastTouch?.teamIdx ?? 0;
-      // a shot that misses ends here
       if (this.activeShot && this.activeShot.shooter.teamIdx !== defendingTeam) {
         this.events.emit({
           type: 'miss', teamIdx: this.activeShot.shooter.teamIdx,
@@ -618,7 +790,6 @@ export class Match {
         this.activeShot = null;
       }
       if (touchTeam === defendingTeam) {
-        // defender touched it out over their own line → corner
         const cornerY = Math.sign(cur.y || 1) * (HALF_W - 0.6);
         const pos = v2(side * (HALF_L - 0.6), cornerY);
         this.events.emit({ type: 'corner', teamIdx: 1 - defendingTeam, minute: this.displayMinute() });
@@ -632,7 +803,6 @@ export class Match {
   }
 
   private scoreGoal(side: number): void {
-    // side = +1 means ball crossed +x line → team attacking +x scored
     const scoringTeam = this.teams[0].attackDir === side ? 0 : 1;
     const team = this.teams[scoringTeam];
     team.score++;
@@ -653,10 +823,8 @@ export class Match {
   }
 
   private updateGoalSeq(dt: number): void {
-    // celebration runs on its own; players idle, clock frozen
     for (const p of this.allPlayers) { p.stop(); p.update(dt); }
     this.ball.update(dt);
-    // the net catches the ball — don't let it roll into the stands
     const b = this.ball;
     if (Math.abs(b.pos.x) > HALF_L + 0.4) {
       b.vel.x *= Math.pow(0.001, dt);
@@ -666,15 +834,19 @@ export class Match {
       b.pos.y = clamp(b.pos.y, -GOAL_HALF_W - 1, GOAL_HALF_W + 1);
     }
     if (this.phaseTimer > 6.2 || (this.phaseTimer > 1.5 && this.anyButton())) {
-      this.setupKickoff(1 - this.lastGoalTeamIdx);
+      // a goal on the final whistle still ends the period
+      if (this.clock >= this.halfLenFor(this.half)) this.endPeriod();
+      else this.setupKickoff(1 - this.lastGoalTeamIdx);
     }
   }
 
-  private lastGoalTeamIdx = 0;
-
   private anyButton(): boolean {
-    return this.input.consumePress('pass', 600) || this.input.consumePress('shoot', 600)
-      || this.input.consumePress('loft', 600) || this.input.consumePress('through', 600);
+    for (const seat of this.seats) {
+      if (!seat) continue;
+      if (seat.consumePress('pass', 600) || seat.consumePress('shoot', 600)
+        || seat.consumePress('loft', 600) || seat.consumePress('through', 600)) return true;
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------- restarts
@@ -690,10 +862,12 @@ export class Match {
     this.ball.reset(pos.x, pos.y);
     this.offside.clear();
     this.activeShot = null;
-    this.shotCharging = false;
-    if (this.humanTeamIdx === teamIdx) this.controlled = taker.isGK ? this.nearestOutfield(team, pos) : taker;
-    else if (this.humanTeamIdx !== null) {
-      this.controlled = this.nearestOutfield(this.teams[this.humanTeamIdx], pos);
+    for (let i = 0; i < 2; i++) {
+      this.shotCharging[i] = false;
+      if (!this.seats[i]) continue;
+      this.controlled[i] = i === teamIdx && !taker.isGK
+        ? taker
+        : this.nearestOutfield(this.teams[i], pos);
     }
   }
 
@@ -703,18 +877,16 @@ export class Match {
     r.timer += dt;
     const team = this.teams[r.teamIdx];
 
-    // taker walks to the spot; everyone else breathes back into shape
     r.taker.moveToward(r.pos, 1);
     for (const t of this.teams) {
       for (const p of t.players) {
-        if (p === r.taker) continue;
+        if (p === r.taker || p.sentOff) continue;
         if (p.isGK) {
           const gx = -HALF_L * t.attackDir;
           p.moveToward({ x: gx + t.attackDir * 2, y: 0 }, 0.9);
           continue;
         }
         let tgt = shapeTarget(this, t, p);
-        // corner: attackers crowd the box
         if (r.kind === 'corner' && t.idx === r.teamIdx && (p.role === 'FW' || p.role === 'MF')) {
           const gx = HALF_L * t.attackDir;
           tgt = {
@@ -722,7 +894,6 @@ export class Match {
             y: this.rng.noise() * 12,
           };
         }
-        // opponents retreat out of the restart bubble
         if (t.idx !== r.teamIdx) {
           const d = dist2(tgt, r.pos);
           if (d < 9) {
@@ -738,31 +909,31 @@ export class Match {
     const atSpot = dist2(r.taker.pos, r.pos) < 1.4;
     if (!atSpot && r.timer < 6) return;
 
-    const isHumanTaker = this.humanTeamIdx === r.teamIdx;
+    const seat = this.seats[r.teamIdx];
     let take = false;
     let action: 'short' | 'cross' = r.kind === 'corner' ? 'cross' : 'short';
-    if (isHumanTaker && r.timer > 0.5) {
-      if (this.input.consumePress('pass', 400)) { take = true; action = 'short'; }
-      else if (this.input.consumePress('loft', 400)) { take = true; action = 'cross'; }
+    if (seat && r.timer > 0.5) {
+      if (seat.consumePress('pass', 400)) { take = true; action = 'short'; }
+      else if (seat.consumePress('loft', 400)) { take = true; action = 'cross'; }
       else if (r.timer > 7) take = true;
-    } else {
+    } else if (!seat) {
       take = r.timer > 1.6;
     }
     if (!take) return;
 
-    // execute the restart with the shared action toolbox
     this.controlledRestartKick(r, team, action);
     this.restart = null;
     this.phase = 'play';
-    this.input.clearBuffers();
+    seat?.clearBuffers();
   }
 
   private controlledRestartKick(r: RestartInfo, team: Team, action: 'short' | 'cross'): void {
     const taker = r.taker;
     taker.pos = { x: r.pos.x, y: r.pos.y };
     this.ball.reset(r.pos.x, r.pos.y);
-    const stick = this.input.getStick();
-    const aimDir: V2 = this.humanTeamIdx === r.teamIdx && len2(stick) > 0.2
+    const seat = this.seats[r.teamIdx];
+    const stick = seat ? seat.getStick() : { x: 0, y: 0 };
+    const aimDir: V2 = seat && len2(stick) > 0.2
       ? norm2(stick)
       : norm2({ x: team.attackDir, y: -Math.sign(r.pos.y || 1) * 0.7 });
 
@@ -796,7 +967,6 @@ export class Match {
     this.buildupTimer += dt;
     if (this.buildupTimer > 0.4) {
       this.buildupTimer = 0;
-      // crowd anticipation: ball deep in a final third, higher when attacking the ball fast
       const adv = Math.abs(this.ball.pos.x) / HALF_L;
       const inFinalThird = Math.abs(this.ball.pos.x) > HALF_L / 3;
       const level = inFinalThird ? clamp((adv - 0.33) * 1.6, 0, 1) : 0;

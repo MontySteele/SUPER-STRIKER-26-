@@ -17,7 +17,7 @@ export interface DefenseAssignments {
 export function assignDefense(match: Match, team: Team): DefenseAssignments {
   const ball = match.ball.pos;
   const candidates = team.players
-    .filter((p) => !p.isGK && !p.diving)
+    .filter((p) => !p.isGK && !p.diving && !p.sentOff)
     .sort((a, b) => dist2(a.pos, ball) - dist2(b.pos, ball));
   return { presser: candidates[0] ?? null, cover: candidates[1] ?? null };
 }

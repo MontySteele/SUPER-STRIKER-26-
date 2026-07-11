@@ -1,5 +1,7 @@
 // Events the sim emits; consumed by UI (ticker/sequences), audio, and camera.
 
+import type { PenResult } from './penalty';
+
 export type MatchEvent =
   | { type: 'kickoff'; half: number }
   | { type: 'goal'; teamIdx: number; scorerName: string; minute: number }
@@ -11,7 +13,13 @@ export type MatchEvent =
   | { type: 'corner'; teamIdx: number; minute: number }
   | { type: 'goalKick'; teamIdx: number }
   | { type: 'offside'; teamIdx: number; playerName: string; minute: number }
-  | { type: 'halftime' }
+  | { type: 'foul'; teamIdx: number; playerName: string; minute: number }
+  | { type: 'card'; color: 'yellow' | 'red'; teamIdx: number; playerName: string; minute: number }
+  | { type: 'penaltyAwarded'; teamIdx: number; minute: number }
+  | { type: 'penTension' }
+  | { type: 'penKick'; teamIdx: number; takerName: string; result: PenResult }
+  | { type: 'shootoutEnd'; winnerIdx: number }
+  | { type: 'break'; label: string }
   | { type: 'fulltime' }
   | { type: 'kick'; power: number }           // any kick, for SFX
   | { type: 'bounce'; speed: number }

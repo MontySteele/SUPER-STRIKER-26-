@@ -48,7 +48,7 @@ export function bestPassTarget(
   const aimAngle = angleOf(aimDir);
 
   for (const mate of team.players) {
-    if (mate === passer) continue;
+    if (mate === passer || mate.sentOff) continue;
     // lead the runner: aim where they'll be when the ball arrives
     const d0 = dist2(passer.pos, mate.pos);
     if (d0 < 2 || d0 > maxDist) continue;
@@ -105,7 +105,7 @@ export function executeLoft(match: Match, passer: PlayerEntity, aimDir: V2): voi
     // cross toward the penalty spot area, aimed at the best runner if any
     const goalX = HALF_L * team.attackDir;
     const runners = team.players.filter(
-      (p) => p !== passer && Math.abs(p.pos.x - goalX) < 24 && Math.abs(p.pos.y) < 16,
+      (p) => p !== passer && !p.sentOff && Math.abs(p.pos.x - goalX) < 24 && Math.abs(p.pos.y) < 16,
     );
     if (runners.length) {
       const r = runners.reduce((a, b) =>
@@ -141,7 +141,7 @@ export function executeThrough(match: Match, passer: PlayerEntity, aimDir: V2): 
   let best: { p: PlayerEntity; score: number } | null = null;
   const aimAngle = angleOf(aimDir);
   for (const mate of team.players) {
-    if (mate === passer || mate.isGK) continue;
+    if (mate === passer || mate.isGK || mate.sentOff) continue;
     const advance = (mate.pos.x - passer.pos.x) * team.attackDir;
     if (advance < -5) continue;
     const dev = Math.abs(angleDiff(aimAngle, angleOf(sub2(mate.pos, passer.pos))));

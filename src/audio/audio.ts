@@ -14,6 +14,11 @@ export class AudioEngine {
   private eruption = 0;        // spikes on goals/shots, decays
   private started = false;
 
+  /** Shared context for the music player (null until unlocked). */
+  context(): AudioContext | null {
+    return this.ctx;
+  }
+
   /** Must be called from a user gesture. */
   unlock(): void {
     if (this.started) return;
@@ -117,10 +122,12 @@ export class AudioEngine {
         this.thump();
         break;
       case 'kickoff':
+        this.setDucked(false);
         this.whistleBlast(1, 0);
         break;
-      case 'halftime':
+      case 'break':
       case 'fulltime':
+        this.setDucked(false);
         this.whistleBlast(3, 0.18);
         this.roar(1.2, 0.5);
         break;
@@ -132,6 +139,32 @@ export class AudioEngine {
       case 'offside':
         this.whistleBlast(2, 0.12);
         this.groan();
+        break;
+      case 'foul':
+        this.whistleBlast(1, 0);
+        break;
+      case 'card':
+        this.whistleBlast(2, 0.1);
+        this.roar(0.7, e.color === 'red' ? 0.55 : 0.3);
+        break;
+      case 'penaltyAwarded':
+        this.whistleBlast(1, 0.3);
+        this.roar(1.4, 0.6);
+        break;
+      case 'penTension':
+        // the crowd holds its breath (§6.5)
+        this.setDucked(true);
+        break;
+      case 'penKick':
+        this.setDucked(false);
+        if (e.result === 'goal') { this.eruption = 1.4; this.roar(2.0, 0.9); }
+        else if (e.result === 'saved') { this.roar(1.4, 0.8); }
+        else this.groan();
+        break;
+      case 'shootoutEnd':
+        this.eruption = 1.6;
+        this.roar(3, 1.0);
+        this.whistleBlast(3, 0.18);
         break;
       case 'possessionChange':
       default:

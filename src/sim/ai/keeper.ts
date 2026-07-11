@@ -28,9 +28,9 @@ export class KeeperBrain {
   onShot(match: Match): void {
     if (this.state === 'dive' || this.state === 'hold') return;
     const keeping = effectiveRating(this.keeper.data, 'keeping');
-    // 180–320ms by stat (§6.3), scaled by difficulty when facing the human
+    // 180–320ms by stat (§6.3); difficulty only slows CPU keepers (§6.6)
     let delay = 0.32 - (keeping / 99) * 0.14;
-    delay *= match.difficulty.cpuKeeperReactMult;
+    if (!this.team.isHuman) delay *= match.difficulty.cpuKeeperReactMult;
     this.reactAt = match.simTime + delay;
     this.state = 'react';
   }

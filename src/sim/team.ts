@@ -55,6 +55,11 @@ export class Team {
   /** Reset everyone to formation, optionally shifted back for kickoff receive. */
   lineUp(kickingOff: boolean): void {
     for (const p of this.players) {
+      if (p.sentOff) {
+        p.pos = { x: 0, y: HALF_W + 6 };
+        p.vel = { x: 0, y: 0 };
+        continue;
+      }
       const home = fracToPitch(p.homeFrac, this.attackDir);
       // compress into own half
       let x = home.x * 0.92;

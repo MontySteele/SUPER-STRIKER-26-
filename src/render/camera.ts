@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { clamp, damp } from '../core/math';
 import { HALF_L } from '../sim/constants';
 
-export type CamMode = 'broadcast' | 'celebration' | 'replay';
+export type CamMode = 'broadcast' | 'celebration' | 'replay' | 'penalty';
 
 export class CameraDirector {
   mode: CamMode = 'broadcast';
@@ -15,6 +15,7 @@ export class CameraDirector {
   /** subject for celebration orbit (world coords) */
   subject = new THREE.Vector3();
   replayGoalSide = 1;
+  penaltySide = 1;
 
   constructor(private camera: THREE.PerspectiveCamera) {}
 
@@ -37,6 +38,15 @@ export class CameraDirector {
         ty = 2.6 + Math.sin(this.orbitT * 0.7) * 0.8;
         tz = this.subject.z + Math.sin(this.orbitT) * r;
         lx = this.subject.x; ly = 1.2; lz = this.subject.z;
+        break;
+      }
+      case 'penalty': {
+        // behind the taker, low, goal filling the frame
+        const gx = HALF_L * this.penaltySide;
+        tx = gx - this.penaltySide * 24;
+        ty = 5.2;
+        tz = 7.5;
+        lx = gx - this.penaltySide * 4; ly = 1.2; lz = 0;
         break;
       }
       case 'replay': {

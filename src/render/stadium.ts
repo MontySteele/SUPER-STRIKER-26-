@@ -9,12 +9,36 @@ const AD_MESSAGES = [
   'ONE MORE MATCH', 'CLAWDE SPORTS', 'GOOOOOAL FM 101.2', 'PS3-ERA & PROUD',
 ];
 
+/** §7.1: three tiers of venue — Mega Bowl 80k / National 45k / Municipal 18k. */
+export type StadiumSize = 'municipal' | 'national' | 'mega';
+
+interface TierSpec { rise: number; run: number; y0: number; }
+
+const SIZES: Record<StadiumSize, { tiers: TierSpec[]; roofY: number; lightH: number }> = {
+  municipal: {
+    tiers: [{ rise: 6, run: 10, y0: 1.2 }],
+    roofY: 10.5, lightH: 26,
+  },
+  national: {
+    tiers: [{ rise: 7, run: 11, y0: 1.4 }, { rise: 10, run: 11, y0: 9.6 }],
+    roofY: 23.5, lightH: 38,
+  },
+  mega: {
+    tiers: [
+      { rise: 7, run: 11, y0: 1.4 },
+      { rise: 10, run: 11, y0: 9.6 },
+      { rise: 13, run: 12, y0: 20.5 },
+    ],
+    roofY: 36.5, lightH: 48,
+  },
+};
+
 export class Stadium {
   private adTextures: THREE.CanvasTexture[] = [];
   private adOffset = 0;
   floodlightHeads: THREE.Mesh[] = [];
 
-  constructor(scene: THREE.Scene, night: boolean) {
+  constructor(scene: THREE.Scene, night: boolean, public size: StadiumSize = 'national') {
     this.buildBowl(scene, night);
     this.buildFloodlights(scene, night);
     this.buildAdBoards(scene);
@@ -69,12 +93,10 @@ export class Stadium {
       { len: 96, rotY: -Math.PI / 2, cx: -(HALF_L + 14), cz: 0 },
     ];
 
+    const spec = SIZES[this.size];
     for (const s of stands) {
       const stand = new THREE.Group();
-      const tiers = [
-        { rise: 7, run: 11, y0: 1.4 },
-        { rise: 10, run: 11, y0: 9.6 },
-      ];
+      const tiers = spec.tiers;
       let depth = 0;
       for (const t of tiers) {
         const theta = Math.atan2(t.rise, t.run);
@@ -95,13 +117,13 @@ export class Stadium {
         stand.add(wall);
         depth += t.run + 1.2;
       }
-      // roof slab over the upper tier
+      // roof slab over the top tier
       const roof = new THREE.Mesh(new THREE.BoxGeometry(s.len, 0.8, 13), roofMat);
-      roof.position.set(0, 23.5, depth - 7);
+      roof.position.set(0, spec.roofY, depth - 7);
       stand.add(roof);
       // back wall
-      const back = new THREE.Mesh(new THREE.BoxGeometry(s.len, 23, 1), concreteMat);
-      back.position.set(0, 11.5, depth + 0.4);
+      const back = new THREE.Mesh(new THREE.BoxGeometry(s.len, spec.roofY - 0.5, 1), concreteMat);
+      back.position.set(0, (spec.roofY - 0.5) / 2, depth + 0.4);
       stand.add(back);
 
       stand.position.set(s.cx, 0, s.cz);
@@ -115,15 +137,16 @@ export class Stadium {
     const headMat = new THREE.MeshBasicMaterial({
       color: night ? 0xffffff : 0xd8dde8,
     });
+    const h = SIZES[this.size].lightH;
     for (const [x, z] of [[-1, -1], [-1, 1], [1, -1], [1, 1]]) {
       const px = x * (HALF_L + 22);
       const pz = z * (HALF_W + 24);
-      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 1.1, 38, 8), poleMat);
-      pole.position.set(px, 19, pz);
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 1.1, h, 8), poleMat);
+      pole.position.set(px, h / 2, pz);
       scene.add(pole);
       // bank of lamps angled at the pitch — MeshBasicMaterial so bloom catches it
       const head = new THREE.Mesh(new THREE.BoxGeometry(7, 4.5, 0.8), headMat);
-      head.position.set(px * 0.965, 38.5, pz * 0.95);
+      head.position.set(px * 0.965, h + 0.5, pz * 0.95);
       head.lookAt(0, 0, 0);
       this.floodlightHeads.push(head);
       scene.add(head);

@@ -1,17 +1,52 @@
-// Keyboard + Gamepad abstraction (spec §5). Actions are buffered for 150ms so a
+// Keyboard + Gamepad abstraction (spec §5), now with seats for 2P couch play
+// (§3.4): keyboard vs gamepad, or two gamepads. Actions buffer for 150ms so a
 // pass queued during a receive animation fires the instant the touch completes.
 
 export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics';
+export type DeviceKind = 'merged' | 'keyboard' | 'pad';
 
 export interface Stick { x: number; y: number; }
 
 const BUFFER_MS = 150;
+const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics'];
 
 interface ActionState {
   held: boolean;
   pressedAt: number;   // performance.now() of last down edge, -1 if consumed
   releasedAt: number;  // last up edge, -1 if consumed
   heldSince: number;
+}
+
+class DeviceState {
+  actions = {} as Record<Action, ActionState>;
+  sprintHeld = false;
+  stick: Stick = { x: 0, y: 0 };
+
+  constructor() {
+    for (const a of ACTIONS) {
+      this.actions[a] = { held: false, pressedAt: -1, releasedAt: -1, heldSince: 0 };
+    }
+  }
+
+  press(a: Action): void {
+    const s = this.actions[a];
+    s.held = true;
+    s.pressedAt = performance.now();
+    s.heldSince = s.pressedAt;
+  }
+
+  release(a: Action): void {
+    const s = this.actions[a];
+    s.held = false;
+    s.releasedAt = performance.now();
+  }
+
+  clear(): void {
+    for (const a of ACTIONS) {
+      this.actions[a].pressedAt = -1;
+      this.actions[a].releasedAt = -1;
+    }
+  }
 }
 
 const KEY_MAP: Record<string, Action | 'sprint' | 'up' | 'down' | 'left' | 'right'> = {
@@ -22,139 +57,199 @@ const KEY_MAP: Record<string, Action | 'sprint' | 'up' | 'down' | 'left' | 'righ
   ShiftLeft: 'sprint', ShiftRight: 'sprint',
 };
 
-export class InputSystem {
+// Standard mapping: 0=A pass, 1=B loft, 2=X shoot, 3=Y through, 4=LB switch, 7=RT sprint
+const PAD_MAP: [number, Action | 'sprint'][] = [
+  [0, 'pass'], [1, 'loft'], [2, 'shoot'], [3, 'through'], [4, 'switch'], [7, 'sprint'],
+];
+
+export class InputHub {
+  keyboard = new DeviceState();
+  private pads = new Map<number, DeviceState>();
+  private prevPadButtons = new Map<number, boolean[]>();
   private keys = new Set<string>();
-  private actions: Record<Action, ActionState> = {} as Record<Action, ActionState>;
-  private sprintHeld = false;
-  gamepadIndex: number | null = null;
-  /** Fired on any key/button press — used to unlock audio + skip sequences. */
+  /** Fired on any key/button press — unlocks audio, advances title screens. */
   onAnyButton: (() => void) | null = null;
 
   constructor() {
-    for (const a of ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics'] as Action[]) {
-      this.actions[a] = { held: false, pressedAt: -1, releasedAt: -1, heldSince: 0 };
-    }
     window.addEventListener('keydown', (e) => {
       const mapped = KEY_MAP[e.code];
       if (mapped) e.preventDefault();
       if (this.keys.has(e.code)) return;
       this.keys.add(e.code);
-      if (mapped === 'sprint') this.sprintHeld = true;
-      else if (mapped && mapped !== 'up' && mapped !== 'down' && mapped !== 'left' && mapped !== 'right') {
-        this.press(mapped);
-      }
+      if (mapped === 'sprint') this.keyboard.sprintHeld = true;
+      else if (mapped && !isDir(mapped)) this.keyboard.press(mapped);
       this.onAnyButton?.();
     });
     window.addEventListener('keyup', (e) => {
       this.keys.delete(e.code);
       const mapped = KEY_MAP[e.code];
-      if (mapped === 'sprint') this.sprintHeld = false;
-      else if (mapped && mapped !== 'up' && mapped !== 'down' && mapped !== 'left' && mapped !== 'right') {
-        this.release(mapped);
+      if (mapped === 'sprint') this.keyboard.sprintHeld = false;
+      else if (mapped && !isDir(mapped)) this.keyboard.release(mapped);
+    });
+  }
+
+  /** Indices of currently connected gamepads. */
+  connectedPads(): number[] {
+    const out: number[] = [];
+    const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+    for (const gp of pads) if (gp) out.push(gp.index);
+    return out;
+  }
+
+  pad(index: number): DeviceState {
+    let d = this.pads.get(index);
+    if (!d) { d = new DeviceState(); this.pads.set(index, d); }
+    return d;
+  }
+
+  /** Poll gamepad edges once per frame (the Gamepad API has no button events). */
+  pollGamepads(): void {
+    const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+    for (const gp of pads) {
+      if (!gp) continue;
+      const dev = this.pad(gp.index);
+      const prev = this.prevPadButtons.get(gp.index) ?? [];
+      for (const [idx, act] of PAD_MAP) {
+        const down = gp.buttons[idx]?.pressed ?? false;
+        const was = prev[idx] ?? false;
+        if (act === 'sprint') {
+          if (down !== was) dev.sprintHeld = down;
+        } else {
+          if (down && !was) { dev.press(act); this.onAnyButton?.(); }
+          if (!down && was) dev.release(act);
+        }
+        prev[idx] = down;
       }
-    });
-    window.addEventListener('gamepadconnected', (e) => {
-      this.gamepadIndex = (e as GamepadEvent).gamepad.index;
-    });
-    window.addEventListener('gamepaddisconnected', () => {
-      this.gamepadIndex = null;
-    });
-  }
-
-  private press(a: Action): void {
-    const s = this.actions[a];
-    s.held = true;
-    s.pressedAt = performance.now();
-    s.heldSince = s.pressedAt;
-  }
-
-  private release(a: Action): void {
-    const s = this.actions[a];
-    s.held = false;
-    s.releasedAt = performance.now();
-  }
-
-  private prevPadButtons: boolean[] = [];
-
-  /** Poll gamepad edges once per frame (Gamepad API has no events for buttons). */
-  pollGamepad(): void {
-    if (this.gamepadIndex === null) return;
-    const gp = navigator.getGamepads()[this.gamepadIndex];
-    if (!gp) return;
-    // Standard mapping: 0=A pass, 2=X shoot, 1=B loft, 3=Y through, 4=LB switch, 7=RT sprint
-    const map: [number, Action | 'sprint'][] = [
-      [0, 'pass'], [2, 'shoot'], [1, 'loft'], [3, 'through'], [4, 'switch'], [7, 'sprint'],
-    ];
-    for (const [idx, act] of map) {
-      const down = gp.buttons[idx]?.pressed ?? false;
-      const was = this.prevPadButtons[idx] ?? false;
-      if (act === 'sprint') {
-        if (down !== was) this.sprintHeld = down;
-      } else {
-        if (down && !was) { this.press(act); this.onAnyButton?.(); }
-        if (!down && was) this.release(act);
-      }
-      this.prevPadButtons[idx] = down;
+      this.prevPadButtons.set(gp.index, prev);
+      const gx = gp.axes[0] ?? 0, gy = gp.axes[1] ?? 0;
+      // dpad fallback (buttons 12-15)
+      let dx = gx, dy = gy;
+      if (gp.buttons[14]?.pressed) dx = -1;
+      if (gp.buttons[15]?.pressed) dx = 1;
+      if (gp.buttons[12]?.pressed) dy = -1;
+      if (gp.buttons[13]?.pressed) dy = 1;
+      dev.stick = Math.hypot(dx, dy) > 0.22 ? { x: dx, y: dy } : { x: 0, y: 0 };
     }
   }
 
-  /** Movement stick: keyboard digital + gamepad analog, normalized. */
-  getStick(): Stick {
+  keyboardStick(): Stick {
     let x = 0, y = 0;
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) x -= 1;
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) x += 1;
     if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) y -= 1;
     if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) y += 1;
-    if (this.gamepadIndex !== null) {
-      const gp = navigator.getGamepads()[this.gamepadIndex];
-      if (gp) {
-        const gx = gp.axes[0] ?? 0, gy = gp.axes[1] ?? 0;
-        if (Math.hypot(gx, gy) > 0.22) { x = gx; y = gy; }
-      }
-    }
     const l = Math.hypot(x, y);
     if (l > 1) { x /= l; y /= l; }
     return { x, y };
   }
 
-  isSprinting(): boolean { return this.sprintHeld; }
-  isHeld(a: Action): boolean { return this.actions[a].held; }
-
-  /** How long the action has been held, in seconds (for shot power). */
-  heldDuration(a: Action): number {
-    const s = this.actions[a];
-    return s.held ? (performance.now() - s.heldSince) / 1000 : 0;
+  /** A seat for one human player. 'merged' = keyboard + every pad (1P mode). */
+  seat(kind: DeviceKind, padIndex = 0): PlayerInput {
+    return new PlayerInput(this, kind, padIndex);
   }
 
-  /**
-   * Consume a buffered press edge if one happened within the window.
-   * Gameplay uses the default 150ms; UI prompts (halftime, rematch) pass a
-   * long window so a press is never swallowed by a slow frame.
-   */
-  consumePress(a: Action, windowMs = BUFFER_MS): boolean {
-    const s = this.actions[a];
-    if (s.pressedAt >= 0 && performance.now() - s.pressedAt <= windowMs) {
-      s.pressedAt = -1;
-      return true;
+  /** UI-level "any press of these actions on any device" (long window). */
+  anyPress(actions: Action[], windowMs = 5000): boolean {
+    const devices = [this.keyboard, ...this.pads.values()];
+    for (const d of devices) {
+      for (const a of actions) {
+        const s = d.actions[a];
+        if (s.pressedAt >= 0 && performance.now() - s.pressedAt <= windowMs) {
+          s.pressedAt = -1;
+          return true;
+        }
+      }
     }
     return false;
   }
 
-  /** Consume a buffered release edge (shoot fires on release for power shots). */
-  consumeRelease(a: Action): { heldFor: number } | null {
-    const s = this.actions[a];
-    if (s.releasedAt >= 0 && performance.now() - s.releasedAt <= BUFFER_MS) {
-      const heldFor = (s.releasedAt - s.heldSince) / 1000;
-      s.releasedAt = -1;
-      return { heldFor };
+  clearAll(): void {
+    this.keyboard.clear();
+    for (const d of this.pads.values()) d.clear();
+  }
+}
+
+function isDir(m: string): m is 'up' | 'down' | 'left' | 'right' {
+  return m === 'up' || m === 'down' || m === 'left' || m === 'right';
+}
+
+/** One player's view of the hub. The whole sim reads inputs through this. */
+export class PlayerInput {
+  constructor(private hub: InputHub, private kind: DeviceKind, private padIndex: number) {}
+
+  private devices(): DeviceState[] {
+    if (this.kind === 'keyboard') return [this.hub.keyboard];
+    if (this.kind === 'pad') return [this.hub.pad(this.padIndex)];
+    return [this.hub.keyboard, ...this.hub.connectedPads().map((i) => this.hub.pad(i))];
+  }
+
+  getStick(): Stick {
+    if (this.kind !== 'pad') {
+      const k = this.hub.keyboardStick();
+      if (this.kind === 'keyboard') return k;
+      // merged: pad stick wins when deflected
+      for (const i of this.hub.connectedPads()) {
+        const s = this.hub.pad(i).stick;
+        if (Math.hypot(s.x, s.y) > 0.22) return clampStick(s);
+      }
+      return k;
+    }
+    return clampStick(this.hub.pad(this.padIndex).stick);
+  }
+
+  isSprinting(): boolean {
+    return this.devices().some((d) => d.sprintHeld);
+  }
+
+  isHeld(a: Action): boolean {
+    return this.devices().some((d) => d.actions[a].held);
+  }
+
+  /** How long the action has been held, in seconds (for shot power). */
+  heldDuration(a: Action): number {
+    let best = 0;
+    for (const d of this.devices()) {
+      const s = d.actions[a];
+      if (s.held) best = Math.max(best, (performance.now() - s.heldSince) / 1000);
+    }
+    return best;
+  }
+
+  /**
+   * Consume a buffered press edge if one happened within the window.
+   * Gameplay uses the default 150ms; UI prompts pass a long window so a
+   * press is never swallowed by a slow frame.
+   */
+  consumePress(a: Action, windowMs = BUFFER_MS): boolean {
+    for (const d of this.devices()) {
+      const s = d.actions[a];
+      if (s.pressedAt >= 0 && performance.now() - s.pressedAt <= windowMs) {
+        s.pressedAt = -1;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Consume a buffered release edge (shots fire on release). */
+  consumeRelease(a: Action, windowMs = BUFFER_MS): { heldFor: number } | null {
+    for (const d of this.devices()) {
+      const s = d.actions[a];
+      if (s.releasedAt >= 0 && performance.now() - s.releasedAt <= windowMs) {
+        const heldFor = (s.releasedAt - s.heldSince) / 1000;
+        s.releasedAt = -1;
+        return { heldFor };
+      }
     }
     return null;
   }
 
   clearBuffers(): void {
-    for (const a of Object.keys(this.actions) as Action[]) {
-      this.actions[a].pressedAt = -1;
-      this.actions[a].releasedAt = -1;
-    }
+    for (const d of this.devices()) d.clear();
   }
+}
+
+function clampStick(s: Stick): Stick {
+  const l = Math.hypot(s.x, s.y);
+  return l > 1 ? { x: s.x / l, y: s.y / l } : { x: s.x, y: s.y };
 }

@@ -18,6 +18,9 @@ export class PlayerEntity {
   sprinting = false;
 
   stamina = 1; // 0..1, drains while sprinting
+  /** discipline (§6.4): two yellows or a straight red and you're off */
+  yellows = 0;
+  sentOff = false;
   /** Brief lockout after a kick/tackle so animations land (never blocks buffered input reads). */
   actionLock = 0;
   actionAnim: ActionAnim = 'none';
