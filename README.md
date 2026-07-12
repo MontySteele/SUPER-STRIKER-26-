@@ -65,6 +65,12 @@ Y through, RT sprint, LB switch, Back replay, Start pause) — with **rumble**:
 kicks, tackles, the post, and goals all speak through the pad. Menus: WASD + J
 confirm, K back. On the full-time card, **L** replays the last goal.
 
+**Defending:** when the other side wins the ball you're automatically handed
+the best-placed defender (FIFA-style auto-switch — **Space** re-switches
+manually). Run at the carrier and shoulder in to force the steal, **hold J**
+to make your man chase the ball, or **L** for a slide tackle — through the
+man is a foul, from behind is a card.
+
 ## Modes
 
 - **Kick-Off** — 1P vs CPU, any two of the 48 teams.
@@ -121,8 +127,9 @@ confirm, K back. On the full-time card, **L** replays the last goal.
 - **The sound:** fully synthesized Web Audio — layered crowd conductor driven
   directly by game state (murmur → anticipation → roar/groan), kick thumps,
   net swish, pea-whistle, the sacred post *DOINK*, the crowd holding its
-  breath before every penalty, and a big-beat menu music loop. Zero audio
-  assets.
+  breath before every penalty, and two synthesized music loops — a big-beat
+  menu anthem and a leaner in-match groove that sits under the crowd (MUSIC
+  setting: ON / MENUS ONLY / OFF). Zero audio assets.
 - **The data:** all 48 teams live in `src/data/teams.json` — real 2026 World
   Cup squads with per-player ratings and one star player per team (gold ring,
   +10 ratings). Don't like the roster? **EDIT TEAMS** on the main menu opens a

@@ -8,6 +8,11 @@ import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { Tournament } from '../sim/tournament';
 import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
+import { MUSIC_KEY, musicSetting, type MusicSetting } from '../audio/music';
+
+const MUSIC_OPTIONS: [MusicSetting, string][] = [
+  ['all', 'ON'], ['menus', 'MENUS ONLY'], ['off', 'OFF'],
+];
 
 export type GameMode = 'kickoff' | 'versus' | 'shootout' | 'golden';
 
@@ -174,11 +179,15 @@ export class Menu {
 
   private settingsRows(): [string, string][] {
     const commentary: [string, string] = ['COMMENTARY', commentaryEnabled() ? 'ON' : 'OFF'];
+    const music: [string, string] = [
+      'MUSIC', (MUSIC_OPTIONS.find(([v]) => v === musicSetting()) ?? MUSIC_OPTIONS[0])[1],
+    ];
     if (this.mode === 'tournament') {
       return [
         ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         commentary,
+        music,
       ];
     }
     if (this.mode === 'shootout' || this.mode === 'golden') {
@@ -187,6 +196,7 @@ export class Menu {
         ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
         commentary,
+        music,
       ];
     }
     return [
@@ -195,6 +205,7 @@ export class Menu {
       ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
       ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
       commentary,
+      music,
     ];
   }
 
@@ -209,6 +220,14 @@ export class Menu {
       try {
         localStorage.setItem(COMMENTARY_KEY, commentaryEnabled() ? 'off' : 'on');
       } catch { /* private browsing: toggle just won't persist */ }
+    }
+    if (key === 'MUSIC') {
+      const i = MUSIC_OPTIONS.findIndex(([v]) => v === musicSetting());
+      const next = MUSIC_OPTIONS[(i + d + MUSIC_OPTIONS.length) % MUSIC_OPTIONS.length][0];
+      try {
+        localStorage.setItem(MUSIC_KEY, next);
+      } catch { /* private browsing: toggle just won't persist */ }
+      window.dispatchEvent(new CustomEvent('ss26-music-change'));
     }
   }
 
