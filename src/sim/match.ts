@@ -364,7 +364,14 @@ export class Match {
         if (d < PLAYER_TACKLE_RADIUS) {
           const def = effectiveRating(opp.data, 'defending');
           const ctrl = effectiveRating(carrier.data, 'passing');
-          const winChance = clamp(0.25 + (def - ctrl) / 200, 0.08, 0.55) * dt * 3.2;
+          // the 0.5s cooldown gates this to one roll per contact window, so
+          // this is a per-contest probability, NOT per-tick — scaling it by dt
+          // made a parked carrier survive ~40s of shoulder-to-shoulder contact.
+          // A standing carrier is easy meat; a full-speed dribbler usually
+          // rides the nibble and keeps going.
+          const base = clamp(0.28 + (def - ctrl) / 200, 0.1, 0.6);
+          const mobility = clamp(len2(carrier.vel) / 6, 0, 1);
+          const winChance = base * (1.1 - 0.8 * mobility);
           this.tackleCooldowns.set(opp, 0.5);
           if (this.rng.next() < winChance) {
             const dir = norm2({
@@ -443,6 +450,30 @@ export class Match {
       this.controlled[best.teamIdx] = best;
       this.shotCharging[best.teamIdx] = false;
     }
+    // defending seat: hand control to the best-placed defender, FIFA-style.
+    // Without this the defending human is usually steering a player nowhere
+    // near the ball (often off-screen) — which reads as "my input does nothing"
+    if (this.seats[1 - best.teamIdx]) this.autoSwitchDefender(1 - best.teamIdx);
+  }
+
+  private autoSwitchDefender(teamIdx: number): void {
+    const team = this.teams[teamIdx];
+    const cur = this.controlled[teamIdx];
+    const ball = this.ball.pos;
+    const ownGoalX = -HALF_L * team.attackDir;
+    let best: PlayerEntity | null = null;
+    let bestScore = Infinity;
+    for (const p of team.players) {
+      if (p.isGK || p.sentOff || p.diving) continue;
+      const d = dist2(p.pos, { x: ball.x, y: ball.y });
+      const goalSide = (p.pos.x - ball.x) * Math.sign(ownGoalX - ball.x) > 0;
+      let score = d + (goalSide ? 0 : 9);
+      // hysteresis: keep the current man unless someone is clearly better,
+      // so control isn't yanked mid-run on every opposition pass
+      if (p === cur) score -= 4;
+      if (score < bestScore) { bestScore = score; best = p; }
+    }
+    if (best) this.controlled[teamIdx] = best;
   }
 
   /** Close control: the ball is repeatedly touched ahead, never glued (§6.1). */

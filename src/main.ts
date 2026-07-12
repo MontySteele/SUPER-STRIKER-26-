@@ -16,7 +16,7 @@ import { RosterEditor } from './ui/rosterEditor';
 import { applyRosterOverrides } from './data/roster';
 import { TournamentUI } from './ui/tournamentUI';
 import { AudioEngine } from './audio/audio';
-import { MusicPlayer } from './audio/music';
+import { MusicPlayer, musicSetting } from './audio/music';
 import { Commentary } from './audio/commentary';
 import { SIM_DT } from './sim/constants';
 import type { TeamData } from './data/types';
@@ -28,10 +28,21 @@ const music = new MusicPlayer();
 const commentary = new Commentary();
 
 let inMenus = true;
+
+/** Idempotent: start/stop/switch the right track for where we are. */
+function applyMusic(): void {
+  const ctx = audio.context();
+  const s = musicSetting();
+  const want = s === 'off' ? null : inMenus ? 'menu' : s === 'all' ? 'match' : null;
+  if (!want || !ctx) { music.stop(); return; }
+  music.start(ctx, want);
+}
+// the menu settings row toggles the persisted value, then pokes us
+window.addEventListener('ss26-music-change', applyMusic);
+
 hub.onAnyButton = () => {
   audio.unlock();
-  const ctx = audio.context();
-  if (inMenus && ctx && !music.playing) music.start(ctx);
+  applyMusic();
 };
 
 interface MatchConfig {
@@ -80,8 +91,7 @@ function showMenu(): void {
   inMenus = true;
   commentary.stop();
   audio.setCrowd(false);
-  const ctx = audio.context();
-  if (ctx && !music.playing) music.start(ctx);
+  applyMusic();
   if (!attractMatch) startAttract(); // editor exit: don't restart the show
   new Menu(handleMenuResult, () => hub.connectedPads().length);
 }
@@ -136,8 +146,7 @@ function showTournamentHub(): void {
   inMenus = true;
   commentary.stop();
   audio.setCrowd(false);
-  const ctx = audio.context();
-  if (ctx && !music.playing) music.start(ctx);
+  applyMusic();
   if (!attractMatch) startAttract();
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
@@ -283,7 +292,7 @@ function startMatch(config: MatchConfig): void {
   stopAttract();
   currentConfig = config;
   inMenus = false;
-  music.stop();
+  applyMusic(); // 'match' groove under the crowd, or silence if set to MENUS/OFF
 
   match = new Match({
     home: config.home,
@@ -324,7 +333,7 @@ function startMatch(config: MatchConfig): void {
   rafId = requestAnimationFrame(loop);
   // debug hook for automated testing
   (window as unknown as Record<string, unknown>).__ss26 = {
-    match: m, renderer: r, hub, tournament, isPaused: () => paused,
+    match: m, renderer: r, hub, tournament, music, isPaused: () => paused,
   };
 }
 
