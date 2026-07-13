@@ -7,6 +7,7 @@ import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
 import { overall } from '../data/loader';
 import { esc } from './escape';
+import { controlsSetting, type ControlsSetting } from './prefs';
 import type { TeamData } from '../data/types';
 
 /** One line of the match story shown on break/full-time cards. */
@@ -38,6 +39,12 @@ export class HUD {
   private replayBug!: HTMLElement;
   private prematch!: HTMLElement;
   private controlsTimer = 14;
+  private controlsMode: ControlsSetting = controlsSetting();
+  private controlsAttack = '';
+  private controlsDefense = '';
+  private controlsBright = 0;
+  /** The single human seat index for context-aware hints; -1 in 2P. */
+  private soloSeat = -1;
   private prematchTimer = 8;
   /** Overrides the full-time prompt (tournament mode: J and K both continue). */
   fulltimeHint: string | null = null;
@@ -56,7 +63,10 @@ export class HUD {
     const [home, away] = this.match.teams;
     const seats = this.match.seats;
     const twoP = seats[0] !== null && seats[1] !== null;
-    const dev = (i: number): string => (seats[i]?.kind === 'pad' ? 'GAMEPAD' : 'KEYBOARD');
+    const dev = (i: number): string => {
+      const kind = seats[i]?.kind;
+      return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'PHONE' : 'KEYBOARD';
+    };
     this.root.innerHTML = `
       <div class="letterbox-top"></div>
       <div class="letterbox-bot"></div>
@@ -81,11 +91,17 @@ export class HUD {
       <div class="pen-hint"></div>
       <div class="match-card"></div>
       <div class="prematch">${this.prematchHtml()}</div>
-      <div class="controls-card">${twoP
-        ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
-        : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · REPLAY R · PAUSE ESC'}</div>
+      <div class="controls-card"></div>
       <div class="wipe"></div>
     `;
+    this.controlsAttack = twoP
+      ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
+      : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · REPLAY R · PAUSE ESC';
+    // 2P shares one card, so it keeps the merged line; 1P swaps to a
+    // defensive cheat-sheet whenever the other side has the ball
+    this.controlsDefense = twoP
+      ? '' : 'DEFENDING — SWITCH SPACE · CHASE hold J · SLIDE L · SPRINT SHIFT · REPLAY R · PAUSE ESC';
+    if (!twoP) this.soloSeat = seats[0] ? 0 : seats[1] ? 1 : -1;
     this.bugScore = this.root.querySelector('.score')!;
     this.bugClock = this.root.querySelector('.clock')!;
     this.ticker = this.root.querySelector('.ticker')!;
@@ -97,6 +113,8 @@ export class HUD {
     this.card = this.root.querySelector('.match-card')!;
     this.wipe = this.root.querySelector('.wipe')!;
     this.controlsCard = this.root.querySelector('.controls-card')!;
+    this.controlsCard.textContent = this.controlsAttack;
+    if (this.controlsMode === 'off') this.controlsCard.style.display = 'none';
     this.reticle = this.root.querySelector('.reticle')!;
     this.penBoard = this.root.querySelector('.pen-board')!;
     this.penHint = this.root.querySelector('.pen-hint')!;
@@ -342,13 +360,24 @@ export class HUD {
     for (let i = 0; i < 2; i++) {
       const ctrl = m.controlled[i];
       const np = this.nameplates[i];
-      if (ctrl && m.seats[i] && inAction && !ctrl.sentOff) {
+      const seat = m.seats[i];
+      if (ctrl && seat && inAction && !ctrl.sentOff) {
         const sp = screenPos(ctrl.pos.x, ctrl.pos.y, 2.6);
         if (sp.visible) {
           np.style.display = 'block';
           np.style.left = `${sp.x}%`;
           np.style.top = `${sp.y}%`;
-          np.textContent = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}`;
+          // off-ball mode tag: the defending player's input IS doing something —
+          // say so right on the nameplate
+          let mode = '';
+          if (m.ball.owner !== ctrl) {
+            if (ctrl.actionAnim === 'slide') mode = 'SLIDE!';
+            else if (seat.isHeld('pass')) mode = 'CHASING';
+            else if (m.ball.owner && m.ball.owner.teamIdx !== i) mode = 'DEFEND';
+          }
+          const label = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}` +
+            (mode ? ` <span class="np-mode">· ${mode}</span>` : '');
+          if (np.innerHTML !== label) np.innerHTML = label;
         } else {
           np.style.display = 'none';
         }
@@ -359,9 +388,24 @@ export class HUD {
 
     this.updatePenaltyUI(screenPos);
 
-    if (this.controlsTimer > 0) {
-      this.controlsTimer -= dt;
-      if (this.controlsTimer <= 0) this.controlsCard.style.display = 'none';
+    // controls card: persistent hint that swaps to the defensive controls
+    // when the other side has the ball (1P only), and dims rather than hides
+    if (this.controlsMode !== 'off') {
+      if (this.controlsDefense && this.soloSeat >= 0 && inAction) {
+        const owner = m.ball.owner;
+        const possession = owner ? owner.teamIdx : m.possessionTeam;
+        const want = possession !== this.soloSeat ? this.controlsDefense : this.controlsAttack;
+        if (this.controlsCard.textContent !== want) {
+          this.controlsCard.textContent = want;
+          this.controlsBright = 4; // resurface the relevant hint briefly
+        }
+      }
+      if (this.controlsMode === 'fade') {
+        if (this.controlsTimer > 0) this.controlsTimer -= dt;
+        if (this.controlsBright > 0) this.controlsBright -= dt;
+        this.controlsCard.classList.toggle('dim',
+          this.controlsTimer <= 0 && this.controlsBright <= 0);
+      }
     }
     if (this.prematchTimer > 0) {
       this.prematchTimer -= dt;

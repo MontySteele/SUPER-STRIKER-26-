@@ -2,8 +2,9 @@
 
 **A browser-based, PS3-era football game built to embarrass the official one.**
 
-Runs locally at 60fps. No cloud streaming, no phone-as-controller, no accounts,
-no QR codes, and **0 microtransactions**. URL → kickoff in seconds.
+Runs locally at 60fps. No cloud streaming, no accounts, and
+**0 microtransactions**. URL → kickoff in seconds. (Fine, there IS an optional
+phone-as-controller now — with a QR code — but only because it rules.)
 
 ## Play it
 
@@ -44,7 +45,25 @@ link. Notes:
   laptop can even go to sleep. No latency concerns — the game runs on the
   player's machine.
 - 2-player Versus is couch co-op **on the same machine**: keyboard + a USB/BT
-  gamepad, or two gamepads, plugged into whichever device opened the link.
+  gamepad, two gamepads, or phones as controllers (below), all driving
+  whichever device opened the link.
+
+## Phone as controller
+
+When the game is served by `npm run dev` or `npm run preview` (NOT a static
+`dist/` deploy — the touch input rides a WebSocket relay inside the Vite
+server), the menus show a **PHONE CONTROLLER** panel with a QR code and URL.
+Scan it with a phone on the same network (or through the same Cloudflare
+tunnel) and the phone becomes a touch gamepad: virtual stick on the left,
+PASS / LOFT / SHOOT / THRU / SPRINT / SWITCH on the right.
+
+- In 1P modes a connected phone just works alongside the keyboard and pads.
+- In Versus / Golden Goal, phones count as controllers for seating (pads
+  first, then phones, keyboard fills the last seat) — two phones = 2P with
+  zero hardware.
+- The 4-char room code pairs the phone to *your* game, so a tunnel URL being
+  public doesn't let strangers grab your match. A phone that disconnects or
+  backgrounds goes neutral, exactly like a yanked gamepad.
 
 ## Controls (keyboard)
 

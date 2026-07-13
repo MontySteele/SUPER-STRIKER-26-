@@ -48,6 +48,8 @@ export class GameRenderer {
   playerMeshes: PlayerMesh[] = [];
   ballMesh: BallMesh;
   switchArrows: [THREE.Mesh, THREE.Mesh];
+  controlRings: [THREE.Mesh, THREE.Mesh];
+  private ringPulse = [0, 0];
 
   // interpolation snapshots
   private prevSnaps: Snap[] = [];
@@ -89,10 +91,11 @@ export class GameRenderer {
     });
     for (const pm of this.playerMeshes) this.sceneMgr.scene.add(pm.root);
 
-    // chunky switch indicators (§5): P1 gold, P2 silver
+    // chunky switch indicators (§5): P1 gold, P2 silver — arrow overhead
+    // plus a glowing ring at the feet so "who am I?" reads at a glance
     const mkArrow = (color: number): THREE.Mesh => {
       const m = new THREE.Mesh(
-        new THREE.ConeGeometry(0.28, 0.5, 4),
+        new THREE.ConeGeometry(0.36, 0.68, 4),
         new THREE.MeshBasicMaterial({ color }),
       );
       m.rotation.x = Math.PI;
@@ -100,6 +103,20 @@ export class GameRenderer {
       return m;
     };
     this.switchArrows = [mkArrow(0xffce4a), mkArrow(0xdde4f0)];
+    const mkRing = (color: number): THREE.Mesh => {
+      const m = new THREE.Mesh(
+        new THREE.RingGeometry(0.55, 0.8, 32),
+        new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: 0.65,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        }),
+      );
+      m.rotation.x = -Math.PI / 2;
+      m.position.y = 0.04;
+      this.sceneMgr.scene.add(m);
+      return m;
+    };
+    this.controlRings = [mkRing(0xffce4a), mkRing(0xdde4f0)];
 
     this.snapshot();
     this.snapshot();
@@ -132,6 +149,10 @@ export class GameRenderer {
   }
 
   onEvent(e: MatchEvent): void {
+    if (e.type === 'switch') {
+      this.ringPulse[e.teamIdx] = 0.3;
+      return;
+    }
     if (e.type === 'goal') {
       this.goalSeqT = 0;
       // celebration subject: the scorer's mesh
@@ -284,12 +305,27 @@ export class GameRenderer {
         this.replayIdx + dtReal * REPLAY_FPS * pass.rate,
         this.passFrames.length - 1,
       );
-      const f = this.passFrames[Math.floor(this.replayIdx)];
-      [ballX, ballY, ballZ] = f.ball;
+      // interpolate between the 30fps recorded frames — nearest-frame
+      // stepping stutters badly at slow-mo rates
+      const i0 = Math.floor(this.replayIdx);
+      const i1 = Math.min(i0 + 1, this.passFrames.length - 1);
+      const frac = this.replayIdx - i0;
+      const f0 = this.passFrames[i0];
+      const f1 = this.passFrames[i1];
+      ballX = f0.ball[0] + (f1.ball[0] - f0.ball[0]) * frac;
+      ballY = f0.ball[1] + (f1.ball[1] - f0.ball[1]) * frac;
+      ballZ = f0.ball[2] + (f1.ball[2] - f0.ball[2]) * frac;
       this.ballMesh.update(ballX, ballY, ballZ);
-      f.players.forEach((s, i) => {
-        const [anim, animT] = f.anims[i];
-        this.playerMeshes[i].update(dtReal, s.x, s.y, 0, s.facing, s.speed, anim, animT);
+      f0.players.forEach((s, i) => {
+        const s1 = f1.players[i];
+        const x = s.x + (s1.x - s.x) * frac;
+        const y = s.y + (s1.y - s.y) * frac;
+        let df = s1.facing - s.facing;
+        if (df > Math.PI) df -= Math.PI * 2;
+        if (df < -Math.PI) df += Math.PI * 2;
+        const [anim, animT] = f0.anims[i];
+        this.playerMeshes[i].update(dtReal, x, y, 0, s.facing + df * frac,
+          s.speed + (s1.speed - s.speed) * frac, anim, animT);
       });
       if (this.replayIdx >= this.passFrames.length - 1) {
         if (this.passIdx < this.passes.length - 1) {
@@ -333,13 +369,22 @@ export class GameRenderer {
     for (let i = 0; i < 2; i++) {
       const ctrl = this.match.controlled[i];
       const arrow = this.switchArrows[i];
+      const ring = this.controlRings[i];
+      this.ringPulse[i] = Math.max(0, this.ringPulse[i] - dtReal);
       if (ctrl && this.match.seats[i] && !replaying && !ctrl.sentOff) {
         arrow.visible = true;
+        ring.visible = true;
         const bob = Math.sin(performance.now() * 0.006 + i * 2) * 0.08;
         arrow.position.set(ctrl.pos.x, 2.35 + bob, ctrl.pos.y);
         arrow.rotation.y += dtReal * 2;
+        // ring pulses outward for a beat right after a switch
+        const pulse = this.ringPulse[i] / 0.3;
+        ring.position.set(ctrl.pos.x, 0.04, ctrl.pos.y);
+        ring.scale.setScalar(1 + pulse * 1.2);
+        (ring.material as THREE.MeshBasicMaterial).opacity = 0.65 + pulse * 0.35;
       } else {
         arrow.visible = false;
+        ring.visible = false;
       }
     }
 

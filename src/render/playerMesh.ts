@@ -79,12 +79,14 @@ export class PlayerMesh {
     const hairMat = new THREE.MeshPhongMaterial({ color: hairC, shininess: 30 });
     const bootMat = new THREE.MeshPhongMaterial({ color: 0x16181c, shininess: 45 });
 
-    // torso — back face carries the printed name/number
+    // torso — back face carries the printed name/number (box faces are what
+    // make the cheap number decal work, so the torso stays a box)
     const numberTex = makeBackNumberTexture(kit.shirt, data.num, data.name);
     const backMat = new THREE.MeshPhongMaterial({ map: numberTex, shininess: 14 });
     const torsoGeo = new THREE.BoxGeometry(0.52, 0.58, 0.3);
     const torso = new THREE.Mesh(torsoGeo, [shirtMat, shirtMat, shirtMat, shirtMat, shirtMat, backMat]);
     torso.position.y = 1.24;
+    torso.scale.z = 0.95;
     torso.castShadow = true;
     this.body.add(torso);
 
@@ -94,17 +96,26 @@ export class PlayerMesh {
     pelvis.castShadow = true;
     this.body.add(pelvis);
 
-    // head + hair + tiny nose for direction reading
+    // head: smooth ellipsoid skull + hair cap, tiny nose for direction
+    // reading, dot eyes so faces read as faces at broadcast distance
     this.head = new THREE.Group();
-    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.155, 12, 10), skinMat);
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.15, 20, 14), skinMat);
+    skull.scale.set(1, 1.12, 1.04);
     skull.castShadow = true;
     this.head.add(skull);
     if (!bald) {
       const hair = new THREE.Mesh(
-        new THREE.SphereGeometry(0.165, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.55), hairMat,
+        new THREE.SphereGeometry(0.16, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), hairMat,
       );
+      hair.scale.set(1, 1.12, 1.04);
       hair.position.y = 0.015;
       this.head.add(hair);
+    }
+    const eyeMat = new THREE.MeshPhongMaterial({ color: 0x14161a, shininess: 60 });
+    for (const side of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 4), eyeMat);
+      eye.position.set(0.055 * side, 0.02, 0.142);
+      this.head.add(eye);
     }
     const nose = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.06), skinMat);
     nose.position.set(0, -0.01, 0.15);
@@ -112,16 +123,20 @@ export class PlayerMesh {
     this.head.position.y = 1.72;
     this.body.add(this.head);
 
-    // arms: pivot at shoulders; upper = sleeve, lower = skin
+    // arms: pivot at shoulders; upper = sleeve, lower = skin. Capsules
+    // instead of boxes so limbs read as limbs, plus a shoulder cap sphere
+    // to hide the pivot gap
     const mkArm = (side: number): THREE.Group => {
       const g = new THREE.Group();
-      const sleeve = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.24, 0.13), shirtMat);
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.08, 10, 8), shirtMat);
+      cap.castShadow = true;
+      const sleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.14, 2, 8), shirtMat);
       sleeve.position.y = -0.11;
       sleeve.castShadow = true;
-      const fore = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.34, 0.1), skinMat);
+      const fore = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.24, 2, 8), skinMat);
       fore.position.y = -0.38;
       fore.castShadow = true;
-      g.add(sleeve, fore);
+      g.add(cap, sleeve, fore);
       g.position.set(0.33 * side, 1.5, 0);
       g.rotation.z = -0.12 * side;
       this.body.add(g);
@@ -130,15 +145,16 @@ export class PlayerMesh {
     this.armL = mkArm(-1);
     this.armR = mkArm(1);
 
-    // legs: pivot at hip; thigh skin, shin sock, boot
+    // legs: pivot at hip; thigh skin, shin sock, boot. Rounded thigh/shin,
+    // boxy boots and shorts (cloth and boots read fine as boxes)
     const mkLeg = (side: number): THREE.Group => {
       const g = new THREE.Group();
-      const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.4, 0.17), skinMat);
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.085, 0.26, 2, 8), skinMat);
       thigh.position.y = -0.2;
       thigh.castShadow = true;
       const shortLeg = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.19), shortsMat);
       shortLeg.position.y = -0.06;
-      const shin = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.42, 0.13), socksMat);
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.065, 0.3, 2, 8), socksMat);
       shin.position.y = -0.6;
       shin.castShadow = true;
       const boot = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.09, 0.26), bootMat);
@@ -256,8 +272,14 @@ export class PlayerMesh {
         break;
     }
 
-    // apply with light damping so overlays don't pop
-    const k = 1 - Math.pow(0.0001, dt);
+    // apply with damping so overlays don't pop. Striking actions are over in
+    // 0.42s, so their limbs need a much faster time constant or the pose
+    // never reaches full extension and the kick reads mushy; locomotion and
+    // the vertical bob stay soft.
+    const snappy = anim === 'pass' || anim === 'loft' || anim === 'shoot' ||
+      anim === 'slide' || anim === 'diveL' || anim === 'diveR';
+    const k = 1 - Math.pow(snappy ? 1e-8 : 1e-4, dt);
+    const kSlow = 1 - Math.pow(0.0001, dt);
     this.legL.rotation.x += (legLx - this.legL.rotation.x) * k;
     this.legR.rotation.x += (legRx - this.legR.rotation.x) * k;
     this.armL.rotation.x += (armLx - this.armL.rotation.x) * k;
@@ -266,7 +288,7 @@ export class PlayerMesh {
     this.armR.rotation.z += (armRz - this.armR.rotation.z) * k;
     this.body.rotation.x += (bodyLean - this.body.rotation.x) * k;
     this.body.rotation.z += (bodyRoll - this.body.rotation.z) * k;
-    this.body.position.y += (rootY - this.body.position.y) * k;
+    this.body.position.y += (rootY - this.body.position.y) * kSlow;
     this.head.rotation.x += (headPitch - this.head.rotation.x) * k;
 
     if (this.starGlow) {
