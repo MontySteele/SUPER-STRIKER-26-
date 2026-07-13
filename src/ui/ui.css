@@ -380,6 +380,45 @@
 .controls-card.dim {
   opacity: 0.35;
 }
+.phone-panel {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  display: none;
+  align-items: center;
+  gap: 12px;
+  background: rgba(8, 10, 14, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 14px;
+  z-index: 6;
+  pointer-events: none;
+}
+.phone-panel canvas {
+  width: 92px;
+  height: 92px;
+  image-rendering: pixelated;
+  border-radius: 4px;
+}
+.phone-panel .pp-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8a93a8;
+  letter-spacing: 0.05em;
+  max-width: 300px;
+  word-break: break-all;
+}
+.phone-panel .pp-text b {
+  color: #ffce4a;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+}
+.phone-panel .pp-on {
+  color: #62d26f;
+}
 .vs-strip {
   display: flex;
   align-items: center;

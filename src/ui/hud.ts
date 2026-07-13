@@ -63,7 +63,10 @@ export class HUD {
     const [home, away] = this.match.teams;
     const seats = this.match.seats;
     const twoP = seats[0] !== null && seats[1] !== null;
-    const dev = (i: number): string => (seats[i]?.kind === 'pad' ? 'GAMEPAD' : 'KEYBOARD');
+    const dev = (i: number): string => {
+      const kind = seats[i]?.kind;
+      return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'PHONE' : 'KEYBOARD';
+    };
     this.root.innerHTML = `
       <div class="letterbox-top"></div>
       <div class="letterbox-bot"></div>

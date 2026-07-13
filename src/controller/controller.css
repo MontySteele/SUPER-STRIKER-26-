@@ -1,0 +1,186 @@
+/* Phone controller page: left half = virtual stick, right half = buttons.
+   Landscape-first, dark, chunky, thumb-sized. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #0a0c10;
+  color: #e8ecf4;
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#controller-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+}
+
+.status-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #8a93a8;
+  z-index: 5;
+  pointer-events: none;
+}
+.status-bar .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e05a4a;
+  margin-right: 6px;
+}
+.status-bar.connected .dot { background: #62d26f; }
+
+.stick-zone {
+  flex: 1 1 50%;
+  position: relative;
+}
+.stick-base {
+  position: absolute;
+  width: 128px;
+  height: 128px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+  transform: translate(-50%, -50%);
+  display: none;
+}
+.stick-nub {
+  position: absolute;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: rgba(255, 206, 74, 0.85);
+  transform: translate(-50%, -50%);
+  display: none;
+}
+.stick-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #4a5266;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-align: center;
+  pointer-events: none;
+}
+
+.pad-zone {
+  flex: 1 1 50%;
+  position: relative;
+}
+.btn {
+  position: absolute;
+  border-radius: 50%;
+  border: none;
+  font-weight: 900;
+  font-size: 15px;
+  letter-spacing: 0.05em;
+  color: #0c0e12;
+  width: 72px;
+  height: 72px;
+  transform: translate(-50%, -50%);
+  transition: filter 0.05s;
+}
+.btn:active, .btn.down { filter: brightness(1.45); }
+.btn-pass    { background: #62d26f; left: 32%; top: 68%; }
+.btn-shoot   { background: #e05a4a; left: 68%; top: 52%; }
+.btn-loft    { background: #4a9de0; left: 50%; top: 82%; width: 62px; height: 62px; font-size: 12px; }
+.btn-through { background: #ffce4a; left: 50%; top: 38%; width: 62px; height: 62px; font-size: 12px; }
+.btn-small {
+  border-radius: 18px;
+  width: 88px;
+  height: 40px;
+  font-size: 12px;
+  color: #e8ecf4;
+  background: rgba(255, 255, 255, 0.12);
+}
+.btn-switch { left: 30%; top: 14%; }
+.btn-pause  { left: 70%; top: 14%; }
+.btn-sprint {
+  border-radius: 22px;
+  width: 120px;
+  height: 74px;
+  font-size: 14px;
+  color: #e8ecf4;
+  background: rgba(255, 255, 255, 0.12);
+  left: 14%;
+  top: 42%;
+}
+
+.join-card {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: #0a0c10;
+  z-index: 10;
+}
+.join-card h1 {
+  font-size: 20px;
+  font-style: italic;
+  letter-spacing: 0.12em;
+  color: #ffce4a;
+}
+.join-card p { color: #8a93a8; font-size: 14px; }
+.join-card input {
+  width: 160px;
+  padding: 12px;
+  font-size: 24px;
+  font-weight: 900;
+  letter-spacing: 0.3em;
+  text-align: center;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.08);
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  color: #fff;
+  outline: none;
+}
+.join-card button {
+  padding: 12px 38px;
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  background: #ffce4a;
+  color: #0c0e12;
+  border: none;
+  border-radius: 8px;
+}
+.rotate-hint { display: none; }
+@media (orientation: portrait) {
+  .rotate-hint {
+    display: flex;
+    position: fixed;
+    inset: 0;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 12, 16, 0.92);
+    color: #ffce4a;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    z-index: 8;
+    pointer-events: none;
+  }
+}

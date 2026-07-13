@@ -3,12 +3,12 @@
 // pass queued during a receive animation fires the instant the touch completes.
 
 export type Action = 'pass' | 'loft' | 'shoot' | 'through' | 'switch' | 'tactics' | 'pause' | 'replay';
-export type DeviceKind = 'merged' | 'keyboard' | 'pad';
+export type DeviceKind = 'merged' | 'keyboard' | 'pad' | 'remote';
 
 export interface Stick { x: number; y: number; }
 
 const BUFFER_MS = 150;
-const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics', 'pause', 'replay'];
+export const ACTIONS: Action[] = ['pass', 'loft', 'shoot', 'through', 'switch', 'tactics', 'pause', 'replay'];
 
 interface ActionState {
   held: boolean;
@@ -17,7 +17,7 @@ interface ActionState {
   heldSince: number;
 }
 
-class DeviceState {
+export class DeviceState {
   actions = {} as Record<Action, ActionState>;
   sprintHeld = false;
   stick: Stick = { x: 0, y: 0 };
@@ -82,6 +82,8 @@ export class InputHub {
   keyboard = new DeviceState();
   private pads = new Map<number, DeviceState>();
   private prevPadButtons = new Map<number, boolean[]>();
+  /** Phone controllers (fed by RemoteInputHost over WebSocket). */
+  private remotes = new Map<number, DeviceState>();
   private keys = new Set<string>();
   /** Fired on any key/button press — unlocks audio, advances title screens. */
   onAnyButton: (() => void) | null = null;
@@ -154,6 +156,24 @@ export class InputHub {
     return d;
   }
 
+  /** Device state for a connected phone controller (created on join). */
+  remote(index: number): DeviceState {
+    let d = this.remotes.get(index);
+    if (!d) { d = new DeviceState(); this.remotes.set(index, d); }
+    return d;
+  }
+
+  /** A phone left — its player must go neutral, like a yanked pad. */
+  removeRemote(index: number): void {
+    this.remotes.get(index)?.neutralize();
+    this.remotes.delete(index);
+  }
+
+  /** Indices of currently connected phone controllers. */
+  connectedRemotes(): number[] {
+    return [...this.remotes.keys()].sort((a, b) => a - b);
+  }
+
   /** Poll gamepad edges once per frame (the Gamepad API has no button events). */
   pollGamepads(): void {
     const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
@@ -211,7 +231,7 @@ export class InputHub {
 
   /** UI-level "any press of these actions on any device" (long window). */
   anyPress(actions: Action[], windowMs = 5000): boolean {
-    const devices = [this.keyboard, ...this.pads.values()];
+    const devices = [this.keyboard, ...this.pads.values(), ...this.remotes.values()];
     for (const d of devices) {
       for (const a of actions) {
         const s = d.actions[a];
@@ -227,6 +247,7 @@ export class InputHub {
   clearAll(): void {
     this.keyboard.clear();
     for (const d of this.pads.values()) d.clear();
+    for (const d of this.remotes.values()) d.clear();
   }
 }
 
@@ -241,21 +262,29 @@ export class PlayerInput {
   private devices(): DeviceState[] {
     if (this.kind === 'keyboard') return [this.hub.keyboard];
     if (this.kind === 'pad') return [this.hub.pad(this.padIndex)];
-    return [this.hub.keyboard, ...this.hub.connectedPads().map((i) => this.hub.pad(i))];
+    if (this.kind === 'remote') return [this.hub.remote(this.padIndex)];
+    return [
+      this.hub.keyboard,
+      ...this.hub.connectedPads().map((i) => this.hub.pad(i)),
+      ...this.hub.connectedRemotes().map((i) => this.hub.remote(i)),
+    ];
   }
 
   getStick(): Stick {
-    if (this.kind !== 'pad') {
-      const k = this.hub.keyboardStick();
-      if (this.kind === 'keyboard') return k;
-      // merged: pad stick wins when deflected
-      for (const i of this.hub.connectedPads()) {
-        const s = this.hub.pad(i).stick;
-        if (Math.hypot(s.x, s.y) > 0.22) return clampStick(s);
-      }
-      return k;
+    if (this.kind === 'pad') return clampStick(this.hub.pad(this.padIndex).stick);
+    if (this.kind === 'remote') return clampStick(this.hub.remote(this.padIndex).stick);
+    const k = this.hub.keyboardStick();
+    if (this.kind === 'keyboard') return k;
+    // merged: any deflected pad/phone stick wins over the keyboard
+    for (const i of this.hub.connectedPads()) {
+      const s = this.hub.pad(i).stick;
+      if (Math.hypot(s.x, s.y) > 0.22) return clampStick(s);
     }
-    return clampStick(this.hub.pad(this.padIndex).stick);
+    for (const i of this.hub.connectedRemotes()) {
+      const s = this.hub.remote(i).stick;
+      if (Math.hypot(s.x, s.y) > 0.22) return clampStick(s);
+    }
+    return k;
   }
 
   isSprinting(): boolean {

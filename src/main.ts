@@ -3,6 +3,8 @@
 
 import './ui/ui.css';
 import { InputHub, type PlayerInput } from './input/input';
+import { RemoteInputHost } from './input/remote';
+import { drawQr } from './ui/qr';
 import { Match, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
@@ -26,8 +28,45 @@ const hub = new InputHub();
 const audio = new AudioEngine();
 const music = new MusicPlayer();
 const commentary = new Commentary();
+const remoteHost = new RemoteInputHost(hub);
 
 let inMenus = true;
+
+// ------------------------------------------------------- phone controller UI
+// Pairing panel lives outside #ui-root so menu re-renders leave it alone.
+// Only shown in menus, and only when the WS relay actually answers (dev /
+// preview server) — on static hosting the feature silently doesn't exist.
+const phonePanel = document.createElement('div');
+phonePanel.className = 'phone-panel';
+document.body.appendChild(phonePanel);
+const ppCanvas = document.createElement('canvas');
+const ppText = document.createElement('div');
+ppText.className = 'pp-text';
+phonePanel.append(ppCanvas, ppText);
+
+function refreshPhonePanel(): void {
+  const show = inMenus && remoteHost.status === 'ready';
+  phonePanel.style.display = show ? 'flex' : 'none';
+  if (!show) return;
+  const url = remoteHost.controllerUrl();
+  const n = remoteHost.connectedCount();
+  ppText.textContent = '';
+  const title = document.createElement('b');
+  title.textContent = 'PHONE CONTROLLER';
+  const urlEl = document.createElement('span');
+  urlEl.textContent = url;
+  const status = document.createElement('span');
+  status.textContent = n > 0 ? `CODE ${remoteHost.code} · ${n} CONNECTED` : `CODE ${remoteHost.code}`;
+  status.className = n > 0 ? 'pp-on' : '';
+  ppText.append(title, urlEl, status);
+  try {
+    drawQr(ppCanvas, url, 3);
+    ppCanvas.style.display = 'block';
+  } catch {
+    ppCanvas.style.display = 'none'; // URL too long for the mini encoder
+  }
+}
+remoteHost.onChange = refreshPhonePanel;
 
 /** Idempotent: start/stop/switch the right track for where we are. */
 function applyMusic(): void {
@@ -92,8 +131,9 @@ function showMenu(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
+  refreshPhonePanel();
   if (!attractMatch) startAttract(); // editor exit: don't restart the show
-  new Menu(handleMenuResult, () => hub.connectedPads().length);
+  new Menu(handleMenuResult, () => hub.connectedPads().length + hub.connectedRemotes().length);
 }
 
 function handleMenuResult(r: MenuResult): void {
@@ -102,8 +142,9 @@ function handleMenuResult(r: MenuResult): void {
     case 'versus':
     case 'shootout':
     case 'golden': {
-      // golden goal is a party mode: 2P when a pad is plugged in, else vs CPU
-      const twoP = r.kind === 'versus' || (r.kind === 'golden' && hub.connectedPads().length > 0);
+      // golden goal is a party mode: 2P when a pad/phone is around, else vs CPU
+      const twoP = r.kind === 'versus' ||
+        (r.kind === 'golden' && hub.connectedPads().length + hub.connectedRemotes().length > 0);
       const seats = makeSeats(twoP);
       startMatch({
         home: r.home, away: r.away, seats,
@@ -133,10 +174,16 @@ function handleMenuResult(r: MenuResult): void {
 }
 
 function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
+  // 1P: merged seat already unions keyboard + pads + phones
   if (!versus) return [hub.seat('merged'), null];
-  const pads = hub.connectedPads();
-  if (pads.length >= 2) return [hub.seat('pad', pads[0]), hub.seat('pad', pads[1])];
-  return [hub.seat('keyboard'), hub.seat('pad', pads[0] ?? 0)];
+  // 2P: pads first, then phones, keyboard fills the last empty seat
+  const devs: PlayerInput[] = [
+    ...hub.connectedPads().map((i) => hub.seat('pad', i)),
+    ...hub.connectedRemotes().map((i) => hub.seat('remote', i)),
+  ];
+  if (devs.length >= 2) return [devs[0], devs[1]];
+  if (devs.length === 1) return [hub.seat('keyboard'), devs[0]];
+  return [hub.seat('keyboard'), hub.seat('pad', 0)];
 }
 
 // ---------------------------------------------------------------- tournament
@@ -147,6 +194,7 @@ function showTournamentHub(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
+  refreshPhonePanel();
   if (!attractMatch) startAttract();
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
@@ -295,6 +343,7 @@ function startMatch(config: MatchConfig): void {
   inMenus = false;
   applyMusic(); // 'match' groove under the crowd, or silence if set to MENUS/OFF
 
+  refreshPhonePanel();
   match = new Match({
     home: config.home,
     away: config.away,
