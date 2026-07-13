@@ -9,7 +9,17 @@ import type { PlayerEntity } from '../player';
 import type { Team } from '../team';
 import type { Match } from '../match';
 
-type KState = 'position' | 'set' | 'react' | 'dive' | 'recover' | 'hold';
+type KState = 'position' | 'set' | 'react' | 'dive' | 'recover' | 'hold' | 'smother';
+
+// Smother (§6.3+): a dribbler carrying the ball deep into the box gets
+// charged down and the ball claimed at their feet — the realistic answer to
+// walking the ball into the net. Shots and chips still beat the charge.
+const SMOTHER_TRIGGER_X = 12;   // carrier within this of the goal line
+const SMOTHER_TRIGGER_Y = 13;
+const SMOTHER_REACH = 7;        // keeper close enough to make the charge
+const SMOTHER_BALL_MAX_Z = 0.6; // at the feet — a chip is not smotherable
+const SMOTHER_WIN_BASE = 0.72;  // + up to 0.18 by Keeping rating
+const SMOTHER_COOLDOWN = 1.6;
 
 export class KeeperBrain {
   state: KState = 'position';
@@ -17,6 +27,7 @@ export class KeeperBrain {
   /** sim time at which the keeper reacts to the in-flight shot */
   reactAt = -1;
   holdTimer = 0;
+  private smotherCooldown = 0;
 
   constructor(public team: Team, public keeper: PlayerEntity) {}
 
@@ -40,6 +51,7 @@ export class KeeperBrain {
     const ball = match.ball;
     const gx = this.goalX();
     this.timer += dt;
+    this.smotherCooldown = Math.max(0, this.smotherCooldown - dt);
 
     // stray ball captured at the keeper's feet → immediate distribution
     if (ball.owner === k && this.state !== 'hold') {
@@ -97,6 +109,38 @@ export class KeeperBrain {
         return;
       }
 
+      case 'smother': {
+        const target = ball.owner;
+        if (!target || target.teamIdx === this.team.idx ||
+            ball.pos.z > 1.2 || Math.abs(target.pos.x - gx) > SMOTHER_TRIGGER_X + 2) {
+          this.state = 'position'; // dribbled clear, passed, or chipped
+          return;
+        }
+        // attack the BALL, leading the carrier's run slightly
+        k.moveToward({
+          x: ball.pos.x + target.vel.x * 0.15,
+          y: ball.pos.y + target.vel.y * 0.15,
+        }, 1, true);
+        const d = dist2(k.pos, { x: ball.pos.x, y: ball.pos.y });
+        if (d < 1.5) {
+          const keeping = effectiveRating(k.data, 'keeping');
+          const winP = SMOTHER_WIN_BASE + (keeping / 99) * 0.18;
+          this.smotherCooldown = SMOTHER_COOLDOWN;
+          if (match.rng.next() < winP) {
+            this.pickUp(match); // swallowed at the dribbler's feet
+          } else {
+            // spilled: poke it toward the byline — often a corner
+            const outY = Math.sign(ball.pos.y || match.rng.noise());
+            ball.kick({ x: -this.team.attackDir * 0.4, y: outY, z: 0.15 },
+              7 + match.rng.next() * 4, k);
+            ball.noControlTimer = 0.4;
+            this.state = 'recover';
+            this.timer = 0;
+          }
+        }
+        return;
+      }
+
       case 'set':
       case 'position':
       default:
@@ -126,8 +170,21 @@ export class KeeperBrain {
       }
     }
 
-    // --- 1v1: close down to narrow the angle (§6.3) — chips punish this
+    // --- smother: carrier deep in the box with the ball at their feet gets
+    // charged down (outranks passive angle-narrowing; a struck shot still
+    // flips us to react via onShot)
     const carrier = ball.owner;
+    if (carrier && carrier.teamIdx !== this.team.idx &&
+        Math.abs(carrier.pos.x - gx) < SMOTHER_TRIGGER_X &&
+        Math.abs(carrier.pos.y) < SMOTHER_TRIGGER_Y &&
+        dist2(k.pos, carrier.pos) < SMOTHER_REACH &&
+        ball.pos.z < SMOTHER_BALL_MAX_Z &&
+        this.smotherCooldown <= 0) {
+      this.state = 'smother';
+      return;
+    }
+
+    // --- 1v1: close down to narrow the angle (§6.3) — chips punish this
     const oneVsOne = carrier && carrier.teamIdx !== this.team.idx &&
       Math.abs(carrier.pos.x - gx) < 22 && Math.abs(carrier.pos.y) < 14 &&
       this.noDefenderBetween(match, carrier);

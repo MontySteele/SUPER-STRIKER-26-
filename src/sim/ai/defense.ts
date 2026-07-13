@@ -3,7 +3,7 @@
 // teamShape.ts.
 
 import { dist2, len2, norm2, sub2, type V2 } from '../../core/math';
-import { HALF_L } from '../constants';
+import { BOX_DEPTH, BOX_HALF_W, HALF_L } from '../constants';
 import type { PlayerEntity } from '../player';
 import type { Team } from '../team';
 import type { Match } from '../match';
@@ -39,10 +39,14 @@ export function updateDefender(
   const ball = match.ball.pos;
   const carrier = match.ball.owner;
   if (assignment === 'press') {
-    // close down the ball; commit harder the closer we are
+    // close down the ball; commit harder the closer we are. Ball inside our
+    // own box is an emergency — sprint regardless of difficulty gating
+    const ownGoalX = -HALF_L * team.attackDir;
+    const danger = Math.abs(ball.x - ownGoalX) < BOX_DEPTH && Math.abs(ball.y) < BOX_HALF_W;
     const d = dist2(p.pos, { x: ball.x, y: ball.y });
     if (d > 6) {
-      p.moveToward({ x: ball.x, y: ball.y }, 1, match.difficulty.cpuSprint && d > 10);
+      p.moveToward({ x: ball.x, y: ball.y }, 1,
+        danger ? true : (match.difficulty.cpuSprint && d > 10));
     } else {
       // jockey goal-side, then step in when the touch is loose — or when the
       // carrier just stands there (jockeying at 1.4m sits outside the 1.3m

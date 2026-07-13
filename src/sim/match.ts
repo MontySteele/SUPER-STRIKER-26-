@@ -808,7 +808,9 @@ export class Match {
     if (d < 1.4 || d > 3.6) return;
     const escaping = len2(carrier.vel) > 4.2;
     const inOwnHalfish = carrier.pos.x * -team.attackDir > -10;
-    if (escaping && inOwnHalfish && this.rng.next() < dt * 4) {
+    // carrier closing on our goal is a last-ditch situation even at a stroll
+    const dGoalOwn = Math.abs(carrier.pos.x - -HALF_L * team.attackDir);
+    if (((escaping && inOwnHalfish) || dGoalOwn < 20) && this.rng.next() < dt * 4) {
       this.trySlide(p);
     }
   }
