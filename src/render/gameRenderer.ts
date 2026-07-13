@@ -284,12 +284,27 @@ export class GameRenderer {
         this.replayIdx + dtReal * REPLAY_FPS * pass.rate,
         this.passFrames.length - 1,
       );
-      const f = this.passFrames[Math.floor(this.replayIdx)];
-      [ballX, ballY, ballZ] = f.ball;
+      // interpolate between the 30fps recorded frames — nearest-frame
+      // stepping stutters badly at slow-mo rates
+      const i0 = Math.floor(this.replayIdx);
+      const i1 = Math.min(i0 + 1, this.passFrames.length - 1);
+      const frac = this.replayIdx - i0;
+      const f0 = this.passFrames[i0];
+      const f1 = this.passFrames[i1];
+      ballX = f0.ball[0] + (f1.ball[0] - f0.ball[0]) * frac;
+      ballY = f0.ball[1] + (f1.ball[1] - f0.ball[1]) * frac;
+      ballZ = f0.ball[2] + (f1.ball[2] - f0.ball[2]) * frac;
       this.ballMesh.update(ballX, ballY, ballZ);
-      f.players.forEach((s, i) => {
-        const [anim, animT] = f.anims[i];
-        this.playerMeshes[i].update(dtReal, s.x, s.y, 0, s.facing, s.speed, anim, animT);
+      f0.players.forEach((s, i) => {
+        const s1 = f1.players[i];
+        const x = s.x + (s1.x - s.x) * frac;
+        const y = s.y + (s1.y - s.y) * frac;
+        let df = s1.facing - s.facing;
+        if (df > Math.PI) df -= Math.PI * 2;
+        if (df < -Math.PI) df += Math.PI * 2;
+        const [anim, animT] = f0.anims[i];
+        this.playerMeshes[i].update(dtReal, x, y, 0, s.facing + df * frac,
+          s.speed + (s1.speed - s.speed) * frac, anim, animT);
       });
       if (this.replayIdx >= this.passFrames.length - 1) {
         if (this.passIdx < this.passes.length - 1) {

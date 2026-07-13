@@ -256,8 +256,14 @@ export class PlayerMesh {
         break;
     }
 
-    // apply with light damping so overlays don't pop
-    const k = 1 - Math.pow(0.0001, dt);
+    // apply with damping so overlays don't pop. Striking actions are over in
+    // 0.42s, so their limbs need a much faster time constant or the pose
+    // never reaches full extension and the kick reads mushy; locomotion and
+    // the vertical bob stay soft.
+    const snappy = anim === 'pass' || anim === 'loft' || anim === 'shoot' ||
+      anim === 'slide' || anim === 'diveL' || anim === 'diveR';
+    const k = 1 - Math.pow(snappy ? 1e-8 : 1e-4, dt);
+    const kSlow = 1 - Math.pow(0.0001, dt);
     this.legL.rotation.x += (legLx - this.legL.rotation.x) * k;
     this.legR.rotation.x += (legRx - this.legR.rotation.x) * k;
     this.armL.rotation.x += (armLx - this.armL.rotation.x) * k;
@@ -266,7 +272,7 @@ export class PlayerMesh {
     this.armR.rotation.z += (armRz - this.armR.rotation.z) * k;
     this.body.rotation.x += (bodyLean - this.body.rotation.x) * k;
     this.body.rotation.z += (bodyRoll - this.body.rotation.z) * k;
-    this.body.position.y += (rootY - this.body.position.y) * k;
+    this.body.position.y += (rootY - this.body.position.y) * kSlow;
     this.head.rotation.x += (headPitch - this.head.rotation.x) * k;
 
     if (this.starGlow) {
