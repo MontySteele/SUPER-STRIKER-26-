@@ -342,13 +342,24 @@ export class HUD {
     for (let i = 0; i < 2; i++) {
       const ctrl = m.controlled[i];
       const np = this.nameplates[i];
-      if (ctrl && m.seats[i] && inAction && !ctrl.sentOff) {
+      const seat = m.seats[i];
+      if (ctrl && seat && inAction && !ctrl.sentOff) {
         const sp = screenPos(ctrl.pos.x, ctrl.pos.y, 2.6);
         if (sp.visible) {
           np.style.display = 'block';
           np.style.left = `${sp.x}%`;
           np.style.top = `${sp.y}%`;
-          np.textContent = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}`;
+          // off-ball mode tag: the defending player's input IS doing something —
+          // say so right on the nameplate
+          let mode = '';
+          if (m.ball.owner !== ctrl) {
+            if (ctrl.actionAnim === 'slide') mode = 'SLIDE!';
+            else if (seat.isHeld('pass')) mode = 'CHASING';
+            else if (m.ball.owner && m.ball.owner.teamIdx !== i) mode = 'DEFEND';
+          }
+          const label = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}` +
+            (mode ? ` <span class="np-mode">· ${mode}</span>` : '');
+          if (np.innerHTML !== label) np.innerHTML = label;
         } else {
           np.style.display = 'none';
         }

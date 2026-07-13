@@ -25,4 +25,5 @@ export type MatchEvent =
   | { type: 'bounce'; speed: number }
   | { type: 'tackle' }
   | { type: 'attackBuildup'; level: number }  // 0..1 crowd anticipation
-  | { type: 'possessionChange'; teamIdx: number };
+  | { type: 'possessionChange'; teamIdx: number }
+  | { type: 'switch'; teamIdx: number };      // controlled player changed

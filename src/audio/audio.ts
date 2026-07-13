@@ -201,10 +201,28 @@ export class AudioEngine {
         this.roar(3, 1.0);
         this.whistleBlast(3, 0.18);
         break;
+      case 'switch':
+        this.switchBlip();
+        break;
       case 'possessionChange':
       default:
         break;
     }
+  }
+
+  /** Tiny UI blip so a controlled-player switch registers without looking. */
+  private switchBlip(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.08, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+    osc.connect(g).connect(this.master);
+    osc.start(t);
+    osc.stop(t + 0.05);
   }
 
   /** Quick anticipation swell (shot struck — crowd inhales). */

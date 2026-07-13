@@ -105,6 +105,10 @@
   white-space: nowrap;
   display: none;
 }
+.np-mode {
+  color: #ffce4a;
+  font-weight: 800;
+}
 
 /* ---------- replay dressing ---------- */
 .letterbox-top, .letterbox-bot {

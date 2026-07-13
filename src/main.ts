@@ -271,6 +271,7 @@ function rumbleFor(e: MatchEvent): void {
     case 'kick': hub.rumble(0, Math.min(0.1 + e.power * 0.35, 0.5), 60); break;
     case 'shot': hub.rumble(0.45, 0.3, 140); break;
     case 'tackle': hub.rumble(0.5, 0.2, 110); break;
+    case 'switch': hub.rumble(0, 0.2, 40); break;
     case 'post': hub.rumble(0.8, 0.4, 220); break;
     case 'goal': hub.rumble(1, 1, 550); break;
     case 'save': hub.rumble(0.4, 0.3, 130); break;
