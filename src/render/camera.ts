@@ -77,15 +77,19 @@ export class CameraDirector {
       }
       case 'broadcast':
       default: {
-        // elevated side-on, slight zoom-out as play stretches (§7.2)
+        // elevated side-on, slight zoom-out as play stretches (§7.2).
+        // Asymmetric: the camera sits on the +y touchline, so play on the
+        // near side needs a much stronger rise/pull-back to stay in frame.
         const cx = clamp(ballX * 0.86, -40, 40);
-        const stretch = Math.abs(ballY) * 0.2;
+        const nearSide = Math.max(ballY, 0);
+        const farSide = Math.max(-ballY, 0);
+        const stretch = farSide * 0.2 + nearSide * 0.5;
         tx = cx;
-        ty = 22 + stretch * 0.7;
-        tz = 40 + stretch;
+        ty = 22 + stretch * 1.1;
+        tz = 40 + stretch * 1.5;
         lx = clamp(ballX * 0.94, -46, 46);
         ly = 0.5 + ballZ * 0.25;
-        lz = ballY * 0.55 - 2;
+        lz = ballY * 0.7 - 1;
         break;
       }
     }
