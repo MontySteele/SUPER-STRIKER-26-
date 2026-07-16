@@ -541,6 +541,13 @@
 .pm-vs.golden { color: #ffce4a; animation: replayBlink 1.2s steps(2) infinite; }
 
 /* ---------- M5: match story timeline ---------- */
+.match-card .motm {
+  margin: 2px 0 8px;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #ffce4a;
+}
 .story {
   margin: 2px 0 12px;
   padding: 8px 4px;

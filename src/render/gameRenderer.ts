@@ -71,6 +71,11 @@ export class GameRenderer {
   private confetti: THREE.Points | null = null;
   private confettiVel: Float32Array | null = null;
   private confettiT = 0;
+  /** clash-resolved outfield shirt colors, [home, away] */
+  private shirts: [string, string] = ['#ffffff', '#ffffff'];
+  // comet trail behind the ball during replays (additive, fades to the tail)
+  private trail: THREE.Points | null = null;
+  private trailPts: [number, number, number][] = [];
 
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
@@ -81,6 +86,7 @@ export class GameRenderer {
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
     const [homeKit, awayKit, gkA, gkB] = resolveKits(match.teams[0].data.kit, match.teams[1].data.kit);
+    this.shirts = [homeKit.shirt, awayKit.shirt];
     match.teams[0].players.forEach((p) => {
       this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit));
     });
@@ -216,6 +222,43 @@ export class GameRenderer {
     this.onReplayStateChange?.(false);
   }
 
+  private pushTrail(x: number, y: number, z: number): void {
+    const N = 22;
+    if (!this.trail) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      this.trail = new THREE.Points(geo, new THREE.PointsMaterial({
+        size: 0.26, vertexColors: true, transparent: true,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      this.trail.frustumCulled = false;
+      this.sceneMgr.scene.add(this.trail);
+    }
+    this.trailPts.push([x, y, z]);
+    if (this.trailPts.length > N) this.trailPts.shift();
+    const pos = this.trail.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const col = this.trail.geometry.getAttribute('color') as THREE.BufferAttribute;
+    for (let i = 0; i < N; i++) {
+      const p = this.trailPts[Math.min(i, this.trailPts.length - 1)];
+      pos.setXYZ(i, p[0], p[2] + 0.11, p[1]); // sim (x, ground-y, height-z) → scene (x, y, z)
+      const b = Math.pow(Math.min(1, (i + 1) / this.trailPts.length), 1.6) * 0.55; // dim toward the tail
+      col.setXYZ(i, b, b, b * 0.9);
+    }
+    pos.needsUpdate = true;
+    col.needsUpdate = true;
+  }
+
+  private clearTrail(): void {
+    this.trailPts = [];
+    if (this.trail) {
+      this.sceneMgr.scene.remove(this.trail);
+      this.trail.geometry.dispose();
+      (this.trail.material as THREE.Material).dispose();
+      this.trail = null;
+    }
+  }
+
   private removeConfetti(): void {
     if (!this.confetti) return;
     this.sceneMgr.scene.remove(this.confetti);
@@ -230,7 +273,7 @@ export class GameRenderer {
     const pos = new Float32Array(N * 3);
     const vel = new Float32Array(N * 3);
     const colors = new Float32Array(N * 3);
-    const kit = new THREE.Color(this.match.teams[teamIdx].data.kit.home);
+    const kit = new THREE.Color(this.shirts[teamIdx]); // what they actually wear
     const gold = new THREE.Color(0xffce4a);
     const gx = HALF_L * Math.sign(this.match.ball.pos.x || 1);
     for (let i = 0; i < N; i++) {
@@ -287,6 +330,7 @@ export class GameRenderer {
       const f = this.passFrames[Math.floor(this.replayIdx)];
       [ballX, ballY, ballZ] = f.ball;
       this.ballMesh.update(ballX, ballY, ballZ);
+      this.pushTrail(ballX, ballY, ballZ);
       f.players.forEach((s, i) => {
         const [anim, animT] = f.anims[i];
         this.playerMeshes[i].update(dtReal, s.x, s.y, 0, s.facing, s.speed, anim, animT);
@@ -327,6 +371,7 @@ export class GameRenderer {
       ballY = this.prevBall[1] + (this.currBall[1] - this.prevBall[1]) * alpha;
       ballZ = this.prevBall[2] + (this.currBall[2] - this.prevBall[2]) * alpha;
       this.ballMesh.update(ballX, ballY, ballZ);
+      if (this.trailPts.length) this.clearTrail();
     }
 
     // switch indicators hover over each seat's controlled player
@@ -382,6 +427,7 @@ export class GameRenderer {
   /** Release all GPU resources — call when the match ends. */
   dispose(): void {
     this.removeConfetti();
+    this.clearTrail();
     this.sceneMgr.dispose();
   }
 

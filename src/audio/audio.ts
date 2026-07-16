@@ -14,6 +14,7 @@ export class AudioEngine {
   private excitement = 0;      // 0..1 target from buildup events
   private eruption = 0;        // spikes on goals/shots, decays
   private crowdOn = true;
+  private chantCooldown = 14;  // first chant a little into the match
 
   constructor() {
     // Autoplay policy: only a real user gesture can start audio, and gamepad
@@ -121,6 +122,42 @@ export class AudioEngine {
     const t = this.ctx.currentTime;
     this.anticipationGain.gain.setTargetAtTime(target * 0.5, t, 0.4);
     this.murmurGain.gain.setTargetAtTime(0.22 + target * 0.2, t, 0.6);
+
+    // terrace claps: when the game is up, a section starts a rhythm
+    if (this.crowdOn) {
+      this.chantCooldown -= dt;
+      if (this.chantCooldown <= 0 && target > 0.35) {
+        this.chant();
+        this.chantCooldown = 22 + Math.random() * 16;
+      }
+    }
+  }
+
+  /** Clap-clap, clap-clap-clap: a few hundred hands, slightly out of time. */
+  private chant(): void {
+    const ctx = this.ctx!;
+    const beat = 0.34;
+    const pattern = [0, 1, 2, 2.5, 3]; // the universal stadium clap
+    for (let bar = 0; bar < 2; bar++) {
+      for (const step of pattern) {
+        const base = ctx.currentTime + 0.05 + (bar * 4 + step) * beat;
+        for (let h = 0; h < 3; h++) { // layered hands, jittered
+          const t = base + Math.random() * 0.045;
+          const src = ctx.createBufferSource();
+          src.buffer = this.noiseBuffer(0.05, false);
+          const bp = ctx.createBiquadFilter();
+          bp.type = 'bandpass';
+          bp.frequency.value = 1500 + Math.random() * 800;
+          bp.Q.value = 1.2;
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0.1 + Math.random() * 0.05, t);
+          g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+          src.connect(bp).connect(g).connect(this.crowdBus);
+          src.start(t);
+          src.stop(t + 0.1);
+        }
+      }
+    }
   }
 
   onEvent(e: MatchEvent): void {
@@ -135,6 +172,7 @@ export class AudioEngine {
       case 'goal':
         this.eruption = 1.6;
         this.roar(2.6, 1.0);
+        this.goalHorn();
         this.whistleBlast(1, 0.0);
         break;
       case 'save':
@@ -280,6 +318,30 @@ export class AudioEngine {
 
   private thump(): void {
     this.kickSfx(0.25);
+  }
+
+  /** Stadium air horn: detuned saw stack, the hockey-barn goal blast. */
+  private goalHorn(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime + 0.15; // let the roar hit first
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1400, t);
+    lp.frequency.exponentialRampToValueAtTime(700, t + 1.0);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.2, t + 0.05);
+    g.gain.setValueAtTime(0.2, t + 0.75);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.15);
+    lp.connect(g).connect(this.master);
+    for (const f of [233, 236.5, 116.5, 351]) {
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.value = f;
+      osc.connect(lp);
+      osc.start(t);
+      osc.stop(t + 1.2);
+    }
   }
 
   /** The sacred post DOINK (§7.3). */
