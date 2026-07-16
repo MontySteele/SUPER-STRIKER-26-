@@ -97,6 +97,8 @@ export class Commentary {
     const team = (idx: number): string => m.teams[idx].data.name;
     switch (e.type) {
       case 'kickoff':
+        // post-goal restarts re-emit kickoff — don't re-announce the match
+        if (m.clock >= 1) break;
         if (e.half === 1) {
           this.say(m.mode === 'golden'
             ? `${team(0)} against ${team(1)} — golden goal, next one wins it, here we go!`

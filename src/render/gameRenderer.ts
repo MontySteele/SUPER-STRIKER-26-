@@ -140,9 +140,11 @@ export class GameRenderer {
   onEvent(e: MatchEvent): void {
     if (e.type === 'goal') {
       this.goalSeqT = 0;
-      // celebration subject: the scorer's mesh
-      const scorer = this.match.allPlayers.find(
-        (p) => p.data.name === e.scorerName && p.teamIdx === e.teamIdx,
+      // celebration subject: the scorer's mesh — matched by shirt number,
+      // since display names can be duplicated (roster editor, factory dupe)
+      const scorer = e.ownGoal ? undefined : this.match.allPlayers.find(
+        (p) => p.teamIdx === e.teamIdx
+          && (e.scorerNum !== undefined ? p.data.num === e.scorerNum : p.data.name === e.scorerName),
       );
       // own goals name a player on the other team — fall back to the ball
       if (scorer) this.cam.subject.set(scorer.pos.x, 0, scorer.pos.y);
@@ -172,6 +174,7 @@ export class GameRenderer {
     this.passIdx = i;
     const p = this.passes[i];
     this.replayIdx = Math.floor(this.passFrames.length * p.from);
+    this.clearTrail(); // the angle cut rewinds time — no stale streak
     this.cam.setMode(p.mode);
     this.onReplayStateChange?.(true, i === 0 ? 'REPLAY' : `REPLAY · ANGLE ${i + 1}`);
   }
@@ -333,7 +336,8 @@ export class GameRenderer {
       this.pushTrail(ballX, ballY, ballZ);
       f.players.forEach((s, i) => {
         const [anim, animT] = f.anims[i];
-        this.playerMeshes[i].update(dtReal, s.x, s.y, 0, s.facing, s.speed, anim, animT);
+        // slow the run cycles with the footage or slow-mo players foot-skate
+        this.playerMeshes[i].update(dtReal * pass.rate, s.x, s.y, 0, s.facing, s.speed, anim, animT);
       });
       if (this.replayIdx >= this.passFrames.length - 1) {
         if (this.passIdx < this.passes.length - 1) {
@@ -374,11 +378,14 @@ export class GameRenderer {
       if (this.trailPts.length) this.clearTrail();
     }
 
-    // switch indicators hover over each seat's controlled player
+    // switch indicators hover over each seat's controlled player (live play
+    // only — a cone bobbing through the penalty cinematic reads as a glitch)
+    const inAction = this.match.phase === 'play' || this.match.phase === 'restart'
+      || this.match.phase === 'kickoff';
     for (let i = 0; i < 2; i++) {
       const ctrl = this.match.controlled[i];
       const arrow = this.switchArrows[i];
-      if (ctrl && this.match.seats[i] && !replaying && !ctrl.sentOff) {
+      if (ctrl && this.match.seats[i] && !replaying && inAction && !ctrl.sentOff) {
         arrow.visible = true;
         const bob = Math.sin(performance.now() * 0.006 + i * 2) * 0.08;
         arrow.position.set(ctrl.pos.x, 2.35 + bob, ctrl.pos.y);
@@ -403,7 +410,9 @@ export class GameRenderer {
       this.cam.setMode('broadcast');
     }
 
-    // confetti physics
+    // confetti physics (hidden while a replay rewinds time — celebration
+    // confetti raining through the pre-goal build-up is anachronistic)
+    if (this.confetti) this.confetti.visible = !replaying;
     if (this.confetti && this.confettiVel) {
       this.confettiT += dtReal;
       const posAttr = this.confetti.geometry.getAttribute('position') as THREE.BufferAttribute;

@@ -21,6 +21,10 @@ const STAGE_LABEL: Record<string, string> = {
 export class TournamentUI {
   private root: HTMLElement;
   private keyHandler: (e: KeyboardEvent) => void;
+  /** No confirms until the hub has been visible a beat — a double-tapped or
+   *  held J from the previous screen must not sim rounds (or skip the
+   *  champion screen and delete the save) before the player can even look. */
+  private graceUntil = 0;
 
   constructor(
     private tournament: Tournament,
@@ -28,7 +32,9 @@ export class TournamentUI {
     private onExit: () => void,
   ) {
     this.root = document.getElementById('ui-root')!;
+    this.graceUntil = performance.now() + 600;
     this.keyHandler = (e) => {
+      if (e.repeat || performance.now() < this.graceUntil) return;
       if (e.code === 'KeyJ' || e.code === 'Enter') this.primary();
       if (e.code === 'KeyK' || e.code === 'Escape') { this.destroy(); this.onExit(); }
     };
@@ -50,6 +56,7 @@ export class TournamentUI {
   }
 
   render(): void {
+    this.graceUntil = performance.now() + 600; // fresh screen, fresh grace
     const t = this.tournament;
     const stage = t.state.stage;
     if (stage === 'done') { this.renderChampion(); return; }

@@ -20,6 +20,20 @@ export class KeeperBrain {
 
   constructor(public team: Team, public keeper: PlayerEntity) {}
 
+  /** True while the keeper has the ball in his hands (possession is frozen). */
+  holding(): boolean {
+    return this.state === 'hold';
+  }
+
+  /** Hard reset at kickoffs: stale 'hold' teleported the ball 44m into the
+   *  keeper's gloves, and stale 'react' threw phantom dives at kickoff passes. */
+  reset(): void {
+    this.state = 'position';
+    this.timer = 0;
+    this.reactAt = -1;
+    this.holdTimer = 0;
+  }
+
   private goalX(): number {
     return -HALF_L * this.team.attackDir;
   }
@@ -47,12 +61,18 @@ export class KeeperBrain {
       this.holdTimer = 0.8;
       ball.owner = null;
       ball.vel = { x: 0, y: 0, z: 0 };
+      k.facing = this.team.attackDir > 0 ? 0 : Math.PI; // face upfield, never the net
     }
 
     switch (this.state) {
       case 'hold': {
+        // a phase change can move the ball out from under a frozen hold
+        if (dist2(k.pos, { x: ball.pos.x, y: ball.pos.y }) > 3) {
+          this.state = 'position';
+          return;
+        }
         this.holdTimer -= dt;
-        ball.pos.x = k.pos.x + Math.cos(k.facing) * 0.5;
+        ball.pos.x = clamp(k.pos.x + Math.cos(k.facing) * 0.5, -HALF_L + 0.3, HALF_L - 0.3);
         ball.pos.y = k.pos.y + Math.sin(k.facing) * 0.5;
         ball.pos.z = 0.9;
         ball.vel = { x: 0, y: 0, z: 0 };
@@ -85,12 +105,18 @@ export class KeeperBrain {
 
       case 'recover': {
         k.stop();
+        // the hands stay live while a shot is in flight — a micro-dive that
+        // decayed instantly must not leave the keeper a ghost the ball
+        // passes through (shots straight at him were automatic goals)
+        if (match.activeShot) this.tryHands(match, 1.0);
         if (this.timer > 0.7) this.state = 'position';
         return;
       }
 
       case 'react': {
-        // track the shot; commit to the dive once reaction time elapses
+        // track the shot; commit to the dive once reaction time elapses —
+        // but hands are live the whole time for balls already on top of him
+        this.tryHands(match, 0.95);
         if (match.simTime >= this.reactAt) {
           this.commitDive(match);
         }
@@ -207,6 +233,13 @@ export class KeeperBrain {
 
   private startDive(match: Match, dy: number, arriveIn: number): void {
     const k = this.keeper;
+    if (Math.abs(dy) < 0.4) {
+      // straight at him: stand tall and catch, don't flop into a zero-length
+      // dive that instantly decays into a blind recover
+      this.state = 'set';
+      this.tryHands(match, 1.0);
+      return;
+    }
     k.diving = true;
     k.diveVel = v2(0, dy / Math.max(arriveIn, 0.15));
     // cap dive velocity to something human
@@ -241,7 +274,7 @@ export class KeeperBrain {
       ball.owner = null;
       ball.noControlTimer = 0.3;
       ball.noControlPlayer = k;
-      match.events.emit({ type: 'save', keeperName: k.data.name, teamIdx: this.team.idx });
+      match.events.emit({ type: 'save', keeperName: k.data.name, teamIdx: this.team.idx, keeperNum: k.data.num });
       match.shotResolved('save');
     }
   }
@@ -252,8 +285,12 @@ export class KeeperBrain {
     ball.vel = { x: 0, y: 0, z: 0 };
     this.state = 'hold';
     this.holdTimer = 1.4;
+    this.keeper.facing = this.team.attackDir > 0 ? 0 : Math.PI; // never toward the net
     this.keeper.playAnim('collect', 0.5);
-    match.events.emit({ type: 'save', keeperName: this.keeper.data.name, teamIdx: this.team.idx });
+    match.events.emit({
+      type: 'save', keeperName: this.keeper.data.name, teamIdx: this.team.idx,
+      keeperNum: this.keeper.data.num,
+    });
     match.shotResolved('save');
   }
 }

@@ -73,6 +73,39 @@ let replayWatch = false; // user-triggered replay: sim frozen while it plays
 let lastPhase = '';
 let cardGraceUntil = 0;
 
+// ------------------------------------------------------------ WebGL safety
+// GPU resets are real (driver hiccups, sleep/wake, iGPU pressure). Without
+// these guards a lost context was either an invisible zombie match or an
+// uncaught TypeError and a permanently black page.
+let glLost = false;
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault(); // let the browser attempt a restore
+  glLost = true;
+  if (match && !paused) {
+    paused = true;
+    hudUI?.showPauseCard();
+    hub.clearAll(); // a stale buffered press must not instantly resume
+  }
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  glLost = false;
+});
+
+/** Last-resort plain-DOM message when the renderer can't exist at all. */
+function showFatal(html: string): void {
+  const root = document.getElementById('ui-root');
+  if (!root) return;
+  root.innerHTML = `
+    <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      background:#06090d;color:#e8ecf4;font-family:inherit;text-align:center;pointer-events:auto">
+      <div style="max-width:520px;padding:32px">
+        <div style="font-size:30px;font-weight:900;font-style:italic;letter-spacing:0.08em;margin-bottom:14px">
+          SUPER STRIKER '26</div>
+        <div style="font-size:15px;line-height:1.6;color:#9aa3b5">${html}</div>
+      </div>
+    </div>`;
+}
+
 function stopLoop(): void {
   cancelAnimationFrame(rafId);
   match = null;
@@ -82,6 +115,8 @@ function stopLoop(): void {
   hudUI = null;
   paused = false;
   replayWatch = false;
+  // don't pin the disposed renderer/scene in memory while idling in menus
+  (window as unknown as Record<string, unknown>).__ss26 = null;
 }
 
 // ---------------------------------------------------------------- menus
@@ -92,8 +127,9 @@ function showMenu(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
-  if (!attractMatch) startAttract(); // editor exit: don't restart the show
+  // menu first: it must exist even when the attract renderer can't
   new Menu(handleMenuResult, () => hub.connectedPads().length);
+  if (!attractMatch) startAttract(); // editor exit: don't restart the show
 }
 
 function handleMenuResult(r: MenuResult): void {
@@ -102,8 +138,9 @@ function handleMenuResult(r: MenuResult): void {
     case 'versus':
     case 'shootout':
     case 'golden': {
-      // golden goal is a party mode: 2P when a pad is plugged in, else vs CPU
-      const twoP = r.kind === 'versus' || (r.kind === 'golden' && hub.connectedPads().length > 0);
+      // golden goal 2P is opt-in via its PLAYERS setting — auto-seating any
+      // plugged-in pad left the away team frozen when nobody was holding it
+      const twoP = r.kind === 'versus' || (r.kind === 'golden' && r.golden2p === true);
       const seats = makeSeats(twoP);
       startMatch({
         home: r.home, away: r.away, seats,
@@ -210,27 +247,35 @@ let attractAcc = 0;
 
 function startAttract(): void {
   stopAttract();
-  const pool = TEAMS.filter((t) => t.tier >= 3);
-  const home = pool[Math.floor(Math.random() * pool.length)];
-  let away = home;
-  while (away.id === home.id) away = pool[Math.floor(Math.random() * pool.length)];
-  attractMatch = new Match({
-    home, away, seats: [null, null],
-    halfLengthSec: 90, difficulty: 'pro', knockout: false, mode: 'match',
-    seed: (Math.random() * 0xffffffff) >>> 0,
-  });
-  attractRenderer = new GameRenderer(canvas, attractMatch,
-    Math.random() < 0.5 ? 'night' : 'sunset', Math.random() < 0.5 ? 'national' : 'mega');
-  // the renderer needs the events or attract goals are 12s of statues —
-  // wired, they get the full celebration + two-angle replay show
-  const m = attractMatch, r = attractRenderer;
-  m.events.on((e) => r.onEvent(e));
-  attractLast = performance.now();
-  attractAcc = 0;
-  attractRaf = requestAnimationFrame(attractLoop);
-  (window as unknown as Record<string, unknown>).__ss26Attract = {
-    match: attractMatch, renderer: attractRenderer,
-  };
+  if (glLost) return; // no renderer while the context is down
+  try {
+    const pool = TEAMS.filter((t) => t.tier >= 3);
+    const home = pool[Math.floor(Math.random() * pool.length)];
+    let away = home;
+    while (away.id === home.id) away = pool[Math.floor(Math.random() * pool.length)];
+    attractMatch = new Match({
+      home, away, seats: [null, null],
+      halfLengthSec: 90, difficulty: 'pro', knockout: false, mode: 'match',
+      seed: (Math.random() * 0xffffffff) >>> 0,
+    });
+    attractRenderer = new GameRenderer(canvas, attractMatch,
+      Math.random() < 0.5 ? 'night' : 'sunset', Math.random() < 0.5 ? 'national' : 'mega');
+    // the renderer needs the events or attract goals are 12s of statues —
+    // wired, they get the full celebration + two-angle replay show
+    const m = attractMatch, r = attractRenderer;
+    m.events.on((e) => r.onEvent(e));
+    attractLast = performance.now();
+    attractAcc = 0;
+    attractRaf = requestAnimationFrame(attractLoop);
+    (window as unknown as Record<string, unknown>).__ss26Attract = {
+      match: attractMatch, renderer: attractRenderer,
+    };
+  } catch (err) {
+    // menus work fine without the show — never let the attract match take
+    // the whole game down with it
+    console.error('attract mode unavailable:', err);
+    stopAttract();
+  }
 }
 
 function stopAttract(): void {
@@ -305,7 +350,15 @@ function startMatch(config: MatchConfig): void {
     seed: (Math.random() * 0xffffffff) >>> 0,
   });
 
-  renderer = new GameRenderer(canvas, match, config.timeOfDay, config.stadium);
+  try {
+    renderer = new GameRenderer(canvas, match, config.timeOfDay, config.stadium);
+  } catch (err) {
+    console.error('renderer construction failed:', err);
+    match = null;
+    showFatal(`The graphics context was lost (or WebGL2 is unavailable).<br>
+      Enable hardware acceleration and reload the page (F5).`);
+    return;
+  }
   hudUI = new HUD(match);
   hudUI.fulltimeHint = config.onDone ? 'PRESS J TO CONTINUE' : null;
   audio.setCrowd(true);
@@ -375,6 +428,9 @@ function loop(now: number): void {
     if (now >= cardGraceUntil && hub.anyPress(['pass'])) {
       hudUI.hideCard();
       hudUI.playWipe();
+      // drop anything else buffered during the card — a stale Esc press
+      // otherwise pauses the game the moment the next period kicks off
+      hub.clearAll();
       match.continueFromBreak();
     }
   } else if (match.phase === 'fulltime') {
@@ -451,10 +507,21 @@ function loop(now: number): void {
   }
 
   const alpha = Math.min(accumulator / SIM_DT, 1);
-  renderer.update(frameDt, alpha);
+  // dt 0 while paused: the goal-sequence replay and letterbox must not play
+  // out underneath the PAUSED card
+  renderer.update(paused ? 0 : frameDt, alpha);
   hudUI.update(frameDt, (x, y, z) => renderer!.screenPos(x, y, z));
   audio.update(frameDt);
 }
 
-applyRosterOverrides();
-showMenu();
+try {
+  applyRosterOverrides();
+  showMenu();
+} catch (err) {
+  // no WebGL2 (hardware acceleration off, blocklisted GPU, remote desktop):
+  // without this catch the page is a silent black rectangle
+  console.error('boot failed:', err);
+  showFatal(`This game needs <b>WebGL2</b>.<br>
+    Enable hardware acceleration in your browser settings (or try another
+    browser), then reload the page.`);
+}

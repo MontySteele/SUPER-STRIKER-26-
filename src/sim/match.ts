@@ -56,6 +56,8 @@ interface RestartInfo {
 interface ActiveShot {
   shooter: PlayerEntity;
   time: number;
+  /** the pre-shot prediction; corrected retroactively on goal/save */
+  onTarget: boolean;
 }
 
 export interface MatchOptions {
@@ -105,7 +107,8 @@ export class Match {
   private cpuDecisionTimers = [0, 0];
   /** Seconds of possession without reaching the final third (per team). */
   buildupTime = [0, 0];
-  private activeShot: ActiveShot | null = null;
+  /** in-flight shot, if any — keepers keep their hands live while one exists */
+  activeShot: ActiveShot | null = null;
   private shotCharging = [false, false];
   private buildupTimer = 0;
   private prevBallPos: V2 = v2();
@@ -155,7 +158,11 @@ export class Match {
     const spans = [45, 45, 45, 15, 15];
     const base = bases[this.half] ?? 0;
     const span = spans[this.half] ?? 45;
-    return Math.min(base + Math.floor((this.clock / this.halfLenFor(this.half)) * span), base + span);
+    const raw = base + Math.floor((this.clock / this.halfLenFor(this.half)) * span);
+    // golden goal has no period end — let the minute run on instead of
+    // pinning at 45' for the rest of the match
+    if (this.mode === 'golden') return raw;
+    return Math.min(raw, base + span);
   }
 
   secondLastDefenderX(teamIdx: number): number {
@@ -175,6 +182,10 @@ export class Match {
     this.ball.reset(0, 0);
     this.offside.clear();
     this.activeShot = null;
+    // stale brains teleported the ball into a 'hold' from the previous period
+    // and threw phantom dives at kickoff passes
+    this.keepers[0].reset();
+    this.keepers[1].reset();
     this.teams[0].lineUp(kickingTeam === 0);
     this.teams[1].lineUp(kickingTeam === 1);
     for (let i = 0; i < 2; i++) {
@@ -258,6 +269,10 @@ export class Match {
     const prevZ = this.ball.pos.z;
 
     this.updatePossession(dt);
+    // an offside whistle mid-possession begins a restart; running the rest of
+    // the tick against the freshly-spotted ball converted goalmouth offsides
+    // into awarded GOALS (checkGoalAndBounds saw the reset as a plane crossing)
+    if (this.phase !== 'play') return;
     this.updateHumanControl(dt);
     this.updateAI(dt);
     for (const p of this.allPlayers) p.update(dt);
@@ -355,6 +370,10 @@ export class Match {
       if (nt <= 0) this.tackleCooldowns.delete(p); else this.tackleCooldowns.set(p, nt);
     }
 
+    // a keeper holding the ball in his hands is out of the possession game:
+    // no foot-captures of his own held ball, no opponents nibbling it away
+    if (this.keepers[0].holding() || this.keepers[1].holding()) return;
+
     if (ball.owner) {
       // tackle contests: nearby opponents nibble at the ball
       const carrier = ball.owner;
@@ -445,8 +464,9 @@ export class Match {
     }
     this.cpuDecisionTimers[best.teamIdx] = CPU_DECISION_TICK * 0.5;
     if (this.activeShot && best.teamIdx !== this.activeShot.shooter.teamIdx) this.activeShot = null;
-    // auto-switch: humans always control the teammate on the ball
-    if (this.seats[best.teamIdx]) {
+    // auto-switch: humans always control the teammate on the ball — except
+    // the keeper (steering a holding GK dragged held balls into own nets)
+    if (this.seats[best.teamIdx] && !best.isGK) {
       this.controlled[best.teamIdx] = best;
       this.shotCharging[best.teamIdx] = false;
     }
@@ -546,6 +566,11 @@ export class Match {
       if (seat.isHeld('shoot')) this.shotCharging[teamIdx] = true;
       const rel = seat.consumeRelease('shoot');
       const held = seat.heldDuration('shoot');
+      if (this.shotCharging[teamIdx] && !rel && !seat.isHeld('shoot')) {
+        // the release edge was destroyed (pause/replay/alt-tab mid-charge) —
+        // cancel the charge instead of latching every button dead forever
+        this.shotCharging[teamIdx] = false;
+      }
       if (rel || (this.shotCharging[teamIdx] && held >= SHOT_MAX_HOLD)) {
         const heldFor = rel ? rel.heldFor : SHOT_MAX_HOLD;
         this.shotCharging[teamIdx] = false;
@@ -804,13 +829,18 @@ export class Match {
   // ---------------------------------------------------------------- referee
 
   registerShot(shooter: PlayerEntity, speed: number, onTarget: boolean): void {
-    this.activeShot = { shooter, time: this.simTime };
+    this.activeShot = { shooter, time: this.simTime, onTarget };
     if (onTarget) this.teams[shooter.teamIdx].shotsOnTarget++;
     const defendingTeam = 1 - shooter.teamIdx;
     this.keepers[defendingTeam].onShot(this);
   }
 
   shotResolved(kind: 'save' | 'goal' | 'out'): void {
+    // the pre-shot prediction ignores drag/curl — correct it from the outcome
+    // so the stat cards never show more goals (or saves) than shots on target
+    if (kind === 'save' && this.activeShot && !this.activeShot.onTarget) {
+      this.teams[this.activeShot.shooter.teamIdx].shotsOnTarget++;
+    }
     this.activeShot = null;
   }
 
@@ -818,6 +848,8 @@ export class Match {
     const ball = this.ball;
     const prev = this.prevBallPos;
     const cur = ball.pos;
+    // a ball held in a keeper's hands can't score or go out
+    if (this.keepers[0].holding() || this.keepers[1].holding()) return;
 
     for (const side of [1, -1]) {
       const planeX = HALF_L * side;
@@ -884,6 +916,16 @@ export class Match {
     // never a random opposition player who didn't touch it
     const scorer = !ownGoal && lt ? lt
       : this.nearestOutfield(team, { x: HALF_L * side, y: 0 });
+    // stat-card sanity: a goal IS a shot on target, whatever the pre-shot
+    // prediction said (and a dribbled/crossed-in goal counts as a shot too)
+    if (!ownGoal) {
+      if (this.activeShot && this.activeShot.shooter.teamIdx === scoringTeam) {
+        if (!this.activeShot.onTarget) team.shotsOnTarget++;
+      } else {
+        team.shots++;
+        team.shotsOnTarget++;
+      }
+    }
     this.activeShot = null;
     this.lastGoalTeamIdx = scoringTeam;
     this.phase = 'goalseq';
@@ -892,9 +934,11 @@ export class Match {
     scorer.playAnim('celebrate', 2.5);
     this.keepers[1 - scoringTeam].keeper.playAnim('dejected', 2.5);
     const scorerName = ownGoal ? lt!.data.name : scorer.data.name;
+    const scorerNum = ownGoal ? lt!.data.num : scorer.data.num;
     this.goalLog.push({ teamIdx: scoringTeam, scorerName, ownGoal, minute: this.displayMinute() });
     this.events.emit({
-      type: 'goal', teamIdx: scoringTeam, scorerName, ownGoal,
+      type: 'goal', teamIdx: scoringTeam, scorerName, ownGoal, scorerNum,
+      scorerTeamIdx: ownGoal ? lt!.teamIdx : scorer.teamIdx,
       minute: this.displayMinute(),
     });
   }
@@ -931,6 +975,13 @@ export class Match {
   // ---------------------------------------------------------------- restarts
 
   beginRestart(kind: RestartKind, teamIdx: number, pos: V2): void {
+    // fouls/offsides can be spotted where a BODY was — which may be out of
+    // bounds; an out-of-bounds free kick was instantly whistled a throw-in
+    // to the fouling team
+    pos = v2(
+      clamp(pos.x, -HALF_L + 0.5, HALF_L - 0.5),
+      clamp(pos.y, -HALF_W + 0.5, HALF_W - 0.5),
+    );
     const team = this.teams[teamIdx];
     const taker = kind === 'goalKick'
       ? team.keeper

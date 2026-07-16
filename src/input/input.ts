@@ -42,9 +42,14 @@ class DeviceState {
   }
 
   clear(): void {
+    const now = performance.now();
     for (const a of ACTIONS) {
-      this.actions[a].pressedAt = -1;
-      this.actions[a].releasedAt = -1;
+      const s = this.actions[a];
+      s.pressedAt = -1;
+      s.releasedAt = -1;
+      // rebase hold time: wall-clock charge must not keep counting across a
+      // pause/replay freeze and fire a max-power shot on resume
+      if (s.held) s.heldSince = now;
     }
   }
 

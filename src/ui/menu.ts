@@ -22,6 +22,8 @@ export type MenuResult =
       home: TeamData; away: TeamData;
       halfLengthSec: number; difficulty: DifficultyName;
       timeOfDay: TimeOfDay; stadium: StadiumSize;
+      /** golden goal only: 2P couch play is opt-in via the PLAYERS setting */
+      golden2p?: boolean;
     }
   | { kind: 'tournament-new'; teamId: string; difficulty: DifficultyName; halfLengthSec: number }
   | { kind: 'tournament-continue' }
@@ -47,6 +49,9 @@ export class Menu {
   private diffIdx = 1;
   private todIdx = 0;
   private stadiumIdx = 0;
+  private golden2p = false;
+  /** START TOURNAMENT over an existing save asks for a second press. */
+  private overwriteArmed = false;
   private keyHandler: (e: KeyboardEvent) => void;
   private padHandler: () => void;
   private hasSave: boolean;
@@ -99,6 +104,8 @@ export class Menu {
   }
 
   private onKey(e: KeyboardEvent): void {
+    // OS auto-repeat must not chain-confirm through five screens into a match
+    if (e.repeat) return;
     const code = e.code;
     if (this.screen === 'title') {
       this.screen = 'mode';
@@ -143,6 +150,7 @@ export class Menu {
 
     if (this.screen === 'settings') {
       const rows = this.settingsRows().length + 1; // + GO row
+      if (up || down || back) this.overwriteArmed = false;
       if (up) { this.focus = Math.max(0, this.focus - 1); this.render(); }
       else if (down) { this.focus = Math.min(rows - 1, this.focus + 1); this.render(); }
       else if (left || right) {
@@ -191,13 +199,19 @@ export class Menu {
       ];
     }
     if (this.mode === 'shootout' || this.mode === 'golden') {
-      return [
+      const rows: [string, string][] = [
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
         commentary,
         music,
       ];
+      if (this.mode === 'golden') {
+        rows.unshift(['PLAYERS', this.padCount() === 0
+          ? '1P VS CPU'
+          : this.golden2p ? '2P — KEYBOARD VS PAD' : '1P VS CPU']);
+      }
+      return rows;
     }
     return [
       ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
@@ -210,8 +224,10 @@ export class Menu {
   }
 
   private cycleSetting(row: number, d: number): void {
+    this.overwriteArmed = false;
     const labels = this.settingsRows().map((r) => r[0]);
     const key = labels[row];
+    if (key === 'PLAYERS' && this.padCount() > 0) this.golden2p = !this.golden2p;
     if (key === 'MATCH LENGTH') this.halfIdx = (this.halfIdx + d + HALF_OPTIONS.length) % HALF_OPTIONS.length;
     if (key === 'DIFFICULTY') this.diffIdx = (this.diffIdx + d + DIFF_OPTIONS.length) % DIFF_OPTIONS.length;
     if (key === 'KICK-OFF') this.todIdx = (this.todIdx + d + TOD_OPTIONS.length) % TOD_OPTIONS.length;
@@ -254,6 +270,12 @@ export class Menu {
   private launch(): void {
     if (this.mode === 'tournament') {
       if (!this.home) return;
+      // an evening-long saved run must not vanish on one accidental press
+      if (Tournament.load() !== null && !this.overwriteArmed) {
+        this.overwriteArmed = true;
+        this.render();
+        return;
+      }
       Tournament.clear();
       this.finish({
         kind: 'tournament-new',
@@ -272,6 +294,7 @@ export class Menu {
       difficulty: DIFF_OPTIONS[this.diffIdx],
       timeOfDay: TOD_OPTIONS[this.todIdx],
       stadium: STADIUM_OPTIONS[this.stadiumIdx][1],
+      golden2p: this.mode === 'golden' ? this.golden2p && this.padCount() > 0 : undefined,
     });
   }
 
@@ -368,7 +391,8 @@ export class Menu {
 
   private renderSettings(): void {
     const rows = this.settingsRows();
-    const goLabel = this.mode === 'tournament' ? 'START TOURNAMENT'
+    const goLabel = this.mode === 'tournament'
+      ? (this.overwriteArmed ? '⚠ OVERWRITES YOUR SAVED RUN — PRESS AGAIN' : 'START TOURNAMENT')
       : this.mode === 'shootout' ? 'TO THE SPOT!'
       : this.mode === 'golden' ? 'NEXT GOAL WINS!' : 'KICK OFF!';
     const rowsHtml = rows.map(([k, v], i) =>

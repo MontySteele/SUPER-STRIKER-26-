@@ -32,6 +32,9 @@ export class PenaltyController {
   aimX = 0;
   aimPower = 0;
   charging = false;
+  /** power hold time accumulated DURING the aim phase only — a shoot button
+   *  still held from before the whistle must not fire an instant max shot */
+  chargeT = 0;
   private cpuAimTarget = 0;
   private cpuStrikeAt = 0;
   private keeperGuess = 0; // -1 | 0 | 1 (pitch-y sign)
@@ -80,6 +83,7 @@ export class PenaltyController {
     this.aimX = 0;
     this.aimPower = 0;
     this.charging = false;
+    this.chargeT = 0;
     this.resolveResult = null;
     this.keeperTouched = false;
     this.keeperGuess = 0;
@@ -148,11 +152,13 @@ export class PenaltyController {
           // hold shoot for power, release to strike
           const stick = seat.getStick();
           this.aimX = clamp(this.aimX + stick.x * this.goalSide * dt * 2.4, -1, 1);
-          if (seat.isHeld('shoot')) this.charging = true;
+          if (seat.isHeld('shoot')) {
+            this.charging = true;
+            this.chargeT += dt; // only aim-phase hold time counts toward power
+          }
           const rel = seat.consumeRelease('shoot');
-          const held = seat.heldDuration('shoot');
-          if (rel || (this.charging && held > 0.9)) {
-            this.aimPower = clamp((rel ? rel.heldFor : 0.9) / 0.9, 0.25, 1);
+          if (rel || (this.charging && (!seat.isHeld('shoot') || this.chargeT > 0.9))) {
+            this.aimPower = clamp(this.chargeT / 0.9, 0.25, 1);
             this.strike();
           } else if (this.timer > 9) {
             // dawdling: the ref makes you take it
@@ -177,6 +183,7 @@ export class PenaltyController {
         m.ball.update(dt);
         this.containBall();
         this.keeper.update(dt);
+        this.taker.update(dt); // follow-through — don't freeze mid wind-up
         this.checkKeeperHands();
         const b = m.ball.pos;
         const pastLine = (b.x - gx) * this.goalSide > 0.1;

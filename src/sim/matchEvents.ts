@@ -4,9 +4,12 @@ import type { PenResult } from './penalty';
 
 export type MatchEvent =
   | { type: 'kickoff'; half: number }
-  | { type: 'goal'; teamIdx: number; scorerName: string; ownGoal?: boolean; minute: number }
+  // scorerNum/scorerTeamIdx identify the credited player uniquely — display
+  // names can be duplicated (roster editor, and one factory cross-team dupe)
+  | { type: 'goal'; teamIdx: number; scorerName: string; ownGoal?: boolean; minute: number;
+      scorerNum?: number; scorerTeamIdx?: number }
   | { type: 'shot'; teamIdx: number; onTarget: boolean; shooterName: string }
-  | { type: 'save'; keeperName: string; teamIdx: number }
+  | { type: 'save'; keeperName: string; teamIdx: number; keeperNum?: number }
   | { type: 'post' }
   | { type: 'miss'; teamIdx: number; shooterName: string; minute: number }
   | { type: 'throwIn'; teamIdx: number }

@@ -173,7 +173,7 @@ export class HUD {
           minute: e.minute, teamIdx: e.teamIdx,
           icon: e.ownGoal ? 'og' : 'goal', name: e.scorerName,
         });
-        if (!e.ownGoal) this.creditMotm(e.teamIdx, e.scorerName, 3);
+        if (!e.ownGoal) this.creditMotm(e.teamIdx, e.scorerName, 3, e.scorerNum);
         break;
       }
       case 'miss':
@@ -181,7 +181,7 @@ export class HUD {
         break;
       case 'save':
         this.pushTicker(`WHAT A SAVE! ${e.keeperName} denies them!`);
-        this.creditMotm(e.teamIdx, e.keeperName, 1.5);
+        this.creditMotm(e.teamIdx, e.keeperName, 1.5, e.keeperNum);
         break;
       case 'post':
         this.pushTicker(`OFF THE WOODWORK! The frame says no.`);
@@ -226,6 +226,9 @@ export class HUD {
         this.pushTicker(`${teamName(e.winnerIdx)} WIN THE SHOOTOUT!`);
         break;
       case 'kickoff':
+        // every post-goal restart re-emits kickoff — only announce the period
+        // on its FIRST kickoff or the ticker repeats itself after every goal
+        if (m.clock >= 1) break;
         if (e.half === 1 && m.mode === 'golden') this.pushTicker(`GOLDEN GOAL — NEXT GOAL WINS IT ALL!`);
         if (e.half === 2) this.pushTicker(`Second half under way!`);
         if (e.half === 3) this.pushTicker(`Extra time — next 15 minutes decide it… maybe.`);
@@ -241,8 +244,9 @@ export class HUD {
     }
   }
 
-  private creditMotm(teamIdx: number, name: string, points: number): void {
-    const key = `${teamIdx}|${name}`;
+  private creditMotm(teamIdx: number, name: string, points: number, num?: number): void {
+    // key by shirt number when we have it — display names can be duplicated
+    const key = `${teamIdx}|${num ?? name}`;
     const cur = this.motm.get(key) ?? { teamIdx, name, score: 0 };
     cur.score += points;
     this.motm.set(key, cur);
@@ -267,8 +271,9 @@ export class HUD {
 
   private showCard(title: string): void {
     const [h, a] = this.match.teams;
-    const total = Math.max(h.possessionTicks + a.possessionTicks, 1);
-    const hp = Math.round((h.possessionTicks / total) * 100);
+    const total = h.possessionTicks + a.possessionTicks;
+    // no open play at all (shootout mode) reads 50/50, not 0%–100%
+    const hp = total ? Math.round((h.possessionTicks / total) * 100) : 50;
     const isFT = title === 'FULL-TIME';
     let hint = isFT
       ? (this.fulltimeHint ?? 'PRESS J FOR REMATCH · K FOR MENU')
@@ -317,7 +322,8 @@ export class HUD {
       const body = `${icon(s)} ${s.minute}' ${surname}${og}`;
       return `<div class="story-row ${s.teamIdx === 0 ? 'home' : 'away'}">${body}</div>`;
     }).join('');
-    return `<div class="story">${rows}</div>`;
+    // dense mode keeps long goal-fests fully visible on the card
+    return `<div class="story${this.story.length > 8 ? ' dense' : ''}">${rows}</div>`;
   }
 
   /** Re-show the full-time card (after an L-triggered goal replay). */
@@ -357,7 +363,7 @@ export class HUD {
       if (seat) {
         const pen = m.penalty;
         if (inPens && pen && pen.kickingTeam === i && pen.phase === 'aim' && pen.charging) {
-          frac = Math.min(seat.heldDuration('shoot') / 0.9, 1);
+          frac = Math.min(pen.chargeT / 0.9, 1); // aim-phase hold only
         } else if (!inPens && seat.isHeld('shoot') && m.ball.owner === m.controlled[i]) {
           frac = Math.min(seat.heldDuration('shoot') / SHOT_MAX_HOLD, 1);
         }
@@ -457,5 +463,8 @@ export class HUD {
 
   destroy(): void {
     this.root.innerHTML = '';
+    // quitting mid-replay left this stuck on the shared root: the next match
+    // played letterboxed with a blinking REPLAY bug and no nameplates
+    this.root.classList.remove('replay-on');
   }
 }

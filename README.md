@@ -84,7 +84,8 @@ man is a foul, from behind is a card.
   are attributed by position and star quality. Progress auto-saves to
   localStorage.
 - **Golden Goal** — party mode: no clock, next goal wins, winner takes the
-  bragging rights. 2P when a gamepad is plugged in, otherwise you vs the CPU.
+  bragging rights. 1P vs CPU by default; with a gamepad connected, flip the
+  PLAYERS setting to 2P for keyboard-vs-pad couch play.
 - **Penalty Shootout** — straight to the spot. Aim with the stick (the reticle
   fades at higher difficulty), hold shoot for power — full power risks blazing
   over. Human keeper picks a dive as they strike. Sudden death after 5.

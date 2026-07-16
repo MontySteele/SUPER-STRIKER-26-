@@ -58,7 +58,7 @@ export class SceneManager {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = timeOfDay === 'night' ? 1.15 : 1.05;
 
@@ -72,6 +72,9 @@ export class SceneManager {
     const sc = this.keyLight.shadow.camera;
     sc.left = -62; sc.right = 62; sc.top = 48; sc.bottom = -48;
     sc.near = 10; sc.far = 220;
+    // without this the frustum silently stays at the ±5m default and
+    // shadows only exist in a small patch around the centre spot
+    sc.updateProjectionMatrix();
     this.keyLight.shadow.mapSize.set(2048, 2048);
     this.keyLight.shadow.bias = -0.0012;
     this.scene.add(this.keyLight, this.keyLight.target);
@@ -114,7 +117,13 @@ export class SceneManager {
       }
     });
     this.scene.clear();
-    this.bloom.dispose();
+    // composer.dispose() only frees its internal targets — every added pass
+    // (and the shadow-map render target) must be freed by hand or ~32MB of
+    // GPU memory strands per match/attract cycle on the shared context
+    this.keyLight.shadow.dispose();
+    for (const pass of this.composer.passes) {
+      (pass as { dispose?: () => void }).dispose?.();
+    }
     this.composer.dispose();
     this.renderer.dispose();
   }
