@@ -81,7 +81,12 @@ let glLost = false;
 canvas.addEventListener('webglcontextlost', (e) => {
   e.preventDefault(); // let the browser attempt a restore
   glLost = true;
-  if (match && !paused) {
+  // only force-pause live phases — break/fulltime cards already hold the sim,
+  // and overwriting their card with PAUSED wedged the loop's branch order
+  const live = match && (match.phase === 'play' || match.phase === 'restart'
+    || match.phase === 'kickoff' || match.phase === 'goalseq'
+    || match.phase === 'penalty' || match.phase === 'shootout');
+  if (live && !paused) {
     paused = true;
     hudUI?.showPauseCard();
     hub.clearAll(); // a stale buffered press must not instantly resume
@@ -89,6 +94,9 @@ canvas.addEventListener('webglcontextlost', (e) => {
 });
 canvas.addEventListener('webglcontextrestored', () => {
   glLost = false;
+  // bring the show back: a loss that killed the attract match otherwise
+  // leaves the menus floating over a black canvas
+  if (inMenus && !attractMatch) startAttract();
 });
 
 /** Last-resort plain-DOM message when the renderer can't exist at all. */
@@ -350,6 +358,15 @@ function startMatch(config: MatchConfig): void {
     seed: (Math.random() * 0xffffffff) >>> 0,
   });
 
+  // never construct three.js on a lost context: the constructor throws AFTER
+  // registering canvas listeners, and each orphaned pair throws uncaught on
+  // the eventual restore
+  if (glLost) {
+    match = null;
+    showFatal(`The graphics context was lost (or WebGL2 is unavailable).<br>
+      Enable hardware acceleration and reload the page (F5).`);
+    return;
+  }
   try {
     renderer = new GameRenderer(canvas, match, config.timeOfDay, config.stadium);
   } catch (err) {

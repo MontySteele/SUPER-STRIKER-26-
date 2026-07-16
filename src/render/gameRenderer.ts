@@ -243,9 +243,12 @@ export class GameRenderer {
     const pos = this.trail.geometry.getAttribute('position') as THREE.BufferAttribute;
     const col = this.trail.geometry.getAttribute('color') as THREE.BufferAttribute;
     for (let i = 0; i < N; i++) {
+      const real = i < this.trailPts.length;
       const p = this.trailPts[Math.min(i, this.trailPts.length - 1)];
       pos.setXYZ(i, p[0], p[2] + 0.11, p[1]); // sim (x, ground-y, height-z) → scene (x, y, z)
-      const b = Math.pow(Math.min(1, (i + 1) / this.trailPts.length), 1.6) * 0.55; // dim toward the tail
+      // padding slots are invisible — head-bright padding stacked ~12x
+      // overbright at the start of every replay angle
+      const b = real ? Math.pow((i + 1) / this.trailPts.length, 1.6) * 0.55 : 0;
       col.setXYZ(i, b, b, b * 0.9);
     }
     pos.needsUpdate = true;
@@ -333,7 +336,9 @@ export class GameRenderer {
       const f = this.passFrames[Math.floor(this.replayIdx)];
       [ballX, ballY, ballZ] = f.ball;
       this.ballMesh.update(ballX, ballY, ballZ);
-      this.pushTrail(ballX, ballY, ballZ);
+      // paused frames (dt 0) must not stack identical points into one
+      // over-bright additive dot
+      if (dtReal > 0) this.pushTrail(ballX, ballY, ballZ);
       f.players.forEach((s, i) => {
         const [anim, animT] = f.anims[i];
         // slow the run cycles with the footage or slow-mo players foot-skate
