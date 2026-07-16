@@ -104,10 +104,9 @@ export class Menu {
   }
 
   private onKey(e: KeyboardEvent): void {
-    // OS auto-repeat must not chain-confirm through five screens into a match
-    if (e.repeat) return;
     const code = e.code;
     if (this.screen === 'title') {
+      if (e.repeat) return; // a held key must not chain from title into a match
       this.screen = 'mode';
       this.focus = 0;
       this.render();
@@ -115,6 +114,9 @@ export class Menu {
     }
     const confirm = code === 'KeyJ' || code === 'Enter' || code === 'Space';
     const back = code === 'KeyK' || code === 'Escape' || code === 'Backspace';
+    // auto-repeat may SCROLL (holding S races down the 48-team grid) but must
+    // never confirm/back — that's how a held J used to launch a match unasked
+    if (e.repeat && (confirm || back)) return;
     const up = code === 'KeyW' || code === 'ArrowUp';
     const down = code === 'KeyS' || code === 'ArrowDown';
     const left = code === 'KeyA' || code === 'ArrowLeft';

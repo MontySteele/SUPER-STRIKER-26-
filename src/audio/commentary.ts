@@ -128,7 +128,7 @@ export class Commentary {
         break;
       }
       case 'save':
-        if (Math.random() < 0.6) {
+        if (e.shotStop && Math.random() < 0.6) {
           this.say(pick([
             `What a save by ${last(e.keeperName)}!`,
             `Brilliant from ${last(e.keeperName)} — kept it out!`,

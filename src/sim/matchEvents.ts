@@ -9,7 +9,9 @@ export type MatchEvent =
   | { type: 'goal'; teamIdx: number; scorerName: string; ownGoal?: boolean; minute: number;
       scorerNum?: number; scorerTeamIdx?: number }
   | { type: 'shot'; teamIdx: number; onTarget: boolean; shooterName: string }
-  | { type: 'save'; keeperName: string; teamIdx: number; keeperNum?: number }
+  // shotStop distinguishes a real shot-stop from a routine loose-ball smother
+  // (both flow through the keeper's hands) — tickers/awards only want the real ones
+  | { type: 'save'; keeperName: string; teamIdx: number; keeperNum?: number; shotStop?: boolean }
   | { type: 'post' }
   | { type: 'miss'; teamIdx: number; shooterName: string; minute: number }
   | { type: 'throwIn'; teamIdx: number }

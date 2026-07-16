@@ -107,16 +107,19 @@ export class KeeperBrain {
         k.stop();
         // the hands stay live while a shot is in flight — a micro-dive that
         // decayed instantly must not leave the keeper a ghost the ball
-        // passes through (shots straight at him were automatic goals)
-        if (match.activeShot) this.tryHands(match, 1.0);
-        if (this.timer > 0.7) this.state = 'position';
+        // passes through (shots straight at him were automatic goals).
+        // 0.85: enough to smother dead-center, not enough to erase near-miss
+        // placement (1.0 dragged the match average under 2 goals)
+        if (match.activeShot) this.tryHands(match, 0.85);
+        // and don't go blind until that shot resolves, however long it takes
+        if (this.timer > 0.7 && !match.activeShot) this.state = 'position';
         return;
       }
 
       case 'react': {
         // track the shot; commit to the dive once reaction time elapses —
         // but hands are live the whole time for balls already on top of him
-        this.tryHands(match, 0.95);
+        this.tryHands(match, 0.8);
         if (match.simTime >= this.reactAt) {
           this.commitDive(match);
         }
@@ -234,9 +237,13 @@ export class KeeperBrain {
   private startDive(match: Match, dy: number, arriveIn: number): void {
     const k = this.keeper;
     if (Math.abs(dy) < 0.4) {
-      // straight at him: stand tall and catch, don't flop into a zero-length
-      // dive that instantly decays into a blind recover
-      this.state = 'set';
+      // straight at him: no sideways flop — hold ground in 'recover', whose
+      // hands stay live every tick while the shot is in flight. (A one-shot
+      // hands check here wedged him in 'set' with dead hands and made
+      // dead-center the optimal finish from range.)
+      this.state = 'recover';
+      this.timer = 0;
+      k.stop();
       this.tryHands(match, 1.0);
       return;
     }
@@ -255,6 +262,10 @@ export class KeeperBrain {
     const k = this.keeper;
     const ball = match.ball;
     if (ball.noControlPlayer === k) return;
+    // never rip a ball out of a player's active control — live react/recover
+    // hands plus a stale activeShot could vacuum a dribbling striker's ball
+    // and log a phantom 'save'
+    if (ball.owner) return;
     const d3 = Math.hypot(ball.pos.x - k.pos.x, ball.pos.y - k.pos.y, (ball.pos.z - 1.0) * 0.7);
     if (d3 > radius) return;
     const sp = ball.speed();
@@ -274,7 +285,10 @@ export class KeeperBrain {
       ball.owner = null;
       ball.noControlTimer = 0.3;
       ball.noControlPlayer = k;
-      match.events.emit({ type: 'save', keeperName: k.data.name, teamIdx: this.team.idx, keeperNum: k.data.num });
+      match.events.emit({
+        type: 'save', keeperName: k.data.name, teamIdx: this.team.idx,
+        keeperNum: k.data.num, shotStop: true, // a parry is always a shot-stop
+      });
       match.shotResolved('save');
     }
   }
@@ -290,6 +304,9 @@ export class KeeperBrain {
     match.events.emit({
       type: 'save', keeperName: this.keeper.data.name, teamIdx: this.team.idx,
       keeperNum: this.keeper.data.num,
+      // only a pickup with a live shot in flight is a real stop; the rest are
+      // routine collections that must not shout WHAT A SAVE or farm MOTM
+      shotStop: match.activeShot !== null,
     });
     match.shotResolved('save');
   }

@@ -180,8 +180,13 @@ export class HUD {
         this.pushTicker(`${e.minute}' — CLOSE! ${e.shooterName} drags it wide.`);
         break;
       case 'save':
-        this.pushTicker(`WHAT A SAVE! ${e.keeperName} denies them!`);
-        this.creditMotm(e.teamIdx, e.keeperName, 1.5, e.keeperNum);
+        // routine loose-ball collections also emit 'save' — only genuine
+        // shot-stops deserve the shout (or MOTM credit: uncapped smother
+        // farming handed the award to a keeper who conceded ten)
+        if (e.shotStop) {
+          this.pushTicker(`WHAT A SAVE! ${e.keeperName} denies them!`);
+          this.creditMotm(e.teamIdx, e.keeperName, 1.5, e.keeperNum);
+        }
         break;
       case 'post':
         this.pushTicker(`OFF THE WOODWORK! The frame says no.`);

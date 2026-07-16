@@ -157,9 +157,14 @@ export class PenaltyController {
             this.chargeT += dt; // only aim-phase hold time counts toward power
           }
           const rel = seat.consumeRelease('shoot');
-          if (rel || (this.charging && (!seat.isHeld('shoot') || this.chargeT > 0.9))) {
+          if (rel || (this.charging && this.chargeT > 0.9)) {
             this.aimPower = clamp(this.chargeT / 0.9, 0.25, 1);
             this.strike();
+          } else if (this.charging && !seat.isHeld('shoot')) {
+            // held state dropped with no release edge (blur / pad unplugged):
+            // cancel the charge — the kick must never take itself
+            this.charging = false;
+            this.chargeT = 0;
           } else if (this.timer > 9) {
             // dawdling: the ref makes you take it
             this.aimPower = 0.55;

@@ -511,7 +511,7 @@ function loop(now: number): void {
   // out underneath the PAUSED card
   renderer.update(paused ? 0 : frameDt, alpha);
   hudUI.update(frameDt, (x, y, z) => renderer!.screenPos(x, y, z));
-  audio.update(frameDt);
+  audio.update(paused ? 0 : frameDt); // no terrace claps over the PAUSED card
 }
 
 try {

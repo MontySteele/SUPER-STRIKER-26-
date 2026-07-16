@@ -124,7 +124,8 @@ export class AudioEngine {
     this.murmurGain.gain.setTargetAtTime(0.22 + target * 0.2, t, 0.6);
 
     // terrace claps: when the game is up, a section starts a rhythm
-    if (this.crowdOn) {
+    // (dt 0 = the game is frozen under a card — no clapping over silence)
+    if (this.crowdOn && dt > 0) {
       this.chantCooldown -= dt;
       if (this.chantCooldown <= 0 && target > 0.35) {
         this.chant();
