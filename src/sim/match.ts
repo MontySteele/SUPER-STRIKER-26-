@@ -101,6 +101,7 @@ export class Match {
 
   possessionTeam = 0;
   controlled: [PlayerEntity | null, PlayerEntity | null] = [null, null];
+  private lastAutoSwitch = [-99, -99];
   /** Every goal of the match, in order — feeds the tournament Golden Boot. */
   goalLog: { teamIdx: number; scorerName: string; ownGoal: boolean; minute: number }[] = [];
 
@@ -483,6 +484,7 @@ export class Match {
     const ownGoalX = -HALF_L * team.attackDir;
     let best: PlayerEntity | null = null;
     let bestScore = Infinity;
+    let curScore = Infinity;
     for (const p of team.players) {
       if (p.isGK || p.sentOff || p.diving) continue;
       const d = dist2(p.pos, { x: ball.x, y: ball.y });
@@ -490,10 +492,16 @@ export class Match {
       let score = d + (goalSide ? 0 : 9);
       // hysteresis: keep the current man unless someone is clearly better,
       // so control isn't yanked mid-run on every opposition pass
-      if (p === cur) score -= 4;
+      if (p === cur) { score -= 7; curScore = score; }
       if (score < bestScore) { bestScore = score; best = p; }
     }
-    if (best) this.controlled[teamIdx] = best;
+    if (!best || best === cur) return;
+    // rate limit: quick opposition passing shouldn't hop control around
+    // unless the new man is decisively better placed
+    if (this.simTime - this.lastAutoSwitch[teamIdx] < 0.7 && curScore - bestScore < 6) return;
+    this.controlled[teamIdx] = best;
+    this.lastAutoSwitch[teamIdx] = this.simTime;
+    this.events.emit({ type: 'switch', teamIdx });
   }
 
   /** Close control: the ball is repeatedly touched ahead, never glued (§6.1). */
@@ -611,7 +619,11 @@ export class Match {
       const score = d + (goalSide ? 0 : 9);
       if (score < bestScore) { bestScore = score; best = p; }
     }
-    if (best) this.controlled[teamIdx] = best;
+    if (best) {
+      this.controlled[teamIdx] = best;
+      this.lastAutoSwitch[teamIdx] = this.simTime;
+      this.events.emit({ type: 'switch', teamIdx });
+    }
   }
 
   // ---------------------------------------------------------------- tackles & fouls
@@ -821,7 +833,11 @@ export class Match {
     if (d < 1.4 || d > 3.6) return;
     const escaping = len2(carrier.vel) > 4.2;
     const inOwnHalfish = carrier.pos.x * -team.attackDir > -10;
-    if (escaping && inOwnHalfish && this.rng.next() < dt * 4) {
+    // carrier closing on our goal is a last-ditch situation even at a stroll
+    // (14m ≈ the box; 20m covered most of the attacking third and, stacked
+    // with the keeper smother, ground scoring down to 1.56 goals/match)
+    const dGoalOwn = Math.abs(carrier.pos.x - -HALF_L * team.attackDir);
+    if (((escaping && inOwnHalfish) || dGoalOwn < 14) && this.rng.next() < dt * 4) {
       this.trySlide(p);
     }
   }

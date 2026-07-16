@@ -9,9 +9,14 @@ import type { StadiumSize } from '../render/stadium';
 import { Tournament } from '../sim/tournament';
 import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
 import { MUSIC_KEY, musicSetting, type MusicSetting } from '../audio/music';
+import { CONTROLS_KEY, controlsSetting, type ControlsSetting } from './prefs';
 
 const MUSIC_OPTIONS: [MusicSetting, string][] = [
   ['all', 'ON'], ['menus', 'MENUS ONLY'], ['off', 'OFF'],
+];
+
+const CONTROLS_OPTIONS: [ControlsSetting, string][] = [
+  ['fade', 'FADE'], ['on', 'ALWAYS'], ['off', 'OFF'],
 ];
 
 export type GameMode = 'kickoff' | 'versus' | 'shootout' | 'golden';
@@ -192,12 +197,16 @@ export class Menu {
     const music: [string, string] = [
       'MUSIC', (MUSIC_OPTIONS.find(([v]) => v === musicSetting()) ?? MUSIC_OPTIONS[0])[1],
     ];
+    const controls: [string, string] = [
+      'CONTROLS HINT', (CONTROLS_OPTIONS.find(([v]) => v === controlsSetting()) ?? CONTROLS_OPTIONS[0])[1],
+    ];
     if (this.mode === 'tournament') {
       return [
         ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         commentary,
         music,
+        controls,
       ];
     }
     if (this.mode === 'shootout' || this.mode === 'golden') {
@@ -207,6 +216,7 @@ export class Menu {
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
         commentary,
         music,
+        controls,
       ];
       if (this.mode === 'golden') {
         rows.unshift(['PLAYERS', this.padCount() === 0
@@ -222,6 +232,7 @@ export class Menu {
       ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
       commentary,
       music,
+      controls,
     ];
   }
 
@@ -246,6 +257,13 @@ export class Menu {
         localStorage.setItem(MUSIC_KEY, next);
       } catch { /* private browsing: toggle just won't persist */ }
       window.dispatchEvent(new CustomEvent('ss26-music-change'));
+    }
+    if (key === 'CONTROLS HINT') {
+      const i = CONTROLS_OPTIONS.findIndex(([v]) => v === controlsSetting());
+      const next = CONTROLS_OPTIONS[(i + d + CONTROLS_OPTIONS.length) % CONTROLS_OPTIONS.length][0];
+      try {
+        localStorage.setItem(CONTROLS_KEY, next);
+      } catch { /* private browsing: toggle just won't persist */ }
     }
   }
 

@@ -59,7 +59,7 @@ export class AudioEngine {
     this.crowdBus.connect(this.duck);
 
     // --- murmur bed: brown noise through a low bandpass
-    this.murmurGain = this.makeCrowdLayer(320, 0.7, 0.28);
+    this.murmurGain = this.makeCrowdLayer(320, 0.7, 0.22);
     // --- anticipation layer: brighter, voice-band noise
     this.anticipationGain = this.makeCrowdLayer(850, 1.4, 0.0);
     this.crowdBus.gain.value = this.crowdOn ? 1 : 0;
@@ -121,7 +121,7 @@ export class AudioEngine {
     const target = Math.min(1, this.excitement * 0.7 + this.eruption);
     const t = this.ctx.currentTime;
     this.anticipationGain.gain.setTargetAtTime(target * 0.5, t, 0.4);
-    this.murmurGain.gain.setTargetAtTime(0.22 + target * 0.2, t, 0.6);
+    this.murmurGain.gain.setTargetAtTime(0.17 + target * 0.18, t, 0.6);
 
     // terrace claps: when the game is up, a section starts a rhythm
     // (dt 0 = the game is frozen under a card — no clapping over silence)
@@ -240,10 +240,28 @@ export class AudioEngine {
         this.roar(3, 1.0);
         this.whistleBlast(3, 0.18);
         break;
+      case 'switch':
+        this.switchBlip();
+        break;
       case 'possessionChange':
       default:
         break;
     }
+  }
+
+  /** Tiny UI blip so a controlled-player switch registers without looking. */
+  private switchBlip(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.08, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+    osc.connect(g).connect(this.master);
+    osc.start(t);
+    osc.stop(t + 0.05);
   }
 
   /** Quick anticipation swell (shot struck — crowd inhales). */

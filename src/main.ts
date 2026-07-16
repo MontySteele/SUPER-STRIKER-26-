@@ -3,6 +3,8 @@
 
 import './ui/ui.css';
 import { InputHub, type PlayerInput } from './input/input';
+import { RemoteInputHost } from './input/remote';
+import { drawQr } from './ui/qr';
 import { Match, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
@@ -26,8 +28,45 @@ const hub = new InputHub();
 const audio = new AudioEngine();
 const music = new MusicPlayer();
 const commentary = new Commentary();
+const remoteHost = new RemoteInputHost(hub);
 
 let inMenus = true;
+
+// ------------------------------------------------------- phone controller UI
+// Pairing panel lives outside #ui-root so menu re-renders leave it alone.
+// Only shown in menus, and only when the WS relay actually answers (dev /
+// preview server) — on static hosting the feature silently doesn't exist.
+const phonePanel = document.createElement('div');
+phonePanel.className = 'phone-panel';
+document.body.appendChild(phonePanel);
+const ppCanvas = document.createElement('canvas');
+const ppText = document.createElement('div');
+ppText.className = 'pp-text';
+phonePanel.append(ppCanvas, ppText);
+
+function refreshPhonePanel(): void {
+  const show = inMenus && remoteHost.status === 'ready';
+  phonePanel.style.display = show ? 'flex' : 'none';
+  if (!show) return;
+  const url = remoteHost.controllerUrl();
+  const n = remoteHost.connectedCount();
+  ppText.textContent = '';
+  const title = document.createElement('b');
+  title.textContent = 'PHONE CONTROLLER';
+  const urlEl = document.createElement('span');
+  urlEl.textContent = url;
+  const status = document.createElement('span');
+  status.textContent = n > 0 ? `CODE ${remoteHost.code} · ${n} CONNECTED` : `CODE ${remoteHost.code}`;
+  status.className = n > 0 ? 'pp-on' : '';
+  ppText.append(title, urlEl, status);
+  try {
+    drawQr(ppCanvas, url, 3);
+    ppCanvas.style.display = 'block';
+  } catch {
+    ppCanvas.style.display = 'none'; // URL too long for the mini encoder
+  }
+}
+remoteHost.onChange = refreshPhonePanel;
 
 /** Idempotent: start/stop/switch the right track for where we are. */
 function applyMusic(): void {
@@ -135,8 +174,9 @@ function showMenu(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
+  refreshPhonePanel();
   // menu first: it must exist even when the attract renderer can't
-  new Menu(handleMenuResult, () => hub.connectedPads().length);
+  new Menu(handleMenuResult, () => hub.connectedPads().length + hub.connectedRemotes().length);
   if (!attractMatch) startAttract(); // editor exit: don't restart the show
 }
 
@@ -147,7 +187,7 @@ function handleMenuResult(r: MenuResult): void {
     case 'shootout':
     case 'golden': {
       // golden goal 2P is opt-in via its PLAYERS setting — auto-seating any
-      // plugged-in pad left the away team frozen when nobody was holding it
+      // plugged-in pad/phone left the away team frozen when nobody was holding it
       const twoP = r.kind === 'versus' || (r.kind === 'golden' && r.golden2p === true);
       const seats = makeSeats(twoP);
       startMatch({
@@ -178,10 +218,16 @@ function handleMenuResult(r: MenuResult): void {
 }
 
 function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
+  // 1P: merged seat already unions keyboard + pads + phones
   if (!versus) return [hub.seat('merged'), null];
-  const pads = hub.connectedPads();
-  if (pads.length >= 2) return [hub.seat('pad', pads[0]), hub.seat('pad', pads[1])];
-  return [hub.seat('keyboard'), hub.seat('pad', pads[0] ?? 0)];
+  // 2P: pads first, then phones, keyboard fills the last empty seat
+  const devs: PlayerInput[] = [
+    ...hub.connectedPads().map((i) => hub.seat('pad', i)),
+    ...hub.connectedRemotes().map((i) => hub.seat('remote', i)),
+  ];
+  if (devs.length >= 2) return [devs[0], devs[1]];
+  if (devs.length === 1) return [hub.seat('keyboard'), devs[0]];
+  return [hub.seat('keyboard'), hub.seat('pad', 0)];
 }
 
 // ---------------------------------------------------------------- tournament
@@ -192,6 +238,7 @@ function showTournamentHub(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
+  refreshPhonePanel();
   if (!attractMatch) startAttract();
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
@@ -324,6 +371,7 @@ function rumbleFor(e: MatchEvent): void {
     case 'kick': hub.rumble(0, Math.min(0.1 + e.power * 0.35, 0.5), 60); break;
     case 'shot': hub.rumble(0.45, 0.3, 140); break;
     case 'tackle': hub.rumble(0.5, 0.2, 110); break;
+    case 'switch': hub.rumble(0, 0.2, 40); break;
     case 'post': hub.rumble(0.8, 0.4, 220); break;
     case 'goal': hub.rumble(1, 1, 550); break;
     case 'save': hub.rumble(0.4, 0.3, 130); break;
@@ -347,6 +395,7 @@ function startMatch(config: MatchConfig): void {
   inMenus = false;
   applyMusic(); // 'match' groove under the crowd, or silence if set to MENUS/OFF
 
+  refreshPhonePanel();
   match = new Match({
     home: config.home,
     away: config.away,

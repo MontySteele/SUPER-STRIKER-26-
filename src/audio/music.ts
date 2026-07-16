@@ -33,10 +33,10 @@ const TRACKS: Record<MusicTrack, TrackDef> = {
     stabChord: [220, 261.6, 329.6, 440],
     hatGain: 0.25,
   },
-  // D-minor driving groove: quieter, busier bass, sparser stabs — leaves
-  // room for the crowd and the commentary
+  // D-minor driving groove: busier bass, sparser stabs — leaves room for
+  // the crowd and the commentary
   match: {
-    bpm: 122, volume: 0.085,
+    bpm: 122, volume: 0.19,
     bass: [73.4, 0, 73.4, 73.4, 0, 87.3, 0, 73.4, 65.4, 0, 65.4, 58.3, 0, 87.3, 98, 0],
     stabSteps: [12],
     stabChord: [293.7, 349.2, 440],
