@@ -73,6 +73,11 @@ export class GameRenderer {
   private confetti: THREE.Points | null = null;
   private confettiVel: Float32Array | null = null;
   private confettiT = 0;
+  /** clash-resolved outfield shirt colors, [home, away] */
+  private shirts: [string, string] = ['#ffffff', '#ffffff'];
+  // comet trail behind the ball during replays (additive, fades to the tail)
+  private trail: THREE.Points | null = null;
+  private trailPts: [number, number, number][] = [];
 
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
@@ -83,6 +88,7 @@ export class GameRenderer {
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
     const [homeKit, awayKit, gkA, gkB] = resolveKits(match.teams[0].data.kit, match.teams[1].data.kit);
+    this.shirts = [homeKit.shirt, awayKit.shirt];
     match.teams[0].players.forEach((p) => {
       this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit));
     });
@@ -155,9 +161,11 @@ export class GameRenderer {
     }
     if (e.type === 'goal') {
       this.goalSeqT = 0;
-      // celebration subject: the scorer's mesh
-      const scorer = this.match.allPlayers.find(
-        (p) => p.data.name === e.scorerName && p.teamIdx === e.teamIdx,
+      // celebration subject: the scorer's mesh — matched by shirt number,
+      // since display names can be duplicated (roster editor, factory dupe)
+      const scorer = e.ownGoal ? undefined : this.match.allPlayers.find(
+        (p) => p.teamIdx === e.teamIdx
+          && (e.scorerNum !== undefined ? p.data.num === e.scorerNum : p.data.name === e.scorerName),
       );
       // own goals name a player on the other team — fall back to the ball
       if (scorer) this.cam.subject.set(scorer.pos.x, 0, scorer.pos.y);
@@ -187,6 +195,7 @@ export class GameRenderer {
     this.passIdx = i;
     const p = this.passes[i];
     this.replayIdx = Math.floor(this.passFrames.length * p.from);
+    this.clearTrail(); // the angle cut rewinds time — no stale streak
     this.cam.setMode(p.mode);
     this.onReplayStateChange?.(true, i === 0 ? 'REPLAY' : `REPLAY · ANGLE ${i + 1}`);
   }
@@ -237,6 +246,46 @@ export class GameRenderer {
     this.onReplayStateChange?.(false);
   }
 
+  private pushTrail(x: number, y: number, z: number): void {
+    const N = 22;
+    if (!this.trail) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      this.trail = new THREE.Points(geo, new THREE.PointsMaterial({
+        size: 0.26, vertexColors: true, transparent: true,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      this.trail.frustumCulled = false;
+      this.sceneMgr.scene.add(this.trail);
+    }
+    this.trailPts.push([x, y, z]);
+    if (this.trailPts.length > N) this.trailPts.shift();
+    const pos = this.trail.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const col = this.trail.geometry.getAttribute('color') as THREE.BufferAttribute;
+    for (let i = 0; i < N; i++) {
+      const real = i < this.trailPts.length;
+      const p = this.trailPts[Math.min(i, this.trailPts.length - 1)];
+      pos.setXYZ(i, p[0], p[2] + 0.11, p[1]); // sim (x, ground-y, height-z) → scene (x, y, z)
+      // padding slots are invisible — head-bright padding stacked ~12x
+      // overbright at the start of every replay angle
+      const b = real ? Math.pow((i + 1) / this.trailPts.length, 1.6) * 0.55 : 0;
+      col.setXYZ(i, b, b, b * 0.9);
+    }
+    pos.needsUpdate = true;
+    col.needsUpdate = true;
+  }
+
+  private clearTrail(): void {
+    this.trailPts = [];
+    if (this.trail) {
+      this.sceneMgr.scene.remove(this.trail);
+      this.trail.geometry.dispose();
+      (this.trail.material as THREE.Material).dispose();
+      this.trail = null;
+    }
+  }
+
   private removeConfetti(): void {
     if (!this.confetti) return;
     this.sceneMgr.scene.remove(this.confetti);
@@ -251,7 +300,7 @@ export class GameRenderer {
     const pos = new Float32Array(N * 3);
     const vel = new Float32Array(N * 3);
     const colors = new Float32Array(N * 3);
-    const kit = new THREE.Color(this.match.teams[teamIdx].data.kit.home);
+    const kit = new THREE.Color(this.shirts[teamIdx]); // what they actually wear
     const gold = new THREE.Color(0xffce4a);
     const gx = HALF_L * Math.sign(this.match.ball.pos.x || 1);
     for (let i = 0; i < N; i++) {
@@ -316,6 +365,9 @@ export class GameRenderer {
       ballY = f0.ball[1] + (f1.ball[1] - f0.ball[1]) * frac;
       ballZ = f0.ball[2] + (f1.ball[2] - f0.ball[2]) * frac;
       this.ballMesh.update(ballX, ballY, ballZ);
+      // paused frames (dt 0) must not stack identical points into one
+      // over-bright additive dot
+      if (dtReal > 0) this.pushTrail(ballX, ballY, ballZ);
       f0.players.forEach((s, i) => {
         const s1 = f1.players[i];
         const x = s.x + (s1.x - s.x) * frac;
@@ -324,7 +376,8 @@ export class GameRenderer {
         if (df > Math.PI) df -= Math.PI * 2;
         if (df < -Math.PI) df += Math.PI * 2;
         const [anim, animT] = f0.anims[i];
-        this.playerMeshes[i].update(dtReal, x, y, 0, s.facing + df * frac,
+        // slow the run cycles with the footage or slow-mo players foot-skate
+        this.playerMeshes[i].update(dtReal * pass.rate, x, y, 0, s.facing + df * frac,
           s.speed + (s1.speed - s.speed) * frac, anim, animT);
       });
       if (this.replayIdx >= this.passFrames.length - 1) {
@@ -363,15 +416,19 @@ export class GameRenderer {
       ballY = this.prevBall[1] + (this.currBall[1] - this.prevBall[1]) * alpha;
       ballZ = this.prevBall[2] + (this.currBall[2] - this.prevBall[2]) * alpha;
       this.ballMesh.update(ballX, ballY, ballZ);
+      if (this.trailPts.length) this.clearTrail();
     }
 
-    // switch indicators hover over each seat's controlled player
+    // switch indicators hover over each seat's controlled player (live play
+    // only — a cone bobbing through the penalty cinematic reads as a glitch)
+    const inAction = this.match.phase === 'play' || this.match.phase === 'restart'
+      || this.match.phase === 'kickoff';
     for (let i = 0; i < 2; i++) {
       const ctrl = this.match.controlled[i];
       const arrow = this.switchArrows[i];
       const ring = this.controlRings[i];
       this.ringPulse[i] = Math.max(0, this.ringPulse[i] - dtReal);
-      if (ctrl && this.match.seats[i] && !replaying && !ctrl.sentOff) {
+      if (ctrl && this.match.seats[i] && !replaying && inAction && !ctrl.sentOff) {
         arrow.visible = true;
         ring.visible = true;
         const bob = Math.sin(performance.now() * 0.006 + i * 2) * 0.08;
@@ -403,7 +460,9 @@ export class GameRenderer {
       this.cam.setMode('broadcast');
     }
 
-    // confetti physics
+    // confetti physics (hidden while a replay rewinds time — celebration
+    // confetti raining through the pre-goal build-up is anachronistic)
+    if (this.confetti) this.confetti.visible = !replaying;
     if (this.confetti && this.confettiVel) {
       this.confettiT += dtReal;
       const posAttr = this.confetti.geometry.getAttribute('position') as THREE.BufferAttribute;
@@ -427,6 +486,7 @@ export class GameRenderer {
   /** Release all GPU resources — call when the match ends. */
   dispose(): void {
     this.removeConfetti();
+    this.clearTrail();
     this.sceneMgr.dispose();
   }
 

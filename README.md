@@ -103,7 +103,8 @@ man is a foul, from behind is a card.
   are attributed by position and star quality. Progress auto-saves to
   localStorage.
 - **Golden Goal** — party mode: no clock, next goal wins, winner takes the
-  bragging rights. 2P when a gamepad is plugged in, otherwise you vs the CPU.
+  bragging rights. 1P vs CPU by default; with a gamepad connected, flip the
+  PLAYERS setting to 2P for keyboard-vs-pad couch play.
 - **Penalty Shootout** — straight to the spot. Aim with the stick (the reticle
   fades at higher difficulty), hold shoot for power — full power risks blazing
   over. Human keeper picks a dive as they strike. Sudden death after 5.
@@ -129,12 +130,16 @@ man is a foul, from behind is a card.
   terraced crowds; floodlight pylons; LED ad boards (CLAWDE SPORTS ·
   ANTHROPIC AIR); day / sunset / night kickoffs; three venues — Municipal 18k,
   National 45k, and the Mega Bowl 80k (tournament finals play there at night).
+  Kit clashes are resolved like a real matchday: the away side switches to its
+  change strip when colors collide, and both keepers pick loud kits that stand
+  out from everyone on the pitch.
 - **The broadcast:** smooth-damped side-on camera with **no hard cuts in open
   play**, a two-angle goal recap (celebration cam → behind-goal replay →
   pitch-level super-slow-mo, letterbox + REPLAY bug), on-demand instant replay
-  (**R**) of the last six seconds, half-time / full-time cards with a match
-  story timeline (goals and cards on a minute line) plus possession, shots,
-  corners and fouls, a pre-match TACTICS strip naming each side's style and
+  (**R**) of the last six seconds with a comet trail on the ball, half-time /
+  full-time cards with a match story timeline (goals and cards on a minute
+  line), a **★ Man of the Match** award, possession, shots, corners and fouls,
+  a pre-match TACTICS strip naming each side's style and
   star man, a glossy score bug, and an always-correct ticker. And from the
   moment it loads, an **attract mode**: a live CPU-vs-CPU match plays behind
   the menus, arcade-classic style.
@@ -144,11 +149,12 @@ man is a foul, from behind is a card.
   ones. Voice quality varies by machine, so it lives behind a COMMENTARY
   toggle in match settings.
 - **The sound:** fully synthesized Web Audio — layered crowd conductor driven
-  directly by game state (murmur → anticipation → roar/groan), kick thumps,
-  net swish, pea-whistle, the sacred post *DOINK*, the crowd holding its
-  breath before every penalty, and two synthesized music loops — a big-beat
-  menu anthem and a leaner in-match groove that sits under the crowd (MUSIC
-  setting: ON / MENUS ONLY / OFF). Zero audio assets.
+  directly by game state (murmur → anticipation → roar/groan), terrace
+  clap-chants when the game heats up, a stadium air-horn on goals, kick
+  thumps, net swish, pea-whistle, the sacred post *DOINK*, the crowd holding
+  its breath before every penalty, and two synthesized music loops — a
+  big-beat menu anthem and a leaner in-match groove that sits under the crowd
+  (MUSIC setting: ON / MENUS ONLY / OFF). Zero audio assets.
 - **The data:** all 48 teams live in `src/data/teams.json` — real 2026 World
   Cup squads with per-player ratings and one star player per team (gold ring,
   +10 ratings). Don't like the roster? **EDIT TEAMS** on the main menu opens a

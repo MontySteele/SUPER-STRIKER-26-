@@ -7,6 +7,7 @@ import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
 import { overall } from '../data/loader';
 import { esc } from './escape';
+import { resolvedShirts } from '../render/playerMesh';
 import { controlsSetting, type ControlsSetting } from './prefs';
 import type { TeamData } from '../data/types';
 
@@ -53,9 +54,14 @@ export class HUD {
   private story: StoryEntry[] = [];
   private corners = [0, 0];
   private fouls = [0, 0];
+  /** goals + saves per player, for the Man of the Match line. */
+  private motm = new Map<string, { teamIdx: number; name: string; score: number }>();
+  /** what each side actually wears (clash-resolved) — not raw kit.home */
+  private shirts: [string, string];
 
   constructor(private match: Match) {
     this.root = document.getElementById('ui-root')!;
+    this.shirts = resolvedShirts(match.teams[0].data.kit, match.teams[1].data.kit);
     this.build();
   }
 
@@ -72,11 +78,11 @@ export class HUD {
       <div class="letterbox-bot"></div>
       <div class="replay-bug">REPLAY</div>
       <div class="score-bug">
-        <div class="chip" style="background:${home.data.kit.home}"></div>
+        <div class="chip" style="background:${this.shirts[0]}"></div>
         <div class="team">${home.data.code}</div>
         <div class="score">0 - 0</div>
         <div class="team">${away.data.code}</div>
-        <div class="chip" style="background:${away.data.kit.home}"></div>
+        <div class="chip" style="background:${this.shirts[1]}"></div>
         <div class="clock">0'</div>
       </div>
       <div class="ticker"></div>
@@ -127,11 +133,12 @@ export class HUD {
   /** Pre-match tactics strip: styles + star men, the data made visible. */
   private prematchHtml(): string {
     const side = (t: TeamData): string => {
-      const star = this.match.teams[t === this.match.teams[0].data ? 0 : 1].players
+      const idx = t === this.match.teams[0].data ? 0 : 1;
+      const star = this.match.teams[idx].players
         .map((p) => p.data)
         .reduce((a, b) => (b.star || (!a.star && overall(b) > overall(a)) ? b : a));
       return `<div class="pm-side">
-        <div class="pm-team" style="border-color:${t.kit.home}">${t.name.toUpperCase()}</div>
+        <div class="pm-team" style="border-color:${this.shirts[idx]}">${t.name.toUpperCase()}</div>
         <div class="pm-info">${t.style.toUpperCase()} · ${t.formation} · ★ ${esc(star.name.split(' ').pop()?.toUpperCase() ?? '')}</div>
       </div>`;
     };
@@ -184,13 +191,20 @@ export class HUD {
           minute: e.minute, teamIdx: e.teamIdx,
           icon: e.ownGoal ? 'og' : 'goal', name: e.scorerName,
         });
+        if (!e.ownGoal) this.creditMotm(e.teamIdx, e.scorerName, 3, e.scorerNum);
         break;
       }
       case 'miss':
         this.pushTicker(`${e.minute}' — CLOSE! ${e.shooterName} drags it wide.`);
         break;
       case 'save':
-        this.pushTicker(`WHAT A SAVE! ${e.keeperName} denies them!`);
+        // routine loose-ball collections also emit 'save' — only genuine
+        // shot-stops deserve the shout (or MOTM credit: uncapped smother
+        // farming handed the award to a keeper who conceded ten)
+        if (e.shotStop) {
+          this.pushTicker(`WHAT A SAVE! ${e.keeperName} denies them!`);
+          this.creditMotm(e.teamIdx, e.keeperName, 1.5, e.keeperNum);
+        }
         break;
       case 'post':
         this.pushTicker(`OFF THE WOODWORK! The frame says no.`);
@@ -235,6 +249,9 @@ export class HUD {
         this.pushTicker(`${teamName(e.winnerIdx)} WIN THE SHOOTOUT!`);
         break;
       case 'kickoff':
+        // every post-goal restart re-emits kickoff — only announce the period
+        // on its FIRST kickoff or the ticker repeats itself after every goal
+        if (m.clock >= 1) break;
         if (e.half === 1 && m.mode === 'golden') this.pushTicker(`GOLDEN GOAL — NEXT GOAL WINS IT ALL!`);
         if (e.half === 2) this.pushTicker(`Second half under way!`);
         if (e.half === 3) this.pushTicker(`Extra time — next 15 minutes decide it… maybe.`);
@@ -250,6 +267,26 @@ export class HUD {
     }
   }
 
+  private creditMotm(teamIdx: number, name: string, points: number, num?: number): void {
+    // key by shirt number when we have it — display names can be duplicated
+    const key = `${teamIdx}|${num ?? name}`;
+    const cur = this.motm.get(key) ?? { teamIdx, name, score: 0 };
+    cur.score += points;
+    this.motm.set(key, cur);
+  }
+
+  /** ★ MAN OF THE MATCH line for the full-time card; '' when nobody earned it. */
+  private motmHtml(): string {
+    let best: { teamIdx: number; name: string; score: number } | null = null;
+    for (const c of this.motm.values()) {
+      if (!best || c.score > best.score) best = c;
+    }
+    if (!best || best.score < 3) return ''; // a goal or two big saves, minimum
+    const surname = esc(best.name.split(' ').pop()?.toUpperCase() ?? '');
+    const code = this.match.teams[best.teamIdx].data.code;
+    return `<div class="motm">★ MAN OF THE MATCH — <span style="color:${this.shirts[best.teamIdx]}">■</span> ${surname} (${code})</div>`;
+  }
+
   private flashCard(color: 'yellow' | 'red'): void {
     this.cardFlash.className = `card-flash show ${color}`;
     setTimeout(() => this.cardFlash.classList.remove('show'), 1600);
@@ -257,8 +294,9 @@ export class HUD {
 
   private showCard(title: string): void {
     const [h, a] = this.match.teams;
-    const total = Math.max(h.possessionTicks + a.possessionTicks, 1);
-    const hp = Math.round((h.possessionTicks / total) * 100);
+    const total = h.possessionTicks + a.possessionTicks;
+    // no open play at all (shootout mode) reads 50/50, not 0%–100%
+    const hp = total ? Math.round((h.possessionTicks / total) * 100) : 50;
     const isFT = title === 'FULL-TIME';
     let hint = isFT
       ? (this.fulltimeHint ?? 'PRESS J FOR REMATCH · K FOR MENU')
@@ -274,11 +312,12 @@ export class HUD {
     this.card.innerHTML = `
       <h1>${isFT && this.match.mode === 'golden' ? 'GOLDEN GOAL!' : title}</h1>
       <div class="scoreline">
-        <span style="color:${h.data.kit.home}">■</span> ${h.data.name}
+        <span style="color:${this.shirts[0]}">■</span> ${h.data.name}
         ${h.score} - ${a.score}
-        ${a.data.name} <span style="color:${a.data.kit.home}">■</span>
+        ${a.data.name} <span style="color:${this.shirts[1]}">■</span>
       </div>
       ${pens}
+      ${isFT ? this.motmHtml() : ''}
       ${this.storyHtml()}
       <table>
         <tr><td class="val">${hp}%</td><td class="stat">POSSESSION</td><td class="val">${100 - hp}%</td></tr>
@@ -306,7 +345,8 @@ export class HUD {
       const body = `${icon(s)} ${s.minute}' ${surname}${og}`;
       return `<div class="story-row ${s.teamIdx === 0 ? 'home' : 'away'}">${body}</div>`;
     }).join('');
-    return `<div class="story">${rows}</div>`;
+    // dense mode keeps long goal-fests fully visible on the card
+    return `<div class="story${this.story.length > 8 ? ' dense' : ''}">${rows}</div>`;
   }
 
   /** Re-show the full-time card (after an L-triggered goal replay). */
@@ -323,9 +363,9 @@ export class HUD {
     this.card.innerHTML = `
       <h1>PAUSED</h1>
       <div class="scoreline">
-        <span style="color:${h.data.kit.home}">■</span> ${h.data.name}
+        <span style="color:${this.shirts[0]}">■</span> ${h.data.name}
         ${h.score} - ${a.score}
-        ${a.data.name} <span style="color:${a.data.kit.home}">■</span>
+        ${a.data.name} <span style="color:${this.shirts[1]}">■</span>
       </div>
       <div class="hint">PRESS J TO RESUME · K TO QUIT</div>
     `;
@@ -346,7 +386,7 @@ export class HUD {
       if (seat) {
         const pen = m.penalty;
         if (inPens && pen && pen.kickingTeam === i && pen.phase === 'aim' && pen.charging) {
-          frac = Math.min(seat.heldDuration('shoot') / 0.9, 1);
+          frac = Math.min(pen.chargeT / 0.9, 1); // aim-phase hold only
         } else if (!inPens && seat.isHeld('shoot') && m.ball.owner === m.controlled[i]) {
           frac = Math.min(seat.heldDuration('shoot') / SHOT_MAX_HOLD, 1);
         }
@@ -458,7 +498,7 @@ export class HUD {
         }
         const t = m.teams[idx].data;
         return `<div class="pen-row">
-          <span class="pen-code" style="color:${t.kit.home}">${t.code}</span>
+          <span class="pen-code" style="color:${this.shirts[idx]}">${t.code}</span>
           <span class="pen-score">${b.scores[idx]}</span>${dots.join('')}
         </div>`;
       };
@@ -472,5 +512,8 @@ export class HUD {
 
   destroy(): void {
     this.root.innerHTML = '';
+    // quitting mid-replay left this stuck on the shared root: the next match
+    // played letterboxed with a blinking REPLAY bug and no nameplates
+    this.root.classList.remove('replay-on');
   }
 }

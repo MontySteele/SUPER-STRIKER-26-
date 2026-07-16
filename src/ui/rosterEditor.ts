@@ -22,6 +22,7 @@ export class RosterEditor {
   constructor(private onExit: () => void) {
     this.root = document.getElementById('ui-root')!;
     this.keyHandler = (e) => {
+      if (e.repeat) return; // a held key must not chain back through screens
       if (e.code !== 'Escape' && e.code !== 'KeyK') return;
       const el = document.activeElement;
       if (el instanceof HTMLInputElement) {

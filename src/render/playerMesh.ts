@@ -311,15 +311,39 @@ export function resolveKits(homeKit: { home: string; away: string }, awayKit: { 
     socks: shirt,
     isGK: false,
   });
-  // keepers get deliberately loud kits that clash with nobody
-  const gkA: KitSpec = { shirt: '#c8e04a', shorts: '#20242c', socks: '#c8e04a', isGK: true };
-  const gkB: KitSpec = { shirt: '#e07a3a', shorts: '#20242c', socks: '#e07a3a', isGK: true };
   const home = mk(homeShirt);
   let away = mk(awayShirt);
   if (colorDist(homeShirt, awayShirt) < 130) {
     away = mk(luminance(homeShirt) > 0.5 ? '#1a2f6b' : '#f0f2f5');
   }
+  // keepers get deliberately loud kits — picked per match from a palette so
+  // they clash with neither outfield shirt nor each other (a fixed orange
+  // keeper next to Holland's outfield orange was unreadable)
+  const pickGk = (avoid: string[]): string => {
+    let best = GK_PALETTE[0];
+    let bestScore = -1;
+    for (const c of GK_PALETTE) {
+      const s = Math.min(...avoid.map((a) => colorDist(c, a)));
+      if (s > bestScore) { bestScore = s; best = c; }
+    }
+    return best;
+  };
+  const shirtA = pickGk([home.shirt, away.shirt]);
+  const shirtB = pickGk([home.shirt, away.shirt, shirtA]);
+  const gkA: KitSpec = { shirt: shirtA, shorts: '#20242c', socks: shirtA, isGK: true };
+  const gkB: KitSpec = { shirt: shirtB, shorts: '#20242c', socks: shirtB, isGK: true };
   return [home, away, gkA, gkB];
+}
+
+const GK_PALETTE = ['#c8e04a', '#e07a3a', '#38c6de', '#df4ad2', '#2d3ce8'];
+
+/** The two resolved outfield shirt colors — what's ACTUALLY worn on the pitch,
+ *  for HUD chips/scorelines/confetti to stay consistent with it. */
+export function resolvedShirts(
+  homeKit: { home: string; away: string }, awayKit: { home: string; away: string },
+): [string, string] {
+  const [h, a] = resolveKits(homeKit, awayKit);
+  return [h.shirt, a.shirt];
 }
 
 function colorDist(a: string, b: string): number {

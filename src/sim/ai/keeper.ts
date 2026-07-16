@@ -18,7 +18,10 @@ const SMOTHER_TRIGGER_X = 12;   // carrier within this of the goal line
 const SMOTHER_TRIGGER_Y = 13;
 const SMOTHER_REACH = 7;        // keeper close enough to make the charge
 const SMOTHER_BALL_MAX_Z = 0.6; // at the feet — a chip is not smotherable
-const SMOTHER_WIN_BASE = 0.72;  // + up to 0.18 by Keeping rating
+// win% tuned down post-merge: with the keeper's shot coverage also fixed,
+// 0.72 dragged matches to 1.56 goals — a spill to the byline still stops
+// the walk-in, so the charge does its job either way
+const SMOTHER_WIN_BASE = 0.55;  // + up to 0.18 by Keeping rating
 const SMOTHER_COOLDOWN = 1.6;
 
 export class KeeperBrain {
@@ -30,6 +33,21 @@ export class KeeperBrain {
   private smotherCooldown = 0;
 
   constructor(public team: Team, public keeper: PlayerEntity) {}
+
+  /** True while the keeper has the ball in his hands (possession is frozen). */
+  holding(): boolean {
+    return this.state === 'hold';
+  }
+
+  /** Hard reset at kickoffs: stale 'hold' teleported the ball 44m into the
+   *  keeper's gloves, and stale 'react' threw phantom dives at kickoff passes. */
+  reset(): void {
+    this.state = 'position';
+    this.timer = 0;
+    this.reactAt = -1;
+    this.holdTimer = 0;
+    this.smotherCooldown = 0;
+  }
 
   private goalX(): number {
     return -HALF_L * this.team.attackDir;
@@ -59,12 +77,18 @@ export class KeeperBrain {
       this.holdTimer = 0.8;
       ball.owner = null;
       ball.vel = { x: 0, y: 0, z: 0 };
+      k.facing = this.team.attackDir > 0 ? 0 : Math.PI; // face upfield, never the net
     }
 
     switch (this.state) {
       case 'hold': {
+        // a phase change can move the ball out from under a frozen hold
+        if (dist2(k.pos, { x: ball.pos.x, y: ball.pos.y }) > 3) {
+          this.state = 'position';
+          return;
+        }
         this.holdTimer -= dt;
-        ball.pos.x = k.pos.x + Math.cos(k.facing) * 0.5;
+        ball.pos.x = clamp(k.pos.x + Math.cos(k.facing) * 0.5, -HALF_L + 0.3, HALF_L - 0.3);
         ball.pos.y = k.pos.y + Math.sin(k.facing) * 0.5;
         ball.pos.z = 0.9;
         ball.vel = { x: 0, y: 0, z: 0 };
@@ -97,12 +121,21 @@ export class KeeperBrain {
 
       case 'recover': {
         k.stop();
-        if (this.timer > 0.7) this.state = 'position';
+        // the hands stay live while a shot is in flight — a micro-dive that
+        // decayed instantly must not leave the keeper a ghost the ball
+        // passes through (shots straight at him were automatic goals).
+        // 0.85: enough to smother dead-center, not enough to erase near-miss
+        // placement (1.0 dragged the match average under 2 goals)
+        if (match.activeShot) this.tryHands(match, 0.85);
+        // and don't go blind until that shot resolves, however long it takes
+        if (this.timer > 0.7 && !match.activeShot) this.state = 'position';
         return;
       }
 
       case 'react': {
-        // track the shot; commit to the dive once reaction time elapses
+        // track the shot; commit to the dive once reaction time elapses —
+        // but hands are live the whole time for balls already on top of him
+        this.tryHands(match, 0.8);
         if (match.simTime >= this.reactAt) {
           this.commitDive(match);
         }
@@ -264,6 +297,17 @@ export class KeeperBrain {
 
   private startDive(match: Match, dy: number, arriveIn: number): void {
     const k = this.keeper;
+    if (Math.abs(dy) < 0.4) {
+      // straight at him: no sideways flop — hold ground in 'recover', whose
+      // hands stay live every tick while the shot is in flight. (A one-shot
+      // hands check here wedged him in 'set' with dead hands and made
+      // dead-center the optimal finish from range.)
+      this.state = 'recover';
+      this.timer = 0;
+      k.stop();
+      this.tryHands(match, 1.0);
+      return;
+    }
     k.diving = true;
     k.diveVel = v2(0, dy / Math.max(arriveIn, 0.15));
     // cap dive velocity to something human
@@ -279,6 +323,10 @@ export class KeeperBrain {
     const k = this.keeper;
     const ball = match.ball;
     if (ball.noControlPlayer === k) return;
+    // never rip a ball out of a player's active control — live react/recover
+    // hands plus a stale activeShot could vacuum a dribbling striker's ball
+    // and log a phantom 'save'
+    if (ball.owner) return;
     const d3 = Math.hypot(ball.pos.x - k.pos.x, ball.pos.y - k.pos.y, (ball.pos.z - 1.0) * 0.7);
     if (d3 > radius) return;
     const sp = ball.speed();
@@ -298,7 +346,10 @@ export class KeeperBrain {
       ball.owner = null;
       ball.noControlTimer = 0.3;
       ball.noControlPlayer = k;
-      match.events.emit({ type: 'save', keeperName: k.data.name, teamIdx: this.team.idx });
+      match.events.emit({
+        type: 'save', keeperName: k.data.name, teamIdx: this.team.idx,
+        keeperNum: k.data.num, shotStop: true, // a parry is always a shot-stop
+      });
       match.shotResolved('save');
     }
   }
@@ -309,8 +360,15 @@ export class KeeperBrain {
     ball.vel = { x: 0, y: 0, z: 0 };
     this.state = 'hold';
     this.holdTimer = 1.4;
+    this.keeper.facing = this.team.attackDir > 0 ? 0 : Math.PI; // never toward the net
     this.keeper.playAnim('collect', 0.5);
-    match.events.emit({ type: 'save', keeperName: this.keeper.data.name, teamIdx: this.team.idx });
+    match.events.emit({
+      type: 'save', keeperName: this.keeper.data.name, teamIdx: this.team.idx,
+      keeperNum: this.keeper.data.num,
+      // only a pickup with a live shot in flight is a real stop; the rest are
+      // routine collections that must not shout WHAT A SAVE or farm MOTM
+      shotStop: match.activeShot !== null,
+    });
     match.shotResolved('save');
   }
 }
