@@ -218,7 +218,7 @@ export type GuestControl =
 
 /** What a seat means right now, in the guest's own words and kit colors. */
 export interface SlotBrief {
-  slot: number;        // 0 = P1, 1 = P2
+  slot: number;        // seat slot: 0 = P1 … 3 = P4 (§5.4.6)
   teamName: string;
   teamCode: string;
   shirt: string;       // kit color the guest's banner is painted in

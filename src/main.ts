@@ -7,7 +7,7 @@ import { GuestHost } from './net/hostLink';
 import { seatHealth } from './net/health';
 import { Lobby, readableOn, type SlotAssignment, type SlotDevice } from './ui/lobby';
 import { resolvedShirts } from './render/playerMesh';
-import { Match, type DifficultyName } from './sim/match';
+import { Match, SEAT_SLOTS, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
 import type { MatchEvent } from './sim/matchEvents';
@@ -62,7 +62,8 @@ type MatchMenuResult = Extract<MenuResult, { home: TeamData }>;
 interface MatchConfig {
   home: TeamData;
   away: TeamData;
-  seats: [PlayerInput | null, PlayerInput | null];
+  /** by seat slot: [team0, team1, team0 partner, team1 partner] (§5.4.6) */
+  seats: (PlayerInput | null)[];
   halfLengthSec: number;
   difficulty: DifficultyName;
   timeOfDay: TimeOfDay;
@@ -71,7 +72,7 @@ interface MatchConfig {
   mode: 'match' | 'shootout' | 'golden';
   /** what happens after full time on button press */
   onDone: ((m: Match) => void) | null; // null = default rematch/menu choice
-  /** seat index → remote guest id, for the §5.4.5 disconnect ladder */
+  /** seat slot → remote guest id, for the §5.4.5 disconnect ladder */
   guestSlots?: Map<number, number>;
 }
 
@@ -96,11 +97,11 @@ let guestHost: GuestHost | null = null;
 let lobby: Lobby | null = null;
 /** Seats the guests are sitting in, and the seat objects to hand back to. */
 let guestSlots = new Map<number, number>();
-let baseSeats: [PlayerInput | null, PlayerInput | null] = [null, null];
-/** Seat currently driven by the AI because its guest went away. */
-const seatOnAI = [false, false];
+let baseSeats: (PlayerInput | null)[] = [null, null, null, null];
+/** Seat slots currently driven by the AI because their guest went away. */
+const seatOnAI = [false, false, false, false];
 /** Human is back but the ball is live — hand over at the next dead ball. */
-const seatHandback = [false, false];
+const seatHandback = [false, false, false, false];
 let netHold: string | null = null;
 
 // ------------------------------------------------------------ WebGL safety
@@ -182,8 +183,9 @@ function handleMenuResult(r: MenuResult): void {
     case 'golden': {
       // golden goal 2P is opt-in via its PLAYERS setting — auto-seating any
       // plugged-in pad/guest left the away team frozen when nobody was holding it
-      const twoP = r.kind === 'versus' || (r.kind === 'golden' && r.golden2p === true);
-      const seats = makeSeats(twoP);
+      const players = r.kind === 'versus' && r.versus2v2 === true ? 4
+        : r.kind === 'versus' || (r.kind === 'golden' && r.golden2p === true) ? 2 : 1;
+      const seats = makeSeats(players);
       startMatch({
         home: r.home, away: r.away, seats,
         halfLengthSec: r.halfLengthSec, difficulty: r.difficulty,
@@ -211,20 +213,23 @@ function handleMenuResult(r: MenuResult): void {
   }
 }
 
-function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
+/** Seat `players` humans on the couch, slot order: P1, P2, P3, P4. */
+function makeSeats(players: 1 | 2 | 4): (PlayerInput | null)[] {
+  const out: (PlayerInput | null)[] = new Array<PlayerInput | null>(SEAT_SLOTS).fill(null);
   // 1P: merged seat already unions keyboard + pads + remote guests
-  if (!versus) return [hub.seat('merged'), null];
-  // 2P: pads first, then guests, keyboard fills the last empty seat
+  if (players === 1) { out[0] = hub.seat('merged'); return out; }
+  // pads first, then guests; the keyboard only takes a seat when there aren't
+  // enough sticks to go round (two pads means pad-vs-pad, as it always did)
   const devs: PlayerInput[] = [
     ...hub.connectedPads().map((i) => hub.seat('pad', i)),
     ...hub.connectedRemotes().map((i) => hub.seat('remote', i)),
   ];
-  if (devs.length >= 2) return [devs[0], devs[1]];
-  if (devs.length === 1) return [hub.seat('keyboard'), devs[0]];
-  return [hub.seat('keyboard'), hub.seat('pad', 0)];
+  if (devs.length < players) devs.unshift(hub.seat('keyboard'));
+  for (let i = 0; i < players; i++) out[i] = devs[i] ?? hub.seat('pad', i);
+  return out;
 }
 
-// ---------------------------------------------------------------- remote 1v1
+// ------------------------------------------------------- remote 1v1 / 2v2
 
 /** INVITE PLAYERS: open a room, seat the guests, kick off (§5.4.2). */
 function showLobby(r: MatchMenuResult): void {
@@ -259,7 +264,7 @@ function closeLobby(): void {
   guestHost?.close();
   guestHost = null;
   guestSlots = new Map();
-  baseSeats = [null, null];
+  baseSeats = [null, null, null, null];
   (window as unknown as Record<string, unknown>).__ss26Net = null;
 }
 
@@ -271,9 +276,9 @@ function seatForDevice(d: SlotDevice): PlayerInput {
 
 function startRemoteMatch(r: MatchMenuResult, slots: SlotAssignment): void {
   lobby = null; // the lobby destroyed itself before handing us the seating
-  const seats: [PlayerInput | null, PlayerInput | null] = [null, null];
+  const seats: (PlayerInput | null)[] = new Array<PlayerInput | null>(SEAT_SLOTS).fill(null);
   const map = new Map<number, number>();
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < SEAT_SLOTS; i++) {
     const d = slots[i];
     if (!d) continue;
     seats[i] = seatForDevice(d);
@@ -284,10 +289,12 @@ function startRemoteMatch(r: MatchMenuResult, slots: SlotAssignment): void {
     guestHost.phase = 'match';
     guestHost.note = null;
     guestHost.describeSlot = (slot) => {
-      const team = slot === 0 ? r.home : r.away;
+      // slots alternate sides: P1/P3 are home, P2/P4 away (§5.4.6)
+      const side = slot & 1;
+      const team = side === 0 ? r.home : r.away;
       return {
         teamName: team.name, teamCode: team.code,
-        shirt: shirts[slot], text: readableOn(shirts[slot]),
+        shirt: shirts[side], text: readableOn(shirts[side]),
       };
     };
     guestHost.broadcast();
@@ -322,6 +329,9 @@ function updateGuestHealth(): void {
       hub.remote(id).neutralize();
       hudUI.netFlash(`${who} DISCONNECTED — AI TAKES OVER`, 4);
     } else if (state === 'lost' && !seatOnAI[slot]) {
+      // any missing human holds the match, partner slots included: in a 2v2 a
+      // side playing 2v1 for five seconds is exactly as unfair as one playing
+      // with no human at all, and everyone is watching one screen anyway
       hold = `${who} RECONNECTING… · K TO ABANDON`;
     }
 
@@ -388,7 +398,7 @@ function playTournamentFixture(fixture: Fixture): void {
   if (!tournament) return;
   const knockout = !fixture.stage.startsWith('md');
   const me = tournament.state.playerTeamId;
-  const seats: [PlayerInput | null, PlayerInput | null] =
+  const seats: (PlayerInput | null)[] =
     fixture.homeId === me ? [hub.seat('merged'), null] : [null, hub.seat('merged')];
   const dress = stageDressing(fixture.stage);
   startMatch({
@@ -519,9 +529,12 @@ function startMatch(config: MatchConfig): void {
 
   // a rematch re-seats the same guests from scratch: nobody starts on the AI
   guestSlots = config.guestSlots ?? new Map();
-  baseSeats = [config.seats[0], config.seats[1]];
-  seatOnAI[0] = seatOnAI[1] = false;
-  seatHandback[0] = seatHandback[1] = false;
+  baseSeats = [];
+  for (let s = 0; s < SEAT_SLOTS; s++) {
+    baseSeats.push(config.seats[s] ?? null);
+    seatOnAI[s] = false;
+    seatHandback[s] = false;
+  }
   netHold = null;
 
   match = new Match({

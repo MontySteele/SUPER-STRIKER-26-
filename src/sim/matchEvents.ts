@@ -31,4 +31,5 @@ export type MatchEvent =
   | { type: 'tackle' }
   | { type: 'attackBuildup'; level: number }  // 0..1 crowd anticipation
   | { type: 'possessionChange'; teamIdx: number }
-  | { type: 'switch'; teamIdx: number };      // controlled player changed
+  // a seat slot's controlled player changed (§5.4.6: slot, not just side)
+  | { type: 'switch'; teamIdx: number; slot: number };

@@ -2,7 +2,7 @@
 // power bars (one per seat), penalty reticle + shootout board, card banners,
 // replay dressing, goal banner, break/fulltime cards.
 
-import type { Match } from '../sim/match';
+import { SEAT_SLOTS, slotTeam, type Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
 import { overall } from '../data/loader';
@@ -44,14 +44,14 @@ export class HUD {
   private netHold: string | null = null;
   private netFlashText = '';
   private netFlashTimer = 0;
-  /** Per-seat link health, drawn as a pip on that player's nameplate. */
-  private netSeat: ('ok' | 'degraded' | 'lost' | 'ai')[] = ['ok', 'ok'];
+  /** Per-slot link health, drawn as a pip on that player's nameplate. */
+  private netSeat: ('ok' | 'degraded' | 'lost' | 'ai')[] = ['ok', 'ok', 'ok', 'ok'];
   private controlsTimer = 14;
   private controlsMode: ControlsSetting = controlsSetting();
   private controlsAttack = '';
   private controlsDefense = '';
   private controlsBright = 0;
-  /** The single human seat index for context-aware hints; -1 in 2P. */
+  /** The lone human's TEAM for context-aware hints; -1 when more than one. */
   private soloSeat = -1;
   private prematchTimer = 8;
   /** Overrides the full-time prompt (tournament mode: J and K both continue). */
@@ -75,7 +75,9 @@ export class HUD {
   private build(): void {
     const [home, away] = this.match.teams;
     const seats = this.match.seats;
-    const twoP = seats[0] !== null && seats[1] !== null;
+    const filled: number[] = [];
+    for (let s = 0; s < SEAT_SLOTS; s++) if (seats[s]) filled.push(s);
+    const twoP = filled.length > 1;
     const dev = (i: number): string => {
       const kind = seats[i]?.kind;
       return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'REMOTE' : 'KEYBOARD';
@@ -95,8 +97,12 @@ export class HUD {
       <div class="ticker"></div>
       <div class="power-wrap p1"><div class="power-fill"></div></div>
       <div class="power-wrap p2"><div class="power-fill"></div></div>
+      <div class="power-wrap p3"><div class="power-fill"></div></div>
+      <div class="power-wrap p4"><div class="power-fill"></div></div>
       <div class="nameplate np1"></div>
       <div class="nameplate np2"></div>
+      <div class="nameplate np3"></div>
+      <div class="nameplate np4"></div>
       <div class="goal-banner">GOAL!</div>
       <div class="card-flash"></div>
       <div class="reticle"></div>
@@ -109,13 +115,13 @@ export class HUD {
       <div class="wipe"></div>
     `;
     this.controlsAttack = twoP
-      ? `P1 ${dev(0)} · P2 ${dev(1)} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
+      ? `${filled.map((i) => `P${i + 1} ${dev(i)}`).join(' · ')} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
       : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · REPLAY R · PAUSE ESC';
-    // 2P shares one card, so it keeps the merged line; 1P swaps to a
-    // defensive cheat-sheet whenever the other side has the ball
+    // a shared couch shares one card, so it keeps the merged line; 1P swaps
+    // to a defensive cheat-sheet whenever the other side has the ball
     this.controlsDefense = twoP
       ? '' : 'DEFENDING — SWITCH SPACE · CHASE hold J · SLIDE L · SPRINT SHIFT · REPLAY R · PAUSE ESC';
-    if (!twoP) this.soloSeat = seats[0] ? 0 : seats[1] ? 1 : -1;
+    if (!twoP) this.soloSeat = filled.length ? slotTeam(filled[0]) : -1;
     this.bugScore = this.root.querySelector('.score')!;
     this.bugClock = this.root.querySelector('.clock')!;
     this.ticker = this.root.querySelector('.ticker')!;
@@ -414,13 +420,14 @@ export class HUD {
     const inPens = m.phase === 'shootout' || m.phase === 'penalty';
     this.bugClock.textContent = m.phase === 'shootout' ? 'PENS' : `${m.displayMinute()}'`;
 
-    // shot power bars, one per seat (penalties charge through the same bar)
-    for (let i = 0; i < 2; i++) {
+    // shot power bars, one per seat slot (penalties charge through the same bar)
+    for (let i = 0; i < SEAT_SLOTS; i++) {
       const seat = m.seats[i];
       let frac = -1;
       if (seat) {
         const pen = m.penalty;
-        if (inPens && pen && pen.kickingTeam === i && pen.phase === 'aim' && pen.charging) {
+        // the spot kick belongs to the side's on-ball human, not his partner
+        if (inPens && pen && m.primarySlot(pen.kickingTeam) === i && pen.phase === 'aim' && pen.charging) {
           frac = Math.min(pen.chargeT / 0.9, 1); // aim-phase hold only
         } else if (!inPens && seat.isHeld('shoot') && m.ball.owner === m.controlled[i]) {
           frac = Math.min(seat.heldDuration('shoot') / SHOT_MAX_HOLD, 1);
@@ -432,7 +439,7 @@ export class HUD {
 
     // nameplates over each controlled player
     const inAction = m.phase === 'play' || m.phase === 'restart' || m.phase === 'kickoff';
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < SEAT_SLOTS; i++) {
       const ctrl = m.controlled[i];
       const np = this.nameplates[i];
       const seat = m.seats[i];
@@ -502,7 +509,7 @@ export class HUD {
     const active = pen && (m.phase === 'penalty' || m.phase === 'shootout');
 
     // reticle: only for a human taker while aiming; fades with difficulty (§6.5)
-    const showReticle = active && pen!.phase === 'aim' && m.seats[pen!.kickingTeam] !== null;
+    const showReticle = active && pen!.phase === 'aim' && m.primarySeat(pen!.kickingTeam) !== null;
     if (showReticle) {
       const gx = HALF_L * pen!.goalSide;
       const aimY = pen!.aimX * (GOAL_HALF_W - 0.25);
@@ -518,8 +525,8 @@ export class HUD {
 
     // hint line
     if (active && pen!.phase === 'aim') {
-      const takerHuman = m.seats[pen!.kickingTeam] !== null;
-      const keeperHuman = m.seats[1 - pen!.kickingTeam] !== null;
+      const takerHuman = m.primarySeat(pen!.kickingTeam) !== null;
+      const keeperHuman = m.primarySeat(1 - pen!.kickingTeam) !== null;
       this.penHint.style.display = 'block';
       this.penHint.textContent = takerHuman && keeperHuman
         ? 'TAKER: AIM ◀ ▶, HOLD SHOOT · KEEPER: PICK A SIDE AS THEY STRIKE'

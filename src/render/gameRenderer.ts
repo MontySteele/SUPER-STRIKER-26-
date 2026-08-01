@@ -19,6 +19,9 @@ interface Snap {
   x: number; y: number; facing: number; speed: number;
 }
 
+/** Switch-indicator colors by seat slot: P1, P2, P3, P4 (§5.4.6). */
+export const SEAT_COLORS = [0xffce4a, 0xdde4f0, 0xff8c2e, 0x5ec8ff];
+
 const REPLAY_SECONDS = 6;
 const REPLAY_FPS = 30;
 
@@ -50,9 +53,9 @@ export class GameRenderer {
   cam: CameraDirector;
   playerMeshes: PlayerMesh[] = [];
   ballMesh: BallMesh;
-  switchArrows: [THREE.Mesh, THREE.Mesh];
-  controlRings: [THREE.Mesh, THREE.Mesh];
-  private ringPulse = [0, 0];
+  switchArrows: THREE.Mesh[];
+  controlRings: THREE.Mesh[];
+  private ringPulse = [0, 0, 0, 0];
 
   // interpolation snapshots
   private prevSnaps: Snap[] = [];
@@ -110,8 +113,10 @@ export class GameRenderer {
     });
     for (const pm of this.playerMeshes) this.sceneMgr.scene.add(pm.root);
 
-    // chunky switch indicators (§5): P1 gold, P2 silver — arrow overhead
-    // plus a glowing ring at the feet so "who am I?" reads at a glance
+    // chunky switch indicators (§5), one per seat slot (§5.4.6): warm for the
+    // home pair (P1 gold, P3 amber), cool for the away pair (P2 silver, P4
+    // ice) — arrow overhead plus a glowing ring at the feet so "who am I?"
+    // reads at a glance even with four of them on the pitch
     const mkArrow = (color: number): THREE.Mesh => {
       const m = new THREE.Mesh(
         new THREE.ConeGeometry(0.36, 0.68, 4),
@@ -121,7 +126,7 @@ export class GameRenderer {
       this.sceneMgr.scene.add(m);
       return m;
     };
-    this.switchArrows = [mkArrow(0xffce4a), mkArrow(0xdde4f0)];
+    this.switchArrows = SEAT_COLORS.map(mkArrow);
     const mkRing = (color: number): THREE.Mesh => {
       const m = new THREE.Mesh(
         new THREE.RingGeometry(0.55, 0.8, 32),
@@ -135,7 +140,7 @@ export class GameRenderer {
       this.sceneMgr.scene.add(m);
       return m;
     };
-    this.controlRings = [mkRing(0xffce4a), mkRing(0xdde4f0)];
+    this.controlRings = SEAT_COLORS.map(mkRing);
 
     // Everything lit is now built, so hand the whole scene to the lighting rig
     // (§7A.4). This is not optional bookkeeping: CSM patches three's global
@@ -208,7 +213,7 @@ export class GameRenderer {
 
   onEvent(e: MatchEvent): void {
     if (e.type === 'switch') {
-      this.ringPulse[e.teamIdx] = 0.3;
+      this.ringPulse[e.slot] = 0.3;
       return;
     }
     if (e.type === 'goal') {
@@ -475,7 +480,7 @@ export class GameRenderer {
     // only — a cone bobbing through the penalty cinematic reads as a glitch)
     const inAction = this.match.phase === 'play' || this.match.phase === 'restart'
       || this.match.phase === 'kickoff';
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < SEAT_COLORS.length; i++) {
       const ctrl = this.match.controlled[i];
       const arrow = this.switchArrows[i];
       const ring = this.controlRings[i];

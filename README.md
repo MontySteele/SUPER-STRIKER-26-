@@ -48,9 +48,10 @@ link. Notes:
   player's machine.
 - There is **no server component at all** any more, so `dist/` on a static
   host is the complete product, remote guests included.
-- 2-player Versus comes in two flavours: couch co-op on the same machine
-  (keyboard + gamepad, or two gamepads), or **VERSUS — REMOTE** with a friend
-  on their own laptop (below).
+- Versus comes in two flavours: couch co-op on the same machine (keyboard +
+  gamepad, or two gamepads — four devices unlocks a **2v2** option), or
+  **VERSUS — REMOTE** with friends on their own laptops (below). Remote and
+  local players mix freely: any of the four seats takes either.
 
 ## Remote guest controllers
 
@@ -58,7 +59,20 @@ Pick **VERSUS — REMOTE** on the main menu, choose both teams, and you land on
 an **INVITE PLAYERS** lobby: a four-letter room code in large type, the join
 link, a QR code, and a live list of everyone who has connected. Your friend
 opens `join.html?c=CODE`, types a name, and their laptop becomes a controller.
-Give them P1 or P2, kick off.
+Give them a seat and kick off.
+
+There are four seats: **P1/P2** are the two sides' on-ball players, **P3/P4**
+their partners. Fill two and it's a 1v1; fill all four and it's a 2v2. Every
+seat takes a local keyboard, a local pad, or a remote guest — the sim cannot
+tell them apart.
+
+In a 2v2 the two humans on a side never end up steering the same player. One
+of them holds the man on the ball (auto-switching on turnovers, plus the
+switch button as always); the other is handed the best-placed teammate for
+what's happening — the covering defender when you're chasing the ball, an
+advanced outlet about 14m off it when you're not — and keeps him until
+somebody is clearly better placed. Switch onto your mate's man and the two of
+you simply swap shirts.
 
 The important part: **the simulation never leaves your machine.** Their page
 draws no pitch, no ball, no scoreline — it is a controller and nothing else,
@@ -234,6 +248,7 @@ your back.
 ```bash
 npx tsx scripts/simTest.ts   # headless sims: league, knockouts+shootouts, tournament
 npx tsx scripts/netTest.ts   # remote-guest wire protocol, edge synthesis, seat swap
+npx tsx scripts/versusTest.ts # 2v2 seat slots, paired-human switch arbitration
 npx tsc --noEmit             # typecheck
 ```
 

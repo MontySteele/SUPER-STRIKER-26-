@@ -30,6 +30,8 @@ export type MenuResult =
       timeOfDay: TimeOfDay; stadium: StadiumSize;
       /** golden goal only: 2P couch play is opt-in via the PLAYERS setting */
       golden2p?: boolean;
+      /** versus only: 2v2 couch play, offered once four devices are seated */
+      versus2v2?: boolean;
     }
   | { kind: 'tournament-new'; teamId: string; difficulty: DifficultyName; halfLengthSec: number }
   | { kind: 'tournament-continue' }
@@ -56,6 +58,7 @@ export class Menu {
   private todIdx = 0;
   private stadiumIdx = 0;
   private golden2p = false;
+  private versus2v2 = false;
   /** START TOURNAMENT over an existing save asks for a second press. */
   private overwriteArmed = false;
   private keyHandler: (e: KeyboardEvent) => void;
@@ -96,13 +99,15 @@ export class Menu {
     rows.push(
       { label: 'KICK-OFF', sub: '1P vs CPU · pick any two teams', id: 'kickoff' },
       {
-        label: 'VERSUS', sub: this.padCount() > 0
-          ? '2P couch play · keyboard vs gamepad'
-          : '2P couch play · CONNECT A GAMEPAD', id: 'versus',
+        label: 'VERSUS', sub: this.padCount() === 0
+          ? '2P couch play · CONNECT A GAMEPAD'
+          : this.canCouch2v2()
+            ? '2P or 2v2 couch play · everyone on the sofa'
+            : '2P couch play · keyboard vs gamepad', id: 'versus',
         disabled: this.padCount() === 0,
       },
       {
-        label: 'VERSUS — REMOTE', sub: 'Invite a friend by room code · they play from their own laptop',
+        label: 'VERSUS — REMOTE', sub: 'Invite friends by room code · 1v1 or 2v2 from their own laptops',
         id: 'online',
       },
       { label: 'GOLDEN GOAL', sub: 'Party mode · no clock · next goal wins', id: 'golden' },
@@ -235,7 +240,7 @@ export class Menu {
       }
       return rows;
     }
-    return [
+    const rows: [string, string][] = [
       ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
       ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
       ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
@@ -245,13 +250,27 @@ export class Menu {
       music,
       controls,
     ];
+    // 2v2 on one couch needs four sticks between everyone, so it only shows
+    // up once there are four — otherwise VERSUS is the 1v1 it always was
+    if (this.mode === 'versus' && this.canCouch2v2()) {
+      rows.unshift(['PLAYERS', this.versus2v2 ? '2v2 — FOUR PLAYERS' : '1v1 — TWO PLAYERS']);
+    }
+    return rows;
+  }
+
+  /** Keyboard plus the pads: four humans need four devices between them. */
+  private canCouch2v2(): boolean {
+    return this.padCount() + 1 >= 4;
   }
 
   private cycleSetting(row: number, d: number): void {
     this.overwriteArmed = false;
     const labels = this.settingsRows().map((r) => r[0]);
     const key = labels[row];
-    if (key === 'PLAYERS' && this.padCount() > 0) this.golden2p = !this.golden2p;
+    if (key === 'PLAYERS' && this.mode === 'golden' && this.padCount() > 0) {
+      this.golden2p = !this.golden2p;
+    }
+    if (key === 'PLAYERS' && this.mode === 'versus') this.versus2v2 = !this.versus2v2;
     if (key === 'MATCH LENGTH') this.halfIdx = (this.halfIdx + d + HALF_OPTIONS.length) % HALF_OPTIONS.length;
     if (key === 'DIFFICULTY') this.diffIdx = (this.diffIdx + d + DIFF_OPTIONS.length) % DIFF_OPTIONS.length;
     if (key === 'KICK-OFF') this.todIdx = (this.todIdx + d + TOD_OPTIONS.length) % TOD_OPTIONS.length;
@@ -333,6 +352,7 @@ export class Menu {
       timeOfDay: TOD_OPTIONS[this.todIdx],
       stadium: STADIUM_OPTIONS[this.stadiumIdx][1],
       golden2p: this.mode === 'golden' ? this.golden2p && this.padCount() > 0 : undefined,
+      versus2v2: this.mode === 'versus' ? this.versus2v2 && this.canCouch2v2() : undefined,
     });
   }
 

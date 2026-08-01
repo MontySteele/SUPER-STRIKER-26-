@@ -14,11 +14,12 @@ import {
   type SlotBrief,
 } from './protocol';
 import { seatHealth, type SeatHealth } from './health';
+import { SEAT_SLOTS } from '../sim/match';
 
 export type HostStatus = 'idle' | 'starting' | 'ready' | 'error';
 
-/** More than a 1v1 needs, but 2v2 will want the headroom. */
-const MAX_GUESTS = 4;
+/** A full 2v2 of remote guests, and no seat left over to fight over. */
+const MAX_GUESTS = SEAT_SLOTS;
 
 export interface Guest {
   /** InputHub remote index — stable across rejoins with the same token. */
@@ -26,7 +27,7 @@ export interface Guest {
   readonly token: string;
   name: string;
   input: GuestInputType;
-  /** 0 = P1, 1 = P2, null = watching the lobby. Reserved across a dropout. */
+  /** Seat slot (0 = P1 … 3 = P4), null = watching. Reserved across a dropout. */
   slot: number | null;
   /** RTT the guest measured on its own input channel, ms (-1 = unknown). */
   rttMs: number;
@@ -47,8 +48,8 @@ interface Entry {
 export class GuestHost {
   /** Regenerated every time the lobby opens; dies with close(). */
   readonly code = newRoomCode();
-  /** 1v1 today. Bump for 2v2 and the lobby follows. */
-  readonly slotCount = 2;
+  /** Seat slots the lobby offers (§5.4.6): two a side, partners optional. */
+  readonly slotCount = SEAT_SLOTS;
 
   status: HostStatus = 'idle';
   error: string | null = null;

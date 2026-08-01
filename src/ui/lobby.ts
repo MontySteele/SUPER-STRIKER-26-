@@ -1,10 +1,14 @@
-// INVITE PLAYERS lobby (§5.4.2): the host's side of a remote 1v1. Shows the
-// join URL, the room code in large type, a corner QR, and a live list of
-// guests with their input type and connection pip — then seats everyone and
-// kicks off. Navigated exactly like the rest of the menus (WASD + J / K).
+// INVITE PLAYERS lobby (§5.4.2/§5.4.6): the host's side of a remote match, 1v1
+// or 2v2. Shows the join URL, the room code in large type, a corner QR, and a
+// live list of guests with their input type and connection pip — then seats
+// everyone and kicks off. Four slots, numbered the way the sim numbers them:
+// P1/P2 are the two sides' on-ball players, P3/P4 their partners. Fill two and
+// it's a 1v1; fill four and it's a 2v2. Navigated exactly like the rest of the
+// menus (WASD + J / K).
 
 import type { TeamData } from '../data/types';
 import type { GuestHost } from '../net/hostLink';
+import { slotRole, slotTeam } from '../sim/match';
 import { esc } from './escape';
 import { drawQr } from './qr';
 
@@ -14,7 +18,8 @@ export type SlotDevice =
   | { kind: 'pad'; index: number }
   | { kind: 'guest'; id: number };
 
-export type SlotAssignment = [SlotDevice | null, SlotDevice | null];
+/** By seat slot: [team0, team1, team0 partner, team1 partner]. */
+export type SlotAssignment = (SlotDevice | null)[];
 
 interface Candidate {
   device: SlotDevice;
@@ -28,8 +33,10 @@ export class Lobby {
   shirts: [string, string] = ['#ffffff', '#ffffff'];
 
   private root: HTMLElement;
-  private focus = 2; // START row: the common case is "everyone's here, go"
-  private slots: SlotAssignment = [{ kind: 'keyboard' }, null];
+  /** The slot rows, then the START row at the end. */
+  private readonly startRow: number;
+  private focus: number;
+  private slots: SlotAssignment;
   private keyHandler: (e: KeyboardEvent) => void;
   private padHandler: () => void;
   private pollId: number;
@@ -42,6 +49,10 @@ export class Lobby {
     private onCancel: () => void,
   ) {
     this.root = document.getElementById('ui-root')!;
+    this.slots = new Array<SlotDevice | null>(host.slotCount).fill(null);
+    this.slots[0] = { kind: 'keyboard' };
+    this.startRow = host.slotCount;
+    this.focus = this.startRow; // the common case is "everyone's here, go"
     this.keyHandler = (e) => this.onKey(e);
     window.addEventListener('keydown', this.keyHandler);
     this.padHandler = () => this.refresh();
@@ -67,9 +78,10 @@ export class Lobby {
 
   /** Kit colors + team name the guest's slot banner is painted in. */
   private briefFor(slot: number): { teamName: string; teamCode: string; shirt: string; text: string } | null {
-    const team = this.teams[slot];
+    const side = slotTeam(slot);
+    const team = this.teams[side];
     if (!team) return null;
-    const shirt = this.shirts[slot];
+    const shirt = this.shirts[side];
     return {
       teamName: team.name,
       teamCode: team.code,
@@ -81,9 +93,9 @@ export class Lobby {
   // ------------------------------------------------------------- assignment
 
   private candidates(slot: number): Candidate[] {
-    const other = this.slots[1 - slot];
-    // one device, one slot — the other seat's pick never shows up in this ring
-    const taken = (d: SlotDevice): boolean => !!other && sameDevice(other, d);
+    // one device, one slot — another seat's pick never shows up in this ring
+    const taken = (d: SlotDevice): boolean =>
+      this.slots.some((o, i) => i !== slot && !!o && sameDevice(o, d));
 
     const out: Candidate[] = [];
     const push = (device: SlotDevice, label: string, warn = false): void => {
@@ -143,8 +155,15 @@ export class Lobby {
     return changed;
   }
 
+  /** One human a side is the minimum; the partner slots are optional. */
   private canStart(): boolean {
     return this.slots[0] !== null && this.slots[1] !== null;
+  }
+
+  /** What the START row promises: 1v1, 2v1, 2v2. */
+  private lineup(): string {
+    const per = [0, 1].map((t) => this.slots.filter((d, i) => d && slotTeam(i) === t).length);
+    return per[0] + 'v' + per[1];
   }
 
   // ------------------------------------------------------------------ input
@@ -160,12 +179,12 @@ export class Lobby {
     const right = code === 'KeyD' || code === 'ArrowRight';
 
     if (up) { this.focus = Math.max(0, this.focus - 1); this.render(); }
-    else if (down) { this.focus = Math.min(2, this.focus + 1); this.render(); }
-    else if ((left || right) && this.focus < 2) {
+    else if (down) { this.focus = Math.min(this.startRow, this.focus + 1); this.render(); }
+    else if ((left || right) && this.focus < this.startRow) {
       this.cycle(this.focus, left ? -1 : 1);
       this.render();
     } else if (confirm) {
-      if (this.focus < 2) { this.cycle(this.focus, 1); this.render(); }
+      if (this.focus < this.startRow) { this.cycle(this.focus, 1); this.render(); }
       else this.start();
     } else if (back) {
       this.destroy();
@@ -216,13 +235,18 @@ export class Lobby {
       }).join('');
 
     const slotRow = (i: number): string => {
-      const team = this.teams[i];
+      const side = slotTeam(i);
+      const team = this.teams[side];
       const picked = this.slots[i];
-      const warn = !picked
-        || !this.candidates(i).some((c) => sameDevice(c.device, picked) && !c.warn);
+      // an empty PARTNER slot is a choice, not a problem — only the two
+      // on-ball slots get nagged about
+      const seated = !!picked
+        && this.candidates(i).some((c) => sameDevice(c.device, picked) && !c.warn);
+      const warn = slotRole(i) === 0 ? !seated : (!!picked && !seated);
+      const role = slotRole(i) === 0 ? '' : ' <small class="slot-role">2ND</small>';
       return `<div class="setting-row${this.focus === i ? ' focus' : ''}" data-row="${i}">
-          <span>PLAYER ${i + 1}
-            <small class="slot-sub"><span class="swatch-dot" style="background:${esc(this.shirts[i])}"></span>${esc(team.name)}</small>
+          <span>PLAYER ${i + 1}${role}
+            <small class="slot-sub"><span class="swatch-dot" style="background:${esc(this.shirts[side])}"></span>${esc(team.name)}</small>
           </span>
           <span class="value${warn ? ' warn' : ''}">◀ ${esc(this.labelFor(i))} ▶</span>
         </div>`;
@@ -242,10 +266,9 @@ export class Lobby {
         </div>
         <div class="guest-list">${guestRows}</div>
         <div class="settings-list">
-          ${slotRow(0)}
-          ${slotRow(1)}
-          <div class="setting-row go${this.focus === 2 ? ' focus' : ''}${this.canStart() ? '' : ' disabled'}" data-row="2">
-            ${this.canStart() ? 'KICK OFF!' : 'FILL BOTH SLOTS TO KICK OFF'}
+          ${this.slots.map((_, i) => slotRow(i)).join('')}
+          <div class="setting-row go${this.focus === this.startRow ? ' focus' : ''}${this.canStart() ? '' : ' disabled'}" data-row="${this.startRow}">
+            ${this.canStart() ? `KICK OFF! — ${this.lineup()}` : 'FILL PLAYER 1 AND PLAYER 2 TO KICK OFF'}
           </div>
         </div>
         <div class="controls-card">W/S SELECT · A/D CHANGE · J CONFIRM · K CANCEL</div>
@@ -260,7 +283,7 @@ export class Lobby {
     this.root.querySelectorAll('.setting-row').forEach((el) => {
       el.addEventListener('click', () => {
         const row = Number((el as HTMLElement).dataset.row);
-        if (row === 2) this.start();
+        if (row === this.startRow) this.start();
         else { this.focus = row; this.cycle(row, 1); this.render(); }
       });
     });
