@@ -13,7 +13,8 @@ import * as THREE from 'three';
 import { findTeam, pickStartingXI } from '../data/loader';
 import { applyShaderPatches } from '../render/materials';
 import { bakeSkyEnvironment } from '../render/sky';
-import { PlayerMesh, resolveKits } from '../render/playerMesh';
+import { PlayerMesh, PlayerRig, resolveKits } from '../render/playerMesh';
+import { TextureLab } from '../render/TextureLab';
 import { SIM_DT } from '../sim/constants';
 import { installDeterministicEnv } from './determinism';
 
@@ -103,8 +104,13 @@ const [outfieldKit, , gkKit] = resolveKits(team.kit, NEUTRAL_OPPONENT);
 const xi = pickStartingXI(team);
 const slot = gkMode ? 0 : Math.min(Math.max(Number(params.get('slot') ?? xi.length - 1), 0), xi.length - 1);
 const player = xi[slot];
-const mesh = new PlayerMesh(player, gkMode ? gkKit : outfieldKit);
+// the studio builds its own lab and rig: the match scene's are per-match, and
+// this page deliberately has no match. Same bakery, same shared body.
+const lab = new TextureLab();
+const rig = new PlayerRig(lab, 'day');
+const mesh = new PlayerMesh(player, gkMode ? gkKit : outfieldKit, rig);
 scene.add(mesh.root);
+lab.report();
 
 // A neutral studio environment — flat grey top to bottom, no sun — so the
 // physical materials have something to reflect without tinting the kit under

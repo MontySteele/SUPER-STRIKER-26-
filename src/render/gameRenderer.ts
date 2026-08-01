@@ -9,7 +9,8 @@ import type { PlayerEntity, ActionAnim } from '../sim/player';
 import { SceneManager, type TimeOfDay } from './scene';
 import { buildPitch } from './pitch';
 import { Stadium, type StadiumSize } from './stadium';
-import { PlayerMesh, resolveKits } from './playerMesh';
+import { PlayerMesh, PlayerRig, resolveKits } from './playerMesh';
+import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
 import { CameraDirector, type CamMode } from './camera';
 import { HALF_L } from '../sim/constants';
@@ -44,6 +45,8 @@ const GOAL_PASSES: ReplayPass[] = [
 export class GameRenderer {
   sceneMgr: SceneManager;
   stadium: Stadium;
+  lab: TextureLab;
+  rig: PlayerRig;
   cam: CameraDirector;
   playerMeshes: PlayerMesh[] = [];
   ballMesh: BallMesh;
@@ -84,19 +87,26 @@ export class GameRenderer {
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
     this.sceneMgr = new SceneManager(canvas, timeOfDay);
-    buildPitch(this.sceneMgr.scene);
-    this.stadium = new Stadium(this.sceneMgr.scene, timeOfDay === 'night', stadiumSize,
-      !this.sceneMgr.profile.retro);
+
+    // §7A.3: one lab per match, seeded, disposed with the match. Everything
+    // textured below draws its maps from it, so the whole scene is a pure
+    // function of LAB_SEED and nothing bakes twice.
+    this.lab = new TextureLab();
+    const [homeKit, awayKit, gkA, gkB] = resolveKits(match.teams[0].data.kit, match.teams[1].data.kit);
+    this.shirts = [homeKit.shirt, awayKit.shirt];
+
+    buildPitch(this.sceneMgr.scene, this.lab, this.sceneMgr.profile);
+    this.stadium = new Stadium(this.sceneMgr.scene, this.lab, timeOfDay, stadiumSize,
+      !this.sceneMgr.profile.retro, this.sceneMgr.profile, homeKit.shirt);
     this.cam = new CameraDirector(this.sceneMgr.camera);
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
-    const [homeKit, awayKit, gkA, gkB] = resolveKits(match.teams[0].data.kit, match.teams[1].data.kit);
-    this.shirts = [homeKit.shirt, awayKit.shirt];
+    this.rig = new PlayerRig(this.lab, timeOfDay);
     match.teams[0].players.forEach((p) => {
-      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit));
+      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit, this.rig));
     });
     match.teams[1].players.forEach((p) => {
-      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkB : awayKit));
+      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkB : awayKit, this.rig));
     });
     for (const pm of this.playerMeshes) this.sceneMgr.scene.add(pm.root);
 
@@ -134,10 +144,41 @@ export class GameRenderer {
     // after this point (confetti, the ball trail, the star rings) is
     // unlit/basic and deliberately stays out of it.
     this.sceneMgr.atmos.register(this.sceneMgr.scene);
+    // ...but the >60m impostors are unlit billboards, and their material is
+    // only minted when a player first crosses the threshold. Registering them
+    // would be a no-op (registerMaterial ignores anything unlit) — the reason
+    // they're safe is that they never enter the CSM branch at all.
+
+    // §7A.3 budget report, plus the per-tier triangle arithmetic that keeps
+    // twenty-two players inside the 150k scene ceiling
+    const b = this.rig.budget();
+    console.info(`player LOD: full ${b.full} tris / decimated ${b.lod} / impostor ${b.impostor}`
+      + ` — 22 players worst case ${b.full * 22} tris`);
+    this.lab.report();
 
     this.snapshot();
     this.snapshot();
     this.cam.jumpTo(0, 30, 60, 0, 0, 0);
+  }
+
+  /**
+   * Pick every player's detail tier against the camera that is about to draw
+   * (§7A.2). Called from both draw paths — the animated loop and the capture
+   * harness's pinned still — so the two never disagree about what is on
+   * screen.
+   */
+  private updateLOD(): void {
+    const cam = this.sceneMgr.camera;
+    for (const pm of this.playerMeshes) pm.updateLOD(cam);
+  }
+
+  /** How the 22 players split across the tiers right now. The headless runner
+   *  prints this next to the triangle count, because "why did that shot get
+   *  cheaper" is otherwise a guess. */
+  lodTiers(): [number, number, number] {
+    const t: [number, number, number] = [0, 0, 0];
+    for (const pm of this.playerMeshes) t[pm.lodTier]++;
+    return t;
   }
 
   /** Called after every fixed sim tick. */
@@ -492,6 +533,7 @@ export class GameRenderer {
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
     if (!this.skipDraw) {
+      this.updateLOD();
       // §7A.7: frame pressure buys back pixels, never features. Only the
       // animated path feeds this — advanceNoDraw and renderStill must stay
       // bit-identical run to run for the capture contract.
@@ -536,6 +578,10 @@ export class GameRenderer {
     }
     this.cam.jumpTo(pose.pos[0], pose.pos[1], pose.pos[2],
       pose.look[0], pose.look[1], pose.look[2]);
+    // the pinned pose is usually nowhere near the director's, so the tiers
+    // have to be re-picked before the counters are read or the still reports
+    // triangles for a camera that isn't drawing it
+    this.updateLOD();
 
     // one composer.render() is many gl draws — autoReset would leave us
     // reading only the last pass
@@ -553,6 +599,12 @@ export class GameRenderer {
   dispose(): void {
     this.removeConfetti();
     this.clearTrail();
+    // the scene traversal in SceneManager frees whatever is attached to the
+    // scene; the rig's shared geometries and the lab's texture caches are held
+    // outside it and have to be freed by hand or a tournament strands them
+    for (const pm of this.playerMeshes) pm.dispose();
+    this.rig.dispose();
+    this.lab.dispose();
     this.sceneMgr.dispose();
   }
 

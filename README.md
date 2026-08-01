@@ -247,6 +247,8 @@ same shot name = the same pixels, so a graphics change is a PNG diff.
 npm run capture                 # every shot → captures/ + captures/stats.json
 npm run capture -- --list       # the shot list and what each one is for
 npm run capture -- --shots midfield_wide --out /tmp/after
+npm run capture -- --shots midfield_wide --bake   # + bake budget & LOD tiers
+npm run capture -- --shots midfield_wide --quality retro   # ad-hoc, not a baseline
 npm run shoot-player -- --team arg   # four studio angles of one player model
 ```
 
@@ -255,6 +257,16 @@ count or a pose invalidates every baseline taken before it. The game itself
 enters capture mode via `index.html?capture=<shot>` (menus, attract mode and
 audio are bypassed), and `viewer.html?team=bra&angle=side` is the standalone
 character viewer — open it with no `angle` for a live turntable.
+
+### Textures (§7A.3)
+
+Nothing in the match scene is a shipped asset. `src/render/TextureLab.ts` bakes
+every map at load from one **seeded** noise field — grass albedo and its
+matching Sobel-derived normal, the low-frequency variation that kills visible
+tiling, procedural goalmouth wear, kit atlases composited from the two hex
+colours in `teams.json`, crowd cards, ad boards, flags. Seeded because a pitch
+that differs between boots is not art direction, it is an unreproducible
+capture. The bake reports a per-map cost against a 2s budget (`--bake`).
 
 Architecture: `src/sim` (fixed 60Hz deterministic simulation, tournament
 engine, penalty controller), `src/render` (Three.js, interpolated),

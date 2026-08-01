@@ -145,7 +145,15 @@ export class SceneManager {
     this.atmos.dispose();
     this.scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
-      if (mesh.geometry) mesh.geometry.dispose();
+      // InstancedMesh (§7A.5's crowd) holds instanceMatrix / instanceColor
+      // OUTSIDE its geometry; geometry.dispose() frees the per-vertex buffers
+      // and the per-instance ones would strand. One rake is 500 instances, and
+      // a tournament builds a fresh bowl per match.
+      const inst = obj as THREE.InstancedMesh;
+      if (inst.isInstancedMesh) inst.dispose();
+      // Sprite geometry is a module-level singleton inside three, shared by
+      // every sprite ever made — not ours to free.
+      if (mesh.geometry && !(obj as THREE.Sprite).isSprite) mesh.geometry.dispose();
       const mats = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
       for (const m of mats) {
         for (const v of Object.values(m)) {

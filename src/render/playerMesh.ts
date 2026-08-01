@@ -1,14 +1,40 @@
-// Stylized PS3-era players (§7.1): rigid-limb hierarchy (~confidently game-y),
-// kit colors + printed back numbers from roster data, code-driven locomotion
-// with action overlays. Proportions ~5% broad for couch readability.
+// Stylized PS3-era players (§7.1/§7A.2): one shared body construction worn by
+// every player in the match, per-team appearance as a texture swap onto the
+// TextureLab kit atlas, per-player skin/hair seeded off the name, and
+// code-driven locomotion with action overlays.
+//
+// The pipeline, and why it is shaped this way:
+//
+//   PlayerRig owns the geometry (playerBody.ts) and the materials. Twenty-two
+//   players share ten geometries per detail level and four kit atlases; the
+//   only thing minted per player is a 256x160 back-number texture and two
+//   colours. That is what "per-team appearance = texture swap only" buys.
+//
+//   LOD is distance-driven off the camera (§7A.2): full detail inside 30m,
+//   a decimated set out to 60m, a single kit-coloured billboard beyond. The
+//   scene draws twenty-two players and the triangle budget is 150k, so the
+//   third tier is not an optimisation, it is the reason the budget holds.
+//
+//   playerMesh.update() is UNCHANGED. Every LOD tier animates through the same
+//   five Groups, so nothing above this file knows the tiers exist.
 
 import * as THREE from 'three';
 import type { PlayerData } from '../data/types';
 import type { ActionAnim } from '../sim/player';
 import { queueBroadcastSkin } from './materials';
+import { TextureLab, luminance } from './TextureLab';
+import {
+  buildParts, disposeParts, mirrorLimbs, triangleCount,
+  type BodyParts, type Detail, type LimbSet,
+} from './playerBody';
+import type { TimeOfDay } from './scene';
 
 const SKIN_TONES = [0x8d5524, 0xc68642, 0xe0ac69, 0xf1c27d, 0xffdbac, 0x5c3a21];
 const HAIR_COLORS = [0x151210, 0x2e2018, 0x4a3320, 0x7a5c30, 0xb8963e, 0x101010];
+
+/** §7A.2 LOD bands, in metres from the camera. */
+export const LOD_FULL_M = 30;
+export const LOD_IMPOSTOR_M = 60;
 
 function hashStr(s: string): number {
   let h = 2166136261;
@@ -26,35 +52,105 @@ export interface KitSpec {
   isGK: boolean;
 }
 
-function makeBackNumberTexture(kit: string, num: number, name: string): THREE.CanvasTexture {
-  const c = document.createElement('canvas');
-  c.width = 256; c.height = 256;
-  const ctx = c.getContext('2d')!;
-  ctx.fillStyle = kit;
-  ctx.fillRect(0, 0, 256, 256);
-  // subtle fabric shading
-  const g = ctx.createLinearGradient(0, 0, 0, 256);
-  g.addColorStop(0, 'rgba(255,255,255,0.10)');
-  g.addColorStop(1, 'rgba(0,0,0,0.14)');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, 256, 256);
-  const lum = luminance(kit);
-  ctx.fillStyle = lum > 0.5 ? '#111318' : '#f2f4f8';
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 36px Helvetica, Arial, sans-serif';
-  const short = name.split(' ').pop()?.toUpperCase() ?? '';
-  ctx.fillText(short.length > 11 ? short.slice(0, 11) : short, 128, 62);
-  ctx.font = 'bold 150px Helvetica, Arial, sans-serif';
-  ctx.fillText(String(num), 128, 205);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+/** The impostor is unlit (a lit billboard whose normal faces the camera goes
+ *  black the moment the sun is behind it), so the time of day is baked into
+ *  its tint instead. These are the levels a lit player lands at. */
+const IMPOSTOR_TINT: Record<TimeOfDay, number> = {
+  day: 0xdde4f2,
+  sunset: 0xc9a88c,
+  night: 0x8494ae,
+};
+
+/**
+ * Everything twenty-two players share. Built once per match, disposed with the
+ * match — never module-level, because SceneManager.dispose() frees whatever is
+ * hanging off the scene and a cached geometry would come back dead.
+ */
+export class PlayerRig {
+  readonly parts: Record<Detail, BodyParts>;
+  readonly limbsL: Record<Detail, LimbSet>;
+  private kitMats = new Map<string, THREE.MeshStandardMaterial>();
+  private impostorMats = new Map<string, THREE.MeshBasicMaterial>();
+  readonly bootMat: THREE.MeshStandardMaterial;
+  readonly eyeMat: THREE.MeshStandardMaterial;
+  private impostorGeo: THREE.PlaneGeometry;
+
+  constructor(readonly lab: TextureLab, private tod: TimeOfDay) {
+    this.parts = { full: buildParts('full'), lod: buildParts('lod') };
+    this.limbsL = { full: mirrorLimbs(this.parts.full), lod: mirrorLimbs(this.parts.lod) };
+    this.bootMat = new THREE.MeshStandardMaterial({
+      color: 0x16181c, roughness: 0.3, metalness: 0.08, vertexColors: true,
+    });
+    this.eyeMat = new THREE.MeshStandardMaterial({
+      color: 0x14161a, roughness: 0.25, vertexColors: true,
+    });
+    this.impostorGeo = new THREE.PlaneGeometry(1.05, 1.9);
+  }
+
+  /** Shared per KIT, not per player — this is the texture-swap contract. */
+  kitMaterial(kit: KitSpec): THREE.MeshStandardMaterial {
+    const key = `${kit.shirt}|${kit.shorts}|${kit.socks}`;
+    let m = this.kitMats.get(key);
+    if (!m) {
+      m = new THREE.MeshStandardMaterial({
+        map: this.lab.kitAtlas(kit), roughness: 0.72, vertexColors: true,
+      });
+      queueBroadcastSkin(m, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
+      this.kitMats.set(key, m);
+    }
+    return m;
+  }
+
+  impostorMaterial(kit: KitSpec): THREE.MeshBasicMaterial {
+    const key = `${kit.shirt}|${kit.shorts}|${kit.socks}`;
+    let m = this.impostorMats.get(key);
+    if (!m) {
+      m = new THREE.MeshBasicMaterial({
+        map: this.lab.impostor(kit),
+        color: IMPOSTOR_TINT[this.tod],
+        transparent: true,
+        alphaTest: 0.42,
+        side: THREE.DoubleSide,
+      });
+      this.impostorMats.set(key, m);
+    }
+    return m;
+  }
+
+  newImpostor(kit: KitSpec): THREE.Mesh {
+    return new THREE.Mesh(this.impostorGeo, this.impostorMaterial(kit));
+  }
+
+  /** Triangles per player at each tier — the §7A.9 budget arithmetic. */
+  budget(): { full: number; lod: number; impostor: number } {
+    return { full: triangleCount(this.parts.full), lod: triangleCount(this.parts.lod), impostor: 2 };
+  }
+
+  dispose(): void {
+    disposeParts(this.parts.full);
+    disposeParts(this.parts.lod);
+    for (const set of [this.limbsL.full, this.limbsL.lod]) {
+      for (const g of Object.values(set)) g.dispose();
+    }
+    for (const m of this.kitMats.values()) m.dispose();
+    for (const m of this.impostorMats.values()) m.dispose();
+    this.kitMats.clear();
+    this.impostorMats.clear();
+    this.bootMat.dispose();
+    this.eyeMat.dispose();
+    this.impostorGeo.dispose();
+  }
 }
 
-function luminance(hex: string): number {
-  const n = parseInt(hex.replace('#', ''), 16);
-  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
-  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+/** One mesh whose geometry swaps between detail levels in place. */
+interface LodMesh {
+  mesh: THREE.Mesh;
+  full: THREE.BufferGeometry;
+  lod: THREE.BufferGeometry;
+  /** dropped entirely below full detail (eyes, the printed number) */
+  nearOnly?: boolean;
+  /** keeps casting into the cascades at the mid tier; small parts don't */
+  bigShadow?: boolean;
 }
 
 export class PlayerMesh {
@@ -68,93 +164,76 @@ export class PlayerMesh {
   private locoPhase = Math.random() * Math.PI * 2;
   private starGlow: THREE.Mesh | null = null;
 
-  constructor(public data: PlayerData, kit: KitSpec) {
+  private lods: LodMesh[] = [];
+  private impostor: THREE.Mesh | null = null;
+  /** 0 = full, 1 = decimated, 2 = billboard */
+  private tier = -1;
+  get lodTier(): number { return this.tier; }
+  private ownMats: THREE.Material[] = [];
+
+  constructor(public data: PlayerData, kit: KitSpec, private rig: PlayerRig) {
     const skin = SKIN_TONES[hashStr(data.name) % SKIN_TONES.length];
     const hairC = HAIR_COLORS[hashStr(data.name + 'h') % HAIR_COLORS.length];
     const bald = hashStr(data.name + 'b') % 9 === 0;
 
-    // Standard, not Phong: only the physical model has an indirect-specular
-    // term, which is what turns scene.environment (§7A.4's PMREM sky) into an
-    // actual sheen on a shirt instead of a flat ambient lift. The later texture
-    // pass inherits roughness/metalness slots as a result.
-    const shirtMat = new THREE.MeshStandardMaterial({ color: kit.shirt, roughness: 0.72 });
-    const shortsMat = new THREE.MeshStandardMaterial({ color: kit.shorts, roughness: 0.72 });
-    const socksMat = new THREE.MeshStandardMaterial({ color: kit.socks, roughness: 0.8 });
-    const skinMat = new THREE.MeshStandardMaterial({ color: skin, roughness: 0.62 });
-    const hairMat = new THREE.MeshStandardMaterial({ color: hairC, roughness: 0.65 });
-    const bootMat = new THREE.MeshStandardMaterial({
-      color: 0x16181c, roughness: 0.3, metalness: 0.08,
+    // The only per-player materials in the game. Standard, not Phong: only the
+    // physical model has an indirect-specular term, which is what turns
+    // scene.environment (§7A.4's PMREM sky) into an actual sheen on a shirt
+    // instead of a flat ambient lift.
+    const skinMat = new THREE.MeshStandardMaterial({
+      color: skin, roughness: 0.62, vertexColors: true,
     });
-
-    // torso — back face carries the printed name/number (box faces are what
-    // make the cheap number decal work, so the torso stays a box)
-    const numberTex = makeBackNumberTexture(kit.shirt, data.num, data.name);
-    const backMat = new THREE.MeshStandardMaterial({ map: numberTex, roughness: 0.72 });
+    const hairMat = new THREE.MeshStandardMaterial({
+      color: hairC, roughness: 0.65, vertexColors: true,
+    });
+    const backMat = new THREE.MeshStandardMaterial({
+      map: rig.lab.backNumber(kit, data), roughness: 0.72, vertexColors: true,
+    });
+    this.ownMats.push(skinMat, hairMat, backMat);
 
     // §7A.4 broadcast skin/fabric: wrapped diffuse + a weak fresnel rim, on the
     // PLAYERS and nowhere else. Skin wraps further and warmer (that is what
     // subsurface scattering looks like from ten metres); cloth barely wraps at
     // all and keeps its own colour.
-    for (const m of [shirtMat, shortsMat, backMat]) {
-      queueBroadcastSkin(m, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
-    }
-    queueBroadcastSkin(socksMat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.06, rimPower: 3.6 });
+    queueBroadcastSkin(backMat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
     queueBroadcastSkin(skinMat, { wrap: 0.42, wrapTint: 0xffbfa0, rim: 0.05, rimPower: 4.0 });
-    const torsoGeo = new THREE.BoxGeometry(0.52, 0.58, 0.3);
-    const torso = new THREE.Mesh(torsoGeo, [shirtMat, shirtMat, shirtMat, shirtMat, shirtMat, backMat]);
-    torso.position.y = 1.24;
-    torso.scale.z = 0.95;
-    torso.castShadow = true;
-    this.body.add(torso);
 
-    // pelvis / shorts
-    const pelvis = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.26, 0.29), shortsMat);
-    pelvis.position.y = 0.86;
-    pelvis.castShadow = true;
-    this.body.add(pelvis);
+    const kitMat = rig.kitMaterial(kit);
+    const P = rig.parts;
+    const L = rig.limbsL;
 
-    // head: smooth ellipsoid skull + hair cap, tiny nose for direction
-    // reading, dot eyes so faces read as faces at broadcast distance
+    const add = (parent: THREE.Object3D, full: THREE.BufferGeometry,
+      lod: THREE.BufferGeometry, mat: THREE.Material,
+      opts: { big?: boolean; nearOnly?: boolean } = {}): THREE.Mesh => {
+      const mesh = new THREE.Mesh(full, mat);
+      mesh.castShadow = !opts.nearOnly;
+      parent.add(mesh);
+      this.lods.push({ mesh, full, lod, nearOnly: opts.nearOnly, bigShadow: opts.big });
+      return mesh;
+    };
+
+    // torso: shirt, collar trim and shorts lofted as ONE piece
+    add(this.body, P.full.torso, P.lod.torso, kitMat, { big: true });
+    add(this.body, P.full.backPanel, P.lod.backPanel, backMat, { nearOnly: true });
+
+    // head: skull carries the nose and the neck stub
     this.head = new THREE.Group();
-    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.15, 20, 14), skinMat);
-    skull.scale.set(1, 1.12, 1.04);
-    skull.castShadow = true;
-    this.head.add(skull);
-    if (!bald) {
-      const hair = new THREE.Mesh(
-        new THREE.SphereGeometry(0.16, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), hairMat,
-      );
-      hair.scale.set(1, 1.12, 1.04);
-      hair.position.y = 0.015;
-      this.head.add(hair);
-    }
-    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.25 });
-    for (const side of [-1, 1]) {
-      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 4), eyeMat);
-      eye.position.set(0.055 * side, 0.02, 0.142);
-      this.head.add(eye);
-    }
-    const nose = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.06), skinMat);
-    nose.position.set(0, -0.01, 0.15);
-    this.head.add(nose);
     this.head.position.y = 1.72;
+    add(this.head, P.full.skull, P.lod.skull, skinMat, { big: true });
+    if (!bald) add(this.head, P.full.hair, P.lod.hair, hairMat);
+    add(this.head, P.full.eyes, P.lod.eyes, rig.eyeMat, { nearOnly: true });
     this.body.add(this.head);
 
-    // arms: pivot at shoulders; upper = sleeve, lower = skin. Capsules
-    // instead of boxes so limbs read as limbs, plus a shoulder cap sphere
-    // to hide the pivot gap
     const mkArm = (side: number): THREE.Group => {
       const g = new THREE.Group();
-      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.08, 10, 8), shirtMat);
-      cap.castShadow = true;
-      const sleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.14, 2, 8), shirtMat);
-      sleeve.position.y = -0.11;
-      sleeve.castShadow = true;
-      const fore = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.24, 2, 8), skinMat);
-      fore.position.y = -0.38;
-      fore.castShadow = true;
-      g.add(cap, sleeve, fore);
-      g.position.set(0.33 * side, 1.5, 0);
+      const set = side < 0 ? L : null;
+      add(g, set ? set.full.armKit : P.full.armKit,
+        set ? set.lod.armKit : P.lod.armKit, kitMat);
+      add(g, set ? set.full.armSkin : P.full.armSkin,
+        set ? set.lod.armSkin : P.lod.armSkin, skinMat);
+      // on the shoulder line, not above it — the deltoid ring in SLEEVE is at
+      // local -0.02, which puts it inside the torso's widest ring
+      g.position.set(0.295 * side, 1.44, 0);
       g.rotation.z = -0.12 * side;
       this.body.add(g);
       return g;
@@ -162,22 +241,15 @@ export class PlayerMesh {
     this.armL = mkArm(-1);
     this.armR = mkArm(1);
 
-    // legs: pivot at hip; thigh skin, shin sock, boot. Rounded thigh/shin,
-    // boxy boots and shorts (cloth and boots read fine as boxes)
     const mkLeg = (side: number): THREE.Group => {
       const g = new THREE.Group();
-      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.085, 0.26, 2, 8), skinMat);
-      thigh.position.y = -0.2;
-      thigh.castShadow = true;
-      const shortLeg = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.19), shortsMat);
-      shortLeg.position.y = -0.06;
-      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.065, 0.3, 2, 8), socksMat);
-      shin.position.y = -0.6;
-      shin.castShadow = true;
-      const boot = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.09, 0.26), bootMat);
-      boot.position.set(0, -0.83, 0.05);
-      boot.castShadow = true;
-      g.add(shortLeg, thigh, shin, boot);
+      const set = side < 0 ? L : null;
+      add(g, set ? set.full.legKit : P.full.legKit,
+        set ? set.lod.legKit : P.lod.legKit, kitMat, { big: true });
+      add(g, set ? set.full.legSkin : P.full.legSkin,
+        set ? set.lod.legSkin : P.lod.legSkin, skinMat, { big: true });
+      add(g, set ? set.full.boot : P.full.boot,
+        set ? set.lod.boot : P.lod.boot, rig.bootMat);
       g.position.set(0.13 * side, 0.88, 0);
       this.body.add(g);
       return g;
@@ -186,6 +258,17 @@ export class PlayerMesh {
     this.legR = mkLeg(1);
 
     this.root.add(this.body);
+
+    // The >60m tier: one card, two triangles, kit colours. It still casts —
+    // three copies map and alphaTest onto the depth material, so an
+    // alpha-tested billboard throws a player-shaped shadow rather than a
+    // rectangle, and a player at 70m with no shadow under him is the one thing
+    // that makes an impostor obvious in a still.
+    this.impostor = rig.newImpostor(kit);
+    this.impostor.position.y = 0.95;
+    this.impostor.visible = false;
+    this.impostor.castShadow = true;
+    this.root.add(this.impostor);
 
     // star player flair (§4): pulsing gold ring at the feet
     if (data.star) {
@@ -201,6 +284,46 @@ export class PlayerMesh {
       this.root.add(ring);
       this.starGlow = ring;
     }
+
+    this.setTier(0);
+  }
+
+  /**
+   * Pick the detail tier for this frame (§7A.2). Called from the renderer with
+   * the camera that is about to draw — including the capture harness's pinned
+   * pose, so a still and the live game agree about what they are drawing.
+   */
+  updateLOD(camera: THREE.Camera): void {
+    const p = this.root.position;
+    const c = camera.position;
+    const d = Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z);
+    this.setTier(d <= LOD_FULL_M ? 0 : d <= LOD_IMPOSTOR_M ? 1 : 2);
+    if (this.tier === 2 && this.impostor) {
+      // Billboard on Y only: a card that pitches toward a high camera reads as
+      // a sticker lying on the grass. The card is parented to root, which is
+      // already yawed to the player's facing — so the world-space angle has to
+      // have that yaw taken back out, or the card ends up pointing wherever
+      // the player happens to be running and spends half its life edge-on to
+      // the camera, i.e. invisible.
+      this.impostor.rotation.y = Math.atan2(c.x - p.x, c.z - p.z) - this.root.rotation.y;
+    }
+  }
+
+  private setTier(tier: number): void {
+    if (tier === this.tier) return;
+    this.tier = tier;
+    const body = tier < 2;
+    for (const l of this.lods) {
+      l.mesh.visible = body && !(l.nearOnly && tier > 0);
+      const want = tier === 0 ? l.full : l.lod;
+      if (l.mesh.geometry !== want) l.mesh.geometry = want;
+      // the mid tier still casts, but only from the parts that make the
+      // silhouette: three cascade passes over twenty-two pairs of forearms is
+      // pure cost at 40m and changes nothing on screen
+      l.mesh.castShadow = !l.nearOnly && (tier === 0 || !!l.bigShadow);
+    }
+    this.body.visible = body;
+    if (this.impostor) this.impostor.visible = tier === 2;
   }
 
   /**
@@ -312,6 +435,19 @@ export class PlayerMesh {
       const m = this.starGlow.material as THREE.MeshBasicMaterial;
       m.opacity = 0.35 + Math.abs(Math.sin(performance.now() * 0.004)) * 0.3;
       this.starGlow.rotation.z += dt * 0.8;
+    }
+  }
+
+  /** Per-player materials only: the rig owns everything that is shared. */
+  dispose(): void {
+    for (const m of this.ownMats) {
+      const map = (m as THREE.MeshStandardMaterial).map;
+      if (map) map.dispose();
+      m.dispose();
+    }
+    if (this.starGlow) {
+      this.starGlow.geometry.dispose();
+      (this.starGlow.material as THREE.Material).dispose();
     }
   }
 }

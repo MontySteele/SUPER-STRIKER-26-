@@ -1,8 +1,26 @@
-// Stadium (§7.1): modeled lower bowl near the pitch, billboard crowd upper
-// tier, floodlight pylons that bloom at night, and animated LED ad boards.
+// Stadium (§7.1/§7A.5): modeled lower bowl, INSTANCED billboard crowd,
+// floodlight pylons that bloom at night, scrolling LED ad boards, corner flags
+// and a handful of waving team flags in the stands.
+//
+// The crowd is the change that matters. A rake used to be one quad wearing a
+// canvas full of 2px fan blobs — which is a photograph of a crowd, and reads
+// as one: perfectly still, perfectly flat, and visibly a texture the moment
+// the camera gets within twenty metres. Now each rake is an InstancedMesh of
+// billboard cards drawn from a four-frame sway/cheer atlas, tinted per
+// instance toward the home kit, with a per-instance phase so no two blocks
+// move together and a per-instance darkening that falls off up the rake. One
+// draw call per rake, exactly as before; a crowd that moves, which is new.
+//
+// Everything animated here is driven by the dt the renderer hands down, which
+// under capture is the harness's fixed virtual step — so a still is still a
+// pure function of its shot spec.
 
 import * as THREE from 'three';
 import { HALF_L, HALF_W } from '../sim/constants';
+import { applyShaderPatches, queueShaderPatch } from './materials';
+import { TextureLab } from './TextureLab';
+import type { QualityProfile } from './quality';
+import type { TimeOfDay } from './scene';
 
 const AD_MESSAGES = [
   'CLAWDE SPORTS', 'ANTHROPIC AIR', "SUPER STRIKER '26", '0 MICROTRANSACTIONS',
@@ -33,64 +51,182 @@ const SIZES: Record<StadiumSize, { tiers: TierSpec[]; roofY: number; lightH: num
   },
 };
 
+/** Metres between crowd cards along and up a rake. Each card carries a small
+ *  cluster of fans, so this is block spacing, not seat spacing. */
+const CARD_STEP_X = 2.1;
+const CARD_STEP_Y = 1.45;
+const CARD_W = 2.4;
+const CARD_H = 1.75;
+
 export class Stadium {
   private adTextures: THREE.CanvasTexture[] = [];
   private adOffset = 0;
+  /** virtual seconds since kick-off, driving every sway in the bowl */
+  private clock = 0;
+  private swayUniforms: { value: number }[] = [];
   floodlightHeads: THREE.Mesh[] = [];
 
   /**
-   * `hdrLamps` drives the floodlight heads' emissive level. With the §7A.6 HDR
-   * chain the bloom threshold sits at 1.0, so a lamp that peaks at pure white
-   * is exactly AT the threshold and glows not at all — it has to be pushed
-   * genuinely overbright. RETRO bloom still runs on tone-mapped LDR at
-   * threshold 0.82, where plain white was always the right answer.
+   * `hdrLamps` drives the floodlight heads' and the LED boards' emissive
+   * level. With the §7A.6 HDR chain the bloom threshold sits at 1.3, so a lamp
+   * that peaks at pure white is BELOW the threshold and glows not at all — it
+   * has to be pushed genuinely overbright. RETRO bloom still runs on
+   * tone-mapped LDR at threshold 0.82, where plain white was always right.
    */
-  constructor(scene: THREE.Scene, night: boolean, public size: StadiumSize = 'national',
-    private hdrLamps = true) {
-    this.buildBowl(scene, night);
+  constructor(scene: THREE.Scene, private lab: TextureLab, tod: TimeOfDay,
+    public size: StadiumSize = 'national', private hdrLamps = true,
+    private profile?: QualityProfile, homeShirt = '#c8ccd4') {
+    const night = tod === 'night';
+    this.buildBowl(scene, night, homeShirt);
     this.buildFloodlights(scene, night);
-    this.buildAdBoards(scene);
+    this.buildAdBoards(scene, night);
+    this.buildCornerFlags(scene);
   }
 
-  /** Crowd texture: thousands of 2px fan blobs in varied colors, drawn once. */
-  private makeCrowdTexture(dark: boolean): THREE.CanvasTexture {
-    const c = document.createElement('canvas');
-    c.width = 512; c.height = 128;
-    const ctx = c.getContext('2d')!;
-    ctx.fillStyle = dark ? '#12151d' : '#1e232d';
-    ctx.fillRect(0, 0, c.width, c.height);
-    const palette = ['#c8ccd4', '#8a93a8', '#b8563e', '#3e6cb8', '#d4c04a', '#5a9950', '#d8d8e0', '#7a4a7e'];
-    // seat rows: fans sit on a grid with jitter, so the stand reads as terraces
-    const ROW_H = 8, SEAT_W = 5;
-    for (let row = 0; row < c.height / ROW_H; row++) {
-      // subtle row shadow line
-      ctx.fillStyle = 'rgba(0,0,0,0.35)';
-      ctx.fillRect(0, row * ROW_H + ROW_H - 1, c.width, 1.5);
-      for (let seat = 0; seat < c.width / SEAT_W; seat++) {
-        if (Math.random() < 0.06) continue; // a few empty seats
-        const x = seat * SEAT_W + Math.random() * 1.5;
-        const y = row * ROW_H + 1 + Math.random() * 1.5;
-        // body
-        ctx.fillStyle = palette[(Math.random() * palette.length) | 0];
-        ctx.globalAlpha = dark ? 0.6 + Math.random() * 0.3 : 0.8 + Math.random() * 0.2;
-        ctx.fillRect(x, y + 2, 3.4, 4);
-        // head
-        ctx.fillStyle = ['#e0b08c', '#c68642', '#8d5524', '#5c3a21'][(Math.random() * 4) | 0];
-        ctx.fillRect(x + 0.7, y, 2, 2.2);
+  private get retro(): boolean {
+    return this.profile?.retro ?? false;
+  }
+
+  // ------------------------------------------------------------ crowd cards
+
+  /**
+   * The shared crowd material: the four-frame atlas plus a vertex patch that
+   * picks a frame and leans the card by the instance's own phase. Unlit on
+   * purpose — it is exempt from the CSM registration rule (§7A.4), and the
+   * time of day is baked into the instance tints instead, which costs nothing
+   * and cannot go three times too bright.
+   */
+  private crowdMaterial(night: boolean): THREE.MeshBasicMaterial {
+    const mat = new THREE.MeshBasicMaterial({
+      map: this.lab.crowdAtlas(night),
+      transparent: true,
+      alphaTest: 0.35,
+      side: THREE.DoubleSide,
+      fog: true,
+    });
+    // NOT vertexColors. InstancedMesh.instanceColor defines USE_INSTANCING_COLOR
+    // on its own and that is what tints the cards; asking for vertexColors as
+    // well defines USE_COLOR, whose `color` attribute the card geometry does
+    // not have — and an absent attribute reads as (0,0,0), i.e. a stand full
+    // of black rectangles.
+    const sway = { value: 0 };
+    this.swayUniforms.push(sway);
+    queueShaderPatch(mat, (shader) => {
+      shader.uniforms.ss26Sway = sway;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', /* glsl */`
+          #include <common>
+          attribute float aPhase;
+          uniform float ss26Sway;
+        `)
+        .replace('#include <uv_vertex>', /* glsl */`
+          #include <uv_vertex>
+          {
+            // four frames across the atlas; the phase decides which one and
+            // when it changes, so a stand never claps in lockstep
+            float f = floor( mod( ss26Sway * 2.6 + aPhase * 4.0, 4.0 ) );
+            vMapUv = vMapUv * vec2( 0.25, 1.0 ) + vec2( f * 0.25, 0.0 );
+          }
+        `)
+        .replace('#include <begin_vertex>', /* glsl */`
+          #include <begin_vertex>
+          {
+            // lean the card about its own base — a crowd sways, it does not
+            // slide sideways
+            float s = sin( ss26Sway * 1.7 + aPhase * 6.2831 );
+            float up = clamp( ( position.y + ${(CARD_H / 2).toFixed(3)} ) / ${CARD_H.toFixed(3)}, 0.0, 1.0 );
+            transformed.x += s * 0.10 * up;
+            transformed.y += abs( s ) * 0.045 * up;
+          }
+        `);
+    });
+    // unlit, so nothing else will ever install a hook here; hang the patch now
+    applyShaderPatches(mat);
+    return mat;
+  }
+
+  /**
+   * One InstancedMesh per rake. The instance tint carries three things at
+   * once: the home-kit bias that makes a home end read as a home end, the
+   * per-block colour variation, and the depth darkening that makes the upper
+   * tiers recede (§7A.5) — all for free, because a tint is an attribute the
+   * card was going to carry anyway.
+   */
+  private buildRake(stand: THREE.Group, len: number, rakeLen: number, theta: number,
+    y0: number, rise: number, depth: number, run: number,
+    tierIdx: number, tierCount: number, mat: THREE.MeshBasicMaterial,
+    home: THREE.Color, night: boolean): void {
+    const cols = Math.max(2, Math.floor(len / CARD_STEP_X));
+    const rows = Math.max(1, Math.floor(rakeLen / CARD_STEP_Y));
+    const count = cols * rows;
+
+    const geo = new THREE.PlaneGeometry(CARD_W, CARD_H);
+    const inst = new THREE.InstancedMesh(geo, mat, count);
+    inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    const phase = new Float32Array(count);
+    geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
+
+    const m = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const pos = new THREE.Vector3();
+    const scl = new THREE.Vector3(1, 1, 1);
+    const col = new THREE.Color();
+    const rng = this.lab.crowdRng();
+
+    // The stand is built with the pitch toward -z, and a PlaneGeometry faces
+    // +z — so every card turns to face the pitch first, and only then leans
+    // back with the rake so the front rows don't clip the row behind them.
+    const facePitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+    const lean = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), theta * 0.5);
+
+    let i = 0;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const along = -len / 2 + CARD_STEP_X * (c + 0.5) + rng.range(-0.25, 0.25);
+        const up = (r + 0.5) / rows;
+        const y = y0 + rise * up + rng.range(-0.08, 0.08);
+        const z = depth + run * up;
+        pos.set(along, y + CARD_H * 0.35, z);
+        q.copy(facePitch).premultiply(lean);
+        m.compose(pos, q, scl);
+        inst.setMatrixAt(i, m);
+        phase[i] = rng.next();
+
+        // home-kit bias: about a third of the cards lean toward the shirt
+        // colour, which is what a home end looks like from the far side
+        const biased = rng.next() < 0.34;
+        col.setRGB(1, 1, 1);
+        if (biased) col.lerp(home, 0.62);
+        else col.offsetHSL(0, 0, rng.range(-0.06, 0.06));
+        // depth: the back of a rake and the upper tiers sit in the roof's
+        // shade, and darkening them is most of what sells stadium scale
+        const deep = (tierIdx / Math.max(1, tierCount - 1)) * 0.34 + up * 0.22;
+        const lit = (night ? 0.62 : 1.0) * (1 - deep);
+        col.multiplyScalar(lit);
+        inst.setColorAt(i, col);
+        i++;
       }
     }
-    ctx.globalAlpha = 1;
-    const tex = new THREE.CanvasTexture(c);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return tex;
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    // Cull the rake as one object — that is the point of the instancing. It
+    // has to be InstancedMesh.computeBoundingSphere (which walks the instance
+    // matrices), not the geometry's: the geometry is a single 2.4m card sitting
+    // at the origin, and culling against that would drop the whole stand the
+    // moment the origin left frame. Pad it for the sway.
+    inst.computeBoundingSphere();
+    inst.boundingSphere!.radius += 1.5;
+    stand.add(inst);
   }
 
-  private buildBowl(scene: THREE.Scene, night: boolean): void {
-    const crowdTex = this.makeCrowdTexture(night);
-    const crowdMat = new THREE.MeshPhongMaterial({ map: crowdTex });
+  private buildBowl(scene: THREE.Scene, night: boolean, homeShirt: string): void {
     const concreteMat = new THREE.MeshPhongMaterial({ color: 0x2e3440 });
     const roofMat = new THREE.MeshPhongMaterial({ color: 0x454e5e, shininess: 30 });
+    // the back of the bowl behind the cards, so a gap between two cards shows
+    // stadium shadow and not sky
+    const voidMat = new THREE.MeshBasicMaterial({ color: night ? 0x0a0d14 : 0x171d27 });
+    const crowdMat = this.retro ? null : this.crowdMaterial(night);
+    const home = new THREE.Color(homeShirt);
 
     // one stand per side; built in local space with the pitch toward -z and
     // the tiers rising away toward +z, then rotated into place
@@ -102,29 +238,39 @@ export class Stadium {
     ];
 
     const spec = SIZES[this.size];
-    for (const s of stands) {
+    stands.forEach((s, standIdx) => {
       const stand = new THREE.Group();
       const tiers = spec.tiers;
       let depth = 0;
-      for (const t of tiers) {
+      tiers.forEach((t, tierIdx) => {
         const theta = Math.atan2(t.rise, t.run);
         const rakeLen = Math.hypot(t.rise, t.run);
-        const m = crowdMat.clone();
-        m.map = crowdTex.clone();
-        m.map.repeat.set(s.len / 16, rakeLen / 5);
-        m.map.needsUpdate = true;
-        const rake = new THREE.Mesh(new THREE.PlaneGeometry(s.len, rakeLen), m);
-        // normal points up and toward the pitch (-z local)
-        rake.rotation.x = -Math.PI / 2 - theta;
-        rake.position.set(0, t.y0 + t.rise / 2, depth + t.run / 2);
-        stand.add(rake);
+        if (crowdMat) {
+          // the terrace itself, dark, under the cards
+          const floor = new THREE.Mesh(new THREE.PlaneGeometry(s.len, rakeLen), voidMat);
+          floor.rotation.x = -Math.PI / 2 - theta;
+          floor.position.set(0, t.y0 + t.rise / 2, depth + t.run / 2);
+          stand.add(floor);
+          this.buildRake(stand, s.len, rakeLen, theta, t.y0, t.rise, depth, t.run,
+            tierIdx, tiers.length, crowdMat, home, night);
+        } else {
+          // RETRO (§7A.7): the v1.1 rake, one quad wearing a crowd texture
+          const map = this.lab.retroCrowdTexture(night).clone();
+          map.needsUpdate = true;
+          map.repeat.set(s.len / 16, rakeLen / 5);
+          const m = new THREE.MeshPhongMaterial({ map });
+          const rake = new THREE.Mesh(new THREE.PlaneGeometry(s.len, rakeLen), m);
+          rake.rotation.x = -Math.PI / 2 - theta;
+          rake.position.set(0, t.y0 + t.rise / 2, depth + t.run / 2);
+          stand.add(rake);
+        }
         // concrete front wall of the tier
         const wallH = t.y0 + 0.2;
         const wall = new THREE.Mesh(new THREE.BoxGeometry(s.len, wallH, 0.6), concreteMat);
         wall.position.set(0, wallH / 2, depth - 0.3);
         stand.add(wall);
         depth += t.run + 1.2;
-      }
+      });
       // roof slab over the top tier
       const roof = new THREE.Mesh(new THREE.BoxGeometry(s.len, 0.8, 13), roofMat);
       roof.position.set(0, spec.roofY, depth - 7);
@@ -134,11 +280,74 @@ export class Stadium {
       back.position.set(0, (spec.roofY - 0.5) / 2, depth + 0.4);
       stand.add(back);
 
+      // a few team flags in the lower tier of the two long stands (§7A.5)
+      if (crowdMat && standIdx < 2) {
+        this.buildCrowdFlags(stand, s.len, spec.tiers[0], home, night);
+      }
+
       stand.position.set(s.cx, 0, s.cz);
       stand.rotation.y = s.rotY;
       scene.add(stand);
-    }
+    });
   }
+
+  /** Instanced waving flags held up in the lower tier, home-kit tinted. */
+  private buildCrowdFlags(stand: THREE.Group, len: number, tier: TierSpec,
+    home: THREE.Color, night: boolean): void {
+    const COUNT = 14;
+    const geo = new THREE.PlaneGeometry(1.6, 1.0, 4, 1);
+    const mat = new THREE.MeshBasicMaterial({
+      map: this.lab.flagTexture(), transparent: true, alphaTest: 0.2,
+      side: THREE.DoubleSide,
+    });
+    const sway = { value: 0 };
+    this.swayUniforms.push(sway);
+    queueShaderPatch(mat, (shader) => {
+      shader.uniforms.ss26Sway = sway;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>',
+          '#include <common>\nattribute float aPhase;\nuniform float ss26Sway;')
+        .replace('#include <begin_vertex>', /* glsl */`
+          #include <begin_vertex>
+          {
+            // a travelling wave down the cloth, anchored at the pole edge
+            float grip = clamp( position.x + 0.8, 0.0, 1.6 ) / 1.6;
+            float w = sin( ss26Sway * 3.4 + aPhase * 6.2831 - grip * 4.5 );
+            transformed.z += w * 0.22 * grip;
+            transformed.y += w * 0.06 * grip;
+          }
+        `);
+    });
+    applyShaderPatches(mat);
+
+    const inst = new THREE.InstancedMesh(geo, mat, COUNT);
+    const phase = new Float32Array(COUNT);
+    geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
+    const rng = this.lab.crowdRng();
+    const m = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const col = new THREE.Color();
+    for (let i = 0; i < COUNT; i++) {
+      const along = rng.range(-len / 2 + 6, len / 2 - 6);
+      const up = rng.range(0.25, 0.8);
+      m.compose(
+        new THREE.Vector3(along, tier.y0 + tier.rise * up + 1.4, tier.run * up * 0.6),
+        q.setFromEuler(new THREE.Euler(0, rng.range(-0.4, 0.4), 0)),
+        new THREE.Vector3(1, 1, 1),
+      );
+      inst.setMatrixAt(i, m);
+      phase[i] = rng.next();
+      col.copy(home).multiplyScalar(night ? 0.7 : 1.05);
+      inst.setColorAt(i, col);
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    inst.computeBoundingSphere();
+    inst.boundingSphere!.radius += 1.0;
+    stand.add(inst);
+  }
+
+  // ------------------------------------------------------------ floodlights
 
   private buildFloodlights(scene: THREE.Scene, night: boolean): void {
     const poleMat = new THREE.MeshPhongMaterial({ color: 0x3a4150 });
@@ -152,6 +361,19 @@ export class Stadium {
       headMat.color.setRGB(lamp, lamp, lamp * (night ? 1 : 1.04), THREE.LinearSRGBColorSpace);
     }
     const h = SIZES[this.size].lightH;
+    // the flare sprites are additive and night-only: a lens flare on a sunny
+    // afternoon is a screensaver, not a broadcast
+    const flareMat = night && !this.retro ? new THREE.SpriteMaterial({
+      map: this.lab.flareTexture(),
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      transparent: true,
+      fog: false,
+    }) : null;
+    if (flareMat && this.hdrLamps) {
+      flareMat.color.setRGB(2.1, 2.0, 1.75, THREE.LinearSRGBColorSpace);
+    }
+
     for (const [x, z] of [[-1, -1], [-1, 1], [1, -1], [1, 1]]) {
       const px = x * (HALF_L + 22);
       const pz = z * (HALF_W + 24);
@@ -164,29 +386,18 @@ export class Stadium {
       head.lookAt(0, 0, 0);
       this.floodlightHeads.push(head);
       scene.add(head);
+      if (flareMat) {
+        const flare = new THREE.Sprite(flareMat);
+        flare.position.copy(head.position);
+        flare.scale.setScalar(22);
+        scene.add(flare);
+      }
     }
   }
 
-  private makeAdTexture(text: string): THREE.CanvasTexture {
-    const c = document.createElement('canvas');
-    c.width = 512; c.height = 48;
-    const ctx = c.getContext('2d')!;
-    const grad = ctx.createLinearGradient(0, 0, 0, 48);
-    grad.addColorStop(0, '#0c2b6b');
-    grad.addColorStop(1, '#081d49');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 512, 48);
-    ctx.font = 'bold 30px Helvetica, Arial, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#e8f0ff';
-    ctx.fillText(text, 256, 26);
-    const tex = new THREE.CanvasTexture(c);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return tex;
-  }
+  // -------------------------------------------------------------- ad boards
 
-  private buildAdBoards(scene: THREE.Scene): void {
+  private buildAdBoards(scene: THREE.Scene, night: boolean): void {
     // one board segment per message, ringed around the pitch
     const H = 1.0;
     const segments: { x: number; z: number; rotY: number; w: number }[] = [];
@@ -204,9 +415,23 @@ export class Stadium {
       segments.push({ x: -(HALF_L + 3), z, rotY: Math.PI / 2, w });
     }
     segments.forEach((s, i) => {
-      const tex = this.makeAdTexture(AD_MESSAGES[i % AD_MESSAGES.length]);
+      // the message is drawn TWICE across the texture and each board shows
+      // half of it, so a wrapping offset crawls the text past the board with
+      // no seam and no second copy in frame
+      const tex = this.lab.adTexture(AD_MESSAGES[i % AD_MESSAGES.length]).clone();
+      tex.needsUpdate = true;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.repeat.x = 0.5;
       this.adTextures.push(tex);
       const mat = new THREE.MeshBasicMaterial({ map: tex });
+      if (this.hdrLamps && night) {
+        // An LED board at night IS a light source, so the lettering has to
+        // clear the 1.3 bloom threshold. 1.7x puts it a little over (~1.4
+        // linear) and leaves the dark blue field at 0.25 — enough that the
+        // board glows and not so much that the bloom eats the words, which is
+        // what 2.4x did: a white bar where the sponsor used to be.
+        mat.color.setRGB(1.7, 1.7, 1.74, THREE.LinearSRGBColorSpace);
+      }
       const board = new THREE.Mesh(new THREE.PlaneGeometry(s.w - 0.4, H), mat);
       board.position.set(s.x, H / 2 + 0.05, s.z);
       board.rotation.y = s.rotY;
@@ -214,14 +439,57 @@ export class Stadium {
     });
   }
 
-  /** LED shimmer: slowly pulse ad brightness so the boards feel alive. */
-  update(dt: number): void {
-    this.adOffset += dt;
-    // cheap: modulate texture offset for a subtle scroll every few seconds
-    const phase = (Math.sin(this.adOffset * 0.8) + 1) / 2;
-    for (const tex of this.adTextures) {
-      tex.offset.x = Math.sin(this.adOffset * 0.15) * 0.01;
+  // ----------------------------------------------------------- corner flags
+
+  private buildCornerFlags(scene: THREE.Scene): void {
+    const poleMat = new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.5 });
+    const clothMat = new THREE.MeshStandardMaterial({
+      color: 0xffcf2e, roughness: 0.75, side: THREE.DoubleSide,
+    });
+    const sway = { value: 0 };
+    this.swayUniforms.push(sway);
+    queueShaderPatch(clothMat, (shader) => {
+      shader.uniforms.ss26Sway = sway;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nuniform float ss26Sway;')
+        .replace('#include <begin_vertex>', /* glsl */`
+          #include <begin_vertex>
+          {
+            float grip = clamp( ( position.x + 0.18 ) / 0.36, 0.0, 1.0 );
+            transformed.z += sin( ss26Sway * 4.2 - grip * 5.0 ) * 0.07 * grip;
+            transformed.y += cos( ss26Sway * 4.2 - grip * 5.0 ) * 0.02 * grip;
+          }
+        `);
+    });
+
+    const poleGeo = new THREE.CylinderGeometry(0.025, 0.025, 1.5, 6);
+    const clothGeo = new THREE.PlaneGeometry(0.36, 0.26, 5, 1);
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const g = new THREE.Group();
+        const pole = new THREE.Mesh(poleGeo, poleMat);
+        pole.position.y = 0.75;
+        pole.castShadow = true;
+        const cloth = new THREE.Mesh(clothGeo, clothMat);
+        cloth.position.set(0.18 * sx, 1.32, 0);
+        g.add(pole, cloth);
+        g.position.set(HALF_L * sx, 0, HALF_W * sz);
+        scene.add(g);
+      }
     }
-    void phase;
+  }
+
+  /**
+   * Drive the bowl. `dt` is the renderer's frame step — the real clock in a
+   * match, the harness's fixed virtual step under capture, which is what keeps
+   * a still reproducible while the crowd genuinely animates in play.
+   */
+  update(dt: number): void {
+    this.clock += dt;
+    for (const u of this.swayUniforms) u.value = this.clock;
+    // the boards actually scroll: the message is drawn twice across the
+    // texture and wrapS repeats, so the crawl never tears
+    this.adOffset = (this.adOffset + dt * 0.045) % 1;
+    for (const tex of this.adTextures) tex.offset.x = this.adOffset;
   }
 }

@@ -73,7 +73,14 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
 
   try {
     const env = installDeterministicEnv(shot.seed);
-    forceQuality(shot.quality ?? 'high');
+    // `&quality=retro` overrides the shot's level for ad-hoc checks — the one
+    // way to point the harness at a level the shot list doesn't ask for
+    // (proving RETRO still boots, mostly). It deliberately does NOT touch
+    // shots.json: a baseline taken this way is not the shot's baseline.
+    const override = new URLSearchParams(location.search).get('quality');
+    const level = override === 'high' || override === 'medium' || override === 'retro'
+      ? override : shot.quality ?? 'high';
+    forceQuality(level);
 
     // both seats null = CPU vs CPU = the sim is a pure function of the seed
     const match = new Match({
@@ -102,6 +109,8 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
     }
 
     const still = renderer.renderStill(shot.cam);
+    const tiers = renderer.lodTiers();
+    console.info(`player LOD tiers (full/decimated/impostor): ${tiers.join(' / ')}`);
 
     // fps: redraw the identical still back-to-back and time it on the REAL
     // clock. A rAF loop would just report the vsync rate; this reports what

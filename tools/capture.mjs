@@ -65,12 +65,24 @@ try {
   for (const shot of shots) {
     const page = await context.newPage();
     const logs = [];
-    page.on('console', (m) => { if (m.type() === 'error') logs.push(m.text()); });
+    // the page reports its §7A.3 bake budget and §7A.2 LOD arithmetic on the
+    // console; surface those, because a texture bakery whose cost nobody can
+    // see is a texture bakery that quietly grows to four seconds
+    const notes = [];
+    page.on('console', (m) => {
+      const text = m.text();
+      if (m.type() === 'error') logs.push(text);
+      else if (/^(TextureLab|player LOD)/.test(text)) notes.push(text);
+    });
     page.on('pageerror', (e) => logs.push(String(e)));
 
     const t0 = Date.now();
     try {
-      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}`,
+      // --quality overrides the level the shot asks for. Only for ad-hoc
+      // checks (does RETRO still boot?) — a PNG taken this way is NOT that
+      // shot's baseline.
+      const q = typeof args.quality === 'string' ? `&quality=${encodeURIComponent(args.quality)}` : '';
+      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}`,
         { waitUntil: 'load' });
       await page.waitForFunction(() => window.__ss26Capture?.ready === true,
         null, { timeout: SHOT_TIMEOUT_MS });
@@ -86,6 +98,7 @@ try {
       console.log(`${shot.name.padEnd(24)} ${String(result.stats.drawCalls).padStart(5)} calls  `
         + `${String(result.stats.triangles).padStart(8)} tris  ${String(result.stats.fps).padStart(6)} fps  `
         + `[lum ${px.minLum}..${px.maxLum}, ${px.colors} colours]`);
+      if (args.bake) for (const n of notes) console.log(n.split('\n').map((l) => `  ${l}`).join('\n'));
     } catch (err) {
       failures++;
       stats[shot.name] = { error: String(err.message ?? err) };
