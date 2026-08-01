@@ -10,6 +10,7 @@ import { Tournament } from '../sim/tournament';
 import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
 import { MUSIC_KEY, musicSetting, type MusicSetting } from '../audio/music';
 import { CONTROLS_KEY, controlsSetting, type ControlsSetting } from './prefs';
+import { QUALITY_OPTIONS, qualitySetting, setQuality } from '../render/quality';
 
 const MUSIC_OPTIONS: [MusicSetting, string][] = [
   ['all', 'ON'], ['menus', 'MENUS ONLY'], ['off', 'OFF'],
@@ -204,10 +205,14 @@ export class Menu {
     const controls: [string, string] = [
       'CONTROLS HINT', (CONTROLS_OPTIONS.find(([v]) => v === controlsSetting()) ?? CONTROLS_OPTIONS[0])[1],
     ];
+    const graphics: [string, string] = [
+      'GRAPHICS', (QUALITY_OPTIONS.find(([v]) => v === qualitySetting()) ?? QUALITY_OPTIONS[0])[1],
+    ];
     if (this.mode === 'tournament') {
       return [
         ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
+        graphics,
         commentary,
         music,
         controls,
@@ -218,6 +223,7 @@ export class Menu {
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
+        graphics,
         commentary,
         music,
         controls,
@@ -234,6 +240,7 @@ export class Menu {
       ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
       ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
       ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
+      graphics,
       commentary,
       music,
       controls,
@@ -261,6 +268,13 @@ export class Menu {
         localStorage.setItem(MUSIC_KEY, next);
       } catch { /* private browsing: toggle just won't persist */ }
       window.dispatchEvent(new CustomEvent('ss26-music-change'));
+    }
+    if (key === 'GRAPHICS') {
+      const i = QUALITY_OPTIONS.findIndex(([v]) => v === qualitySetting());
+      setQuality(QUALITY_OPTIONS[(i + d + QUALITY_OPTIONS.length) % QUALITY_OPTIONS.length][0]);
+      // the attract match behind the menu is a live renderer: rebuild it so the
+      // level you just picked is the one you're looking at (§7A.7)
+      window.dispatchEvent(new CustomEvent('ss26-quality-change'));
     }
     if (key === 'CONTROLS HINT') {
       const i = CONTROLS_OPTIONS.findIndex(([v]) => v === controlsSetting());

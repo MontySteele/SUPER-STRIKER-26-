@@ -10,6 +10,7 @@
 // render layer's Math.random and wall clock.
 
 import { GameRenderer } from '../render/gameRenderer';
+import { forceQuality, type QualityLevel } from '../render/quality';
 import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { SIM_DT } from '../sim/constants';
@@ -36,6 +37,9 @@ export interface ShotSpec {
   timeOfDay: TimeOfDay;
   stadium: StadiumSize;
   cam: CamPose;
+  /** §7A.7 level to draw at. Omitted = HIGH: a baseline must never silently
+   *  inherit whatever graphics setting the browser profile happens to hold. */
+  quality?: QualityLevel;
 }
 
 export const SHOTS: ShotSpec[] = (shotsJson as unknown as { shots: ShotSpec[] }).shots;
@@ -69,6 +73,7 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
 
   try {
     const env = installDeterministicEnv(shot.seed);
+    forceQuality(shot.quality ?? 'high');
 
     // both seats null = CPU vs CPU = the sim is a pure function of the seed
     const match = new Match({
@@ -109,11 +114,19 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
 
     // draw the still one last time inside rAF so the composited surface the
     // screenshot grabs is the still itself (the canvas has no preserved
-    // drawing buffer), then hand over on the following frame
+    // drawing buffer), then idle a few frames before handing over. One frame
+    // used to be enough; a post-uplift frame costs over a second under
+    // software rasterization, which is long enough for the compositor to miss
+    // its deadline and hand the screenshot an empty surface instead.
     await new Promise<void>((resolve) => {
       requestAnimationFrame(() => {
         renderer.renderStill(shot.cam);
-        requestAnimationFrame(() => resolve());
+        let idle = 4;
+        const tick = (): void => {
+          if (--idle <= 0) resolve();
+          else requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
       });
     });
 

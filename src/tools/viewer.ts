@@ -11,6 +11,8 @@
 
 import * as THREE from 'three';
 import { findTeam, pickStartingXI } from '../data/loader';
+import { applyShaderPatches } from '../render/materials';
+import { bakeSkyEnvironment } from '../render/sky';
 import { PlayerMesh, resolveKits } from '../render/playerMesh';
 import { SIM_DT } from '../sim/constants';
 import { installDeterministicEnv } from './determinism';
@@ -73,7 +75,10 @@ floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
 
-// three-point rig: warm key front-left, cool fill front-right, hard rim behind
+// three-point rig: warm key front-left, cool fill front-right, hard rim behind.
+// This is the one place outside render/Atmosphere.ts allowed to make its own
+// lights (§7A.4): the studio set exists precisely to judge a model OUTSIDE the
+// match rig, and it never builds a CSM, so nothing here can collide with it.
 const key = new THREE.DirectionalLight(0xfff2e0, 2.4);
 key.position.set(4.5, 5.2, 3.5);
 key.castShadow = true;
@@ -100,6 +105,23 @@ const slot = gkMode ? 0 : Math.min(Math.max(Number(params.get('slot') ?? xi.leng
 const player = xi[slot];
 const mesh = new PlayerMesh(player, gkMode ? gkKit : outfieldKit);
 scene.add(mesh.root);
+
+// A neutral studio environment — flat grey top to bottom, no sun — so the
+// physical materials have something to reflect without tinting the kit under
+// review. Then hang the §7A.4 wrap/rim patch on, which the match scene gets
+// from the lighting rig's registration pass and this page has to do by hand.
+const studioEnv = bakeSkyEnvironment(renderer, {
+  zenith: 0x8b909a, horizon: 0x6d727b, ground: 0x3a3e45,
+  sun: 0xffffff, sunIntensity: 0, sunSize: 0.02, haze: 0.2,
+  sunDir: new THREE.Vector3(0, 1, 0),
+});
+scene.environment = studioEnv.texture;
+scene.environmentIntensity = 0.7;
+mesh.root.traverse((obj) => {
+  const m = (obj as THREE.Mesh).material;
+  if (!m) return;
+  for (const mat of Array.isArray(m) ? m : [m]) applyShaderPatches(mat);
+});
 
 if (showLabel) {
   const label = document.getElementById('viewer-label');

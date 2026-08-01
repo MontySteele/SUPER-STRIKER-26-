@@ -85,7 +85,8 @@ export class GameRenderer {
     stadiumSize: StadiumSize = 'national') {
     this.sceneMgr = new SceneManager(canvas, timeOfDay);
     buildPitch(this.sceneMgr.scene);
-    this.stadium = new Stadium(this.sceneMgr.scene, timeOfDay === 'night', stadiumSize);
+    this.stadium = new Stadium(this.sceneMgr.scene, timeOfDay === 'night', stadiumSize,
+      !this.sceneMgr.profile.retro);
     this.cam = new CameraDirector(this.sceneMgr.camera);
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
@@ -125,6 +126,14 @@ export class GameRenderer {
       return m;
     };
     this.controlRings = [mkRing(0xffce4a), mkRing(0xdde4f0)];
+
+    // Everything lit is now built, so hand the whole scene to the lighting rig
+    // (§7A.4). This is not optional bookkeeping: CSM patches three's global
+    // lighting chunk, and any lit material that misses registration takes the
+    // non-CSM branch and receives the sun once PER CASCADE. Anything added
+    // after this point (confetti, the ball trail, the star rings) is
+    // unlit/basic and deliberately stays out of it.
+    this.sceneMgr.atmos.register(this.sceneMgr.scene);
 
     this.snapshot();
     this.snapshot();
@@ -482,7 +491,13 @@ export class GameRenderer {
 
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
-    if (!this.skipDraw) this.sceneMgr.render();
+    if (!this.skipDraw) {
+      // §7A.7: frame pressure buys back pixels, never features. Only the
+      // animated path feeds this — advanceNoDraw and renderStill must stay
+      // bit-identical run to run for the capture contract.
+      this.sceneMgr.adaptPixelRatio(dtReal);
+      this.sceneMgr.render();
+    }
   }
 
   // ------------------------------------------------------ capture harness

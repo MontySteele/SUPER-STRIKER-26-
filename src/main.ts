@@ -44,6 +44,13 @@ function applyMusic(): void {
 // the menu settings row toggles the persisted value, then pokes us
 window.addEventListener('ss26-music-change', applyMusic);
 
+// §7A.7: the graphics level is baked into the renderer at construction, so the
+// attract match behind the menu has to be rebuilt to show the new one. Only
+// while in the menus — nobody changes this mid-match.
+window.addEventListener('ss26-quality-change', () => {
+  if (inMenus && attractMatch) startAttract();
+});
+
 hub.onAnyButton = () => {
   audio.unlock();
   applyMusic();

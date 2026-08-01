@@ -106,10 +106,16 @@ export function buildPitch(scene: THREE.Scene): void {
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 8;
 
-  const mat = new THREE.MeshPhongMaterial({
+  // Standard so the grass gets a real grazing-angle sheen off the sky and the
+  // floodlights (§7.1) — Phong's specular lobe had nothing to reflect once the
+  // PMREM environment arrived. Textures here are the NEXT pass's job; this is
+  // only the lighting model.
+  const mat = new THREE.MeshStandardMaterial({
     map: tex,
-    specular: new THREE.Color(0x2a3a2a),
-    shininess: 18, // floodlight sheen (§7.1)
+    // rough enough that the grazing-angle sheen stays a sheen; at 0.78 the
+    // low sunset key smears a blown cream highlight over half the pitch
+    roughness: 0.9,
+    metalness: 0,
   });
   const geo = new THREE.PlaneGeometry(PITCH_LENGTH + MARGIN * 2, PITCH_WIDTH + MARGIN * 2);
   const mesh = new THREE.Mesh(geo, mat);
@@ -120,7 +126,7 @@ export function buildPitch(scene: THREE.Scene): void {
   // dark surround so the pitch reads as an island of light
   const surround = new THREE.Mesh(
     new THREE.PlaneGeometry(600, 480),
-    new THREE.MeshPhongMaterial({ color: 0x101816 }),
+    new THREE.MeshStandardMaterial({ color: 0x101816, roughness: 0.95 }),
   );
   surround.rotation.x = -Math.PI / 2;
   surround.position.y = -0.05;
@@ -149,7 +155,11 @@ function makeNetTexture(): THREE.Texture {
 
 function buildGoal(scene: THREE.Scene, side: number): void {
   const group = new THREE.Group();
-  const postMat = new THREE.MeshPhongMaterial({ color: 0xf8f8f8, shininess: 60 });
+  // painted metal: the classic thing in the frame that catches a floodlight
+  // hard enough to clear the bloom threshold
+  const postMat = new THREE.MeshStandardMaterial({
+    color: 0xf6f8fb, roughness: 0.26, metalness: 0.2,
+  });
   const r = 0.07;
   const postGeo = new THREE.CylinderGeometry(r, r, GOAL_HEIGHT, 10);
   for (const y of [-GOAL_HALF_W, GOAL_HALF_W]) {

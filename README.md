@@ -174,8 +174,12 @@ man is a foul, from behind is a card.
   (line check at the pass), halves and a broadcast clock — plus fouls: slide
   tackles that go through the man give free kicks, from behind risk yellow /
   red cards (two yellows and you're off), and in the box it's a penalty.
-- **The look:** PS3-confident rendering — per-pixel lighting, real shadows,
-  bloom, vignette, filmic tone mapping; striped pitch with worn goalmouths;
+- **The look:** PS3-confident rendering — an HDR post chain with exactly one
+  filmic tone-map (bloom sees real radiance, so highlights bloom in colour
+  instead of greying out), a procedural sky baked to a PMREM environment map
+  for real reflected light, three-cascade shadows with self-shadowing players,
+  and a single-owner lighting rig per time of day; striped pitch with worn
+  goalmouths;
   terraced crowds; floodlight pylons; LED ad boards (CLAWDE SPORTS ·
   ANTHROPIC AIR); day / sunset / night kickoffs; three venues — Municipal 18k,
   National 45k, and the Mega Bowl 80k (tournament finals play there at night).
@@ -215,6 +219,15 @@ man is a foul, from behind is a card.
 
 4 / 6 / 10 minute matches, three difficulties (Amateur / Pro / Legend — the CPU
 thinks better, the game never cheats physics), and three kickoff times.
+
+**GRAPHICS** picks the renderer: **HIGH** is the full stack (3 shadow cascades,
+MSAA + SMAA, HDR bloom, colour grade, PMREM sky). **MEDIUM** keeps the lighting
+model but halves the expensive bits (2 cascades, half-res bloom, FXAA, no
+grade). **RETRO (v1.1)** is not a potato mode — it's the pre-uplift look kept
+alive on purpose, one shadow map and all. Whatever you pick, a struggling
+machine gives up *pixels* first: resolution steps down under sustained frame
+pressure and climbs back when it can. Features are never switched off behind
+your back.
 
 ## Dev
 

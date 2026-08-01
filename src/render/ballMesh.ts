@@ -15,7 +15,9 @@ export class BallMesh {
     const tex = this.makeTexture();
     this.sphere = new THREE.Mesh(
       new THREE.SphereGeometry(BALL_RADIUS * VISUAL_SCALE, 18, 14),
-      new THREE.MeshPhongMaterial({ map: tex, shininess: 55, specular: new THREE.Color(0x888888) }),
+      // glossy panels: with the PMREM sky in play this is the one moving
+      // specular in the frame, and the §7A.6 bloom is tuned to catch it
+      new THREE.MeshStandardMaterial({ map: tex, roughness: 0.34, metalness: 0.02 }),
     );
     this.sphere.castShadow = true;
     this.root.add(this.sphere);

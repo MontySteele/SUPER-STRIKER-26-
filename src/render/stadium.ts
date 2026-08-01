@@ -38,7 +38,15 @@ export class Stadium {
   private adOffset = 0;
   floodlightHeads: THREE.Mesh[] = [];
 
-  constructor(scene: THREE.Scene, night: boolean, public size: StadiumSize = 'national') {
+  /**
+   * `hdrLamps` drives the floodlight heads' emissive level. With the §7A.6 HDR
+   * chain the bloom threshold sits at 1.0, so a lamp that peaks at pure white
+   * is exactly AT the threshold and glows not at all — it has to be pushed
+   * genuinely overbright. RETRO bloom still runs on tone-mapped LDR at
+   * threshold 0.82, where plain white was always the right answer.
+   */
+  constructor(scene: THREE.Scene, night: boolean, public size: StadiumSize = 'national',
+    private hdrLamps = true) {
     this.buildBowl(scene, night);
     this.buildFloodlights(scene, night);
     this.buildAdBoards(scene);
@@ -137,6 +145,12 @@ export class Stadium {
     const headMat = new THREE.MeshBasicMaterial({
       color: night ? 0xffffff : 0xd8dde8,
     });
+    if (this.hdrLamps) {
+      // linear space on purpose: these values live above 1.0 and must not be
+      // run through the sRGB decode a hex colour would get
+      const lamp = night ? 4.5 : 1.35;
+      headMat.color.setRGB(lamp, lamp, lamp * (night ? 1 : 1.04), THREE.LinearSRGBColorSpace);
+    }
     const h = SIZES[this.size].lightH;
     for (const [x, z] of [[-1, -1], [-1, 1], [1, -1], [1, 1]]) {
       const px = x * (HALF_L + 22);

@@ -5,6 +5,7 @@
 import * as THREE from 'three';
 import type { PlayerData } from '../data/types';
 import type { ActionAnim } from '../sim/player';
+import { queueBroadcastSkin } from './materials';
 
 const SKIN_TONES = [0x8d5524, 0xc68642, 0xe0ac69, 0xf1c27d, 0xffdbac, 0x5c3a21];
 const HAIR_COLORS = [0x151210, 0x2e2018, 0x4a3320, 0x7a5c30, 0xb8963e, 0x101010];
@@ -72,17 +73,33 @@ export class PlayerMesh {
     const hairC = HAIR_COLORS[hashStr(data.name + 'h') % HAIR_COLORS.length];
     const bald = hashStr(data.name + 'b') % 9 === 0;
 
-    const shirtMat = new THREE.MeshPhongMaterial({ color: kit.shirt, shininess: 14 });
-    const shortsMat = new THREE.MeshPhongMaterial({ color: kit.shorts, shininess: 14 });
-    const socksMat = new THREE.MeshPhongMaterial({ color: kit.socks, shininess: 10 });
-    const skinMat = new THREE.MeshPhongMaterial({ color: skin, shininess: 22 });
-    const hairMat = new THREE.MeshPhongMaterial({ color: hairC, shininess: 30 });
-    const bootMat = new THREE.MeshPhongMaterial({ color: 0x16181c, shininess: 45 });
+    // Standard, not Phong: only the physical model has an indirect-specular
+    // term, which is what turns scene.environment (§7A.4's PMREM sky) into an
+    // actual sheen on a shirt instead of a flat ambient lift. The later texture
+    // pass inherits roughness/metalness slots as a result.
+    const shirtMat = new THREE.MeshStandardMaterial({ color: kit.shirt, roughness: 0.72 });
+    const shortsMat = new THREE.MeshStandardMaterial({ color: kit.shorts, roughness: 0.72 });
+    const socksMat = new THREE.MeshStandardMaterial({ color: kit.socks, roughness: 0.8 });
+    const skinMat = new THREE.MeshStandardMaterial({ color: skin, roughness: 0.62 });
+    const hairMat = new THREE.MeshStandardMaterial({ color: hairC, roughness: 0.65 });
+    const bootMat = new THREE.MeshStandardMaterial({
+      color: 0x16181c, roughness: 0.3, metalness: 0.08,
+    });
 
     // torso — back face carries the printed name/number (box faces are what
     // make the cheap number decal work, so the torso stays a box)
     const numberTex = makeBackNumberTexture(kit.shirt, data.num, data.name);
-    const backMat = new THREE.MeshPhongMaterial({ map: numberTex, shininess: 14 });
+    const backMat = new THREE.MeshStandardMaterial({ map: numberTex, roughness: 0.72 });
+
+    // §7A.4 broadcast skin/fabric: wrapped diffuse + a weak fresnel rim, on the
+    // PLAYERS and nowhere else. Skin wraps further and warmer (that is what
+    // subsurface scattering looks like from ten metres); cloth barely wraps at
+    // all and keeps its own colour.
+    for (const m of [shirtMat, shortsMat, backMat]) {
+      queueBroadcastSkin(m, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
+    }
+    queueBroadcastSkin(socksMat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.06, rimPower: 3.6 });
+    queueBroadcastSkin(skinMat, { wrap: 0.42, wrapTint: 0xffbfa0, rim: 0.05, rimPower: 4.0 });
     const torsoGeo = new THREE.BoxGeometry(0.52, 0.58, 0.3);
     const torso = new THREE.Mesh(torsoGeo, [shirtMat, shirtMat, shirtMat, shirtMat, shirtMat, backMat]);
     torso.position.y = 1.24;
@@ -111,7 +128,7 @@ export class PlayerMesh {
       hair.position.y = 0.015;
       this.head.add(hair);
     }
-    const eyeMat = new THREE.MeshPhongMaterial({ color: 0x14161a, shininess: 60 });
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.25 });
     for (const side of [-1, 1]) {
       const eye = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 4), eyeMat);
       eye.position.set(0.055 * side, 0.02, 0.142);
