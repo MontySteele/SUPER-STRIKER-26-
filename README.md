@@ -174,6 +174,25 @@ npx tsx scripts/simTest.ts   # headless sims: league, knockouts+shootouts, tourn
 npx tsc --noEmit             # typecheck
 ```
 
+### Capture harness (§7A.9)
+
+The graphics quality gate: a fixed list of shots, each pinned to a seed, a
+sim-frame timestamp and a camera pose, rendered headlessly. Same commit +
+same shot name = the same pixels, so a graphics change is a PNG diff.
+
+```bash
+npm run capture                 # every shot → captures/ + captures/stats.json
+npm run capture -- --list       # the shot list and what each one is for
+npm run capture -- --shots midfield_wide --out /tmp/after
+npm run shoot-player -- --team arg   # four studio angles of one player model
+```
+
+The shot contract lives in `src/tools/shots.json`; editing a seed, a frame
+count or a pose invalidates every baseline taken before it. The game itself
+enters capture mode via `index.html?capture=<shot>` (menus, attract mode and
+audio are bypassed), and `viewer.html?team=bra&angle=side` is the standalone
+character viewer — open it with no `angle` for a live turntable.
+
 Architecture: `src/sim` (fixed 60Hz deterministic simulation, tournament
 engine, penalty controller), `src/render` (Three.js, interpolated),
 `src/ui` (HTML/CSS overlay), `src/audio` (Web Audio synthesis), `src/input`

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+captures/
 *.log
 .DS_Store
 

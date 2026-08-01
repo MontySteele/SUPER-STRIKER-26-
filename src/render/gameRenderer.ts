@@ -78,6 +78,8 @@ export class GameRenderer {
   // comet trail behind the ball during replays (additive, fades to the tail)
   private trail: THREE.Points | null = null;
   private trailPts: [number, number, number][] = [];
+  /** capture harness (§7A.9): when set, update() drives state but skips the draw */
+  private skipDraw = false;
 
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
@@ -480,7 +482,56 @@ export class GameRenderer {
 
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
+    if (!this.skipDraw) this.sceneMgr.render();
+  }
+
+  // ------------------------------------------------------ capture harness
+  // Two generic hooks for the headless shot runner (§7A.9): advance the
+  // visuals without drawing, and draw one frame from an arbitrary camera
+  // pose. Neither knows anything about the post chain, so a post-stack
+  // rewrite leaves them valid.
+
+  /**
+   * Advance the visual state one frame WITHOUT drawing. Lets a still be
+   * composed from thousands of sim frames without paying for thousands of
+   * fully post-processed renders.
+   */
+  advanceNoDraw(dtReal: number, alpha: number): void {
+    this.skipDraw = true;
+    try {
+      this.update(dtReal, alpha);
+    } finally {
+      this.skipDraw = false;
+    }
+  }
+
+  /**
+   * Pin the camera to a fixed pose and draw exactly one frame, bypassing the
+   * camera director. Returns that frame's GPU counters.
+   */
+  renderStill(pose: {
+    pos: [number, number, number];
+    look: [number, number, number];
+    fov?: number;
+  }): { drawCalls: number; triangles: number } {
+    const camera = this.sceneMgr.camera;
+    if (pose.fov !== undefined && camera.fov !== pose.fov) {
+      camera.fov = pose.fov;
+      camera.updateProjectionMatrix();
+    }
+    this.cam.jumpTo(pose.pos[0], pose.pos[1], pose.pos[2],
+      pose.look[0], pose.look[1], pose.look[2]);
+
+    // one composer.render() is many gl draws — autoReset would leave us
+    // reading only the last pass
+    const info = this.sceneMgr.renderer.info;
+    const prevAutoReset = info.autoReset;
+    info.autoReset = false;
+    info.reset();
     this.sceneMgr.render();
+    const stats = { drawCalls: info.render.calls, triangles: info.render.triangles };
+    info.autoReset = prevAutoReset;
+    return stats;
   }
 
   /** Release all GPU resources — call when the match ends. */

@@ -580,14 +580,29 @@ function loop(now: number): void {
   audio.update(paused ? 0 : frameDt); // no terrace claps over the PAUSED card
 }
 
-try {
-  applyRosterOverrides();
-  showMenu();
-} catch (err) {
-  // no WebGL2 (hardware acceleration off, blocklisted GPU, remote desktop):
-  // without this catch the page is a silent black rectangle
-  console.error('boot failed:', err);
-  showFatal(`This game needs <b>WebGL2</b>.<br>
-    Enable hardware acceleration in your browser settings (or try another
-    browser), then reload the page.`);
+// ------------------------------------------------------------ capture mode
+// §7A.9: `?capture=<shot>` boots straight into a deterministic still and stops.
+// It deliberately bypasses everything above — no menus, no attract match, no
+// audio, and no roster overrides (localStorage is not reproducible). The module
+// is loaded on demand so normal players never download the harness.
+const captureShot = new URLSearchParams(location.search).get('capture');
+if (captureShot) {
+  // the phone-pairing panel is the one piece of chrome that shows itself
+  // without the menus (the relay answers on the dev server) — it would sit in
+  // the corner of every capture
+  inMenus = false;
+  phonePanel.remove();
+  void import('./tools/capture').then((m) => m.runCapture(canvas, captureShot));
+} else {
+  try {
+    applyRosterOverrides();
+    showMenu();
+  } catch (err) {
+    // no WebGL2 (hardware acceleration off, blocklisted GPU, remote desktop):
+    // without this catch the page is a silent black rectangle
+    console.error('boot failed:', err);
+    showFatal(`This game needs <b>WebGL2</b>.<br>
+      Enable hardware acceleration in your browser settings (or try another
+      browser), then reload the page.`);
+  }
 }

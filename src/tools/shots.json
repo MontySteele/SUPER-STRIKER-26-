@@ -1,0 +1,72 @@
+{
+  "_contract": "The shot list is a contract (§7A.9): fixed teams, fixed seed, fixed sim-frame timestamp and a fixed camera pose per shot. Same commit + same shot name => the same pixels. Camera poses are in SCENE coords (x along the pitch length, y up, z across the width = sim y). Changing a seed, a frame count or a pose invalidates every baseline captured before it, so treat edits here like an API break.",
+  "_teams": "cze (red #D7141A) vs ger (white #FFFFFF) everywhere — two maximally distinct kits, and the keeper palette resolves clear of both.",
+  "shots": [
+    {
+      "name": "midfield_wide",
+      "note": "Open play, ball just left of the centre circle, both shapes on screen. Broadcast-height wide — the everyday readability shot.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": { "pos": [-7, 24, 46], "look": [-7, 0.7, -1], "fov": 36 }
+    },
+    {
+      "name": "goalmouth_scramble",
+      "note": "Frame 986 of seed 8230: a German shot being struck on the edge of the six with a Czech defender sliding in and the keeper set — 9 bodies inside 14m of the ball. Camera behind the west goal, shooting through the net past the keeper.",
+      "seed": 8230,
+      "home": "cze",
+      "away": "ger",
+      "frames": 986,
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": { "pos": [-63, 6, 1], "look": [-44, 1.5, 3.6], "fov": 36 }
+    },
+    {
+      "name": "celebration_closeup",
+      "note": "Seed 22343 scores at frame 1706 (Goretzka, 1'). 54 frames later he is mid-celebrate at (-46.1, 6.2) under falling confetti — a real goal celebration, not a posed close-up.",
+      "seed": 22343,
+      "home": "cze",
+      "away": "ger",
+      "frames": 1760,
+      "timeOfDay": "night",
+      "stadium": "mega",
+      "cam": { "pos": [-43, 1.95, 8.4], "look": [-46.1, 1.35, 6.2], "fov": 36 }
+    },
+    {
+      "name": "stadium_establishing",
+      "note": "The whole bowl from a high corner at night: roof line, three tiers, all four floodlight banks. The venue-scale and floodlight-bloom shot.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "night",
+      "stadium": "mega",
+      "cam": { "pos": [152, 128, 138], "look": [0, 2, 0], "fov": 36 }
+    },
+    {
+      "name": "pitch_stripes_low_sun",
+      "note": "Knee-height camera raking the full length of the pitch into a low sunset key — the mowing stripes, the goalmouth wear and the grass grain all read at a glancing angle here and nowhere else.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 900,
+      "timeOfDay": "sunset",
+      "stadium": "national",
+      "cam": { "pos": [-42, 2.4, 11], "look": [8, -1.5, -1], "fov": 36 }
+    },
+    {
+      "name": "specular_bloom_check",
+      "note": "A player at 6m, backlit by the low sunset key, standing against the pool of sun-raked grass behind him. This is the §7A.6 grey-halo regression test: the bloom must rim the silhouette, not paint a desaturated halo around it.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 900,
+      "timeOfDay": "sunset",
+      "stadium": "national",
+      "cam": { "pos": [-11, 1.35, -3], "look": [-16.4, 1.55, 1], "fov": 36 }
+    }
+  ]
+}

@@ -12,6 +12,9 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         controller: resolve(__dirname, 'controller.html'),
+        // studio character viewer (§7A.9) — a build input so it works in dev
+        // and survives into dist/ for reviewing kits on a deployed build
+        viewer: resolve(__dirname, 'viewer.html'),
       },
     },
   },

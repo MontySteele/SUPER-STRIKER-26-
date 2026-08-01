@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "capture": "node tools/capture.mjs",
+    "shoot-player": "node tools/shoot-player.mjs"
   },
   "repository": {
     "type": "git",
@@ -19,6 +21,7 @@
   "devDependencies": {
     "@types/three": "^0.185.1",
     "@types/ws": "^8.18.1",
+    "playwright": "^1.62.1",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",
     "vite": "^8.1.4",
