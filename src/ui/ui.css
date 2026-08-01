@@ -469,6 +469,15 @@
 }
 .pip.ok { background: #62d26f; }
 .pip.warn { background: #ffce4a; }
+/* the "2ND" tag on a partner slot: quieter than the player number it rides */
+.setting-row .slot-role {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: #ffce4a;
+  opacity: 0.75;
+  margin-left: 6px;
+}
 .setting-row .slot-sub {
   display: block;
   font-size: 12px;
@@ -544,11 +553,30 @@
 }
 
 /* ---------- M4 additions ---------- */
+/* Seat bars sit in slot order out from the centre: the home pair (P1, P3) to
+   the left, the away pair (P2, P4) to the right. P1/P2 keep their 1v1 spots
+   so a two-player match looks exactly as it always did (§5.4.6). */
 .power-wrap.p1 { left: calc(50% - 130px); }
 .power-wrap.p2 { left: calc(50% + 130px); }
+.power-wrap.p3 { left: calc(50% - 345px); }
+.power-wrap.p4 { left: calc(50% + 345px); }
 .power-wrap.p2 .power-fill {
   background: linear-gradient(90deg, #4a9ad8, #d8c03a 60%, #d84a3a);
 }
+.power-wrap.p3 .power-fill {
+  background: linear-gradient(90deg, #d87a2e, #d8c03a 60%, #d84a3a);
+}
+.power-wrap.p4 .power-fill {
+  background: linear-gradient(90deg, #3aa8d8, #d8c03a 60%, #d84a3a);
+}
+
+/* nameplate accent = that seat's switch-indicator colour, so the label under
+   the arrow and the arrow itself are obviously the same player */
+.nameplate.np1 { border-bottom-color: #ffce4a; }
+.nameplate.np2 { border-bottom-color: #dde4f0; }
+.nameplate.np3 { border-bottom-color: #ff8c2e; }
+.nameplate.np4 { border-bottom-color: #5ec8ff; }
+.nameplate { border-bottom-width: 2px; }
 
 .card-flash {
   position: absolute;

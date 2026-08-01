@@ -123,11 +123,11 @@ export class PenaltyController {
   }
 
   private takerSeat() {
-    return this.match.seats[this.kickingTeam];
+    return this.match.primarySeat(this.kickingTeam);
   }
 
   private keeperSeat() {
-    return this.match.seats[1 - this.kickingTeam];
+    return this.match.primarySeat(1 - this.kickingTeam);
   }
 
   update(dt: number): void {

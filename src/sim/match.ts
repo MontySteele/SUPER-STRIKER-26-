@@ -1,6 +1,7 @@
-// Match orchestrator: fixed-timestep sim, human control (1–2 seats), possession
-// model, referee (bounds / goals / fouls / cards / penalties), extra time and
-// shootouts for knockout draws, and the match state machine.
+// Match orchestrator: fixed-timestep sim, human control (up to 4 seats, two
+// per side — §5.4.6), possession model, referee (bounds / goals / fouls /
+// cards / penalties), extra time and shootouts for knockout draws, and the
+// match state machine.
 
 import { clamp, dist2, len2, norm2, sub2, v2, type V2 } from '../core/math';
 import { EventBus } from '../core/events';
@@ -45,6 +46,29 @@ export const DIFFICULTIES: Record<DifficultyName, Difficulty> = {
   legend:  { cpuNoise: 0.5, cpuKeeperReactMult: 0.85, humanShotErrMult: 1.15, cpuSprint: true },
 };
 
+// ------------------------------------------------------------- seat slots (§5.4.6)
+// Four slots, laid out [team0 primary, team1 primary, team0 partner, team1
+// partner]. Primaries first is not cosmetic: it keeps a 1v1 sitting in slots
+// 0 and 1 exactly where it always was, so "P2" still means "the away human"
+// on every banner, nameplate and reconnect toast.
+
+export const SEAT_SLOTS = 4;
+/** Which side a seat slot plays for. */
+export function slotTeam(slot: number): number { return slot & 1; }
+/** 0 = the side's on-ball driver, 1 = its off-ball partner. */
+export function slotRole(slot: number): number { return slot >> 1; }
+/** The slot a given side/role pair lives in. */
+export function teamSlot(teamIdx: number, role: number): number { return role * 2 + teamIdx; }
+
+/** How far off the ball the useful off-ball runner sits, in metres. */
+const PARTNER_SUPPORT_RANGE = 14;
+/** Credit the man the partner is already driving, so control doesn't strobe. */
+const PARTNER_STICKY = 12;
+/** Minimum seconds between partner handovers… */
+const PARTNER_HOLD = 1.4;
+/** …unless the new man is at least this much better placed. */
+const PARTNER_OVERRIDE = 18;
+
 interface RestartInfo {
   kind: RestartKind;
   teamIdx: number;
@@ -63,8 +87,12 @@ interface ActiveShot {
 export interface MatchOptions {
   home: TeamData;
   away: TeamData;
-  /** one input seat per team; null = CPU */
-  seats: [PlayerInput | null, PlayerInput | null];
+  /**
+   * Input seats by slot (see SEAT_SLOTS): [team0, team1, team0 partner,
+   * team1 partner]. null = nobody sitting there. A 1v1 passes the two-entry
+   * tuple it always did; the rest are padded with nulls.
+   */
+  seats: (PlayerInput | null)[];
   halfLengthSec: number;       // real seconds per half
   difficulty: DifficultyName;
   /** knockout: a draw goes to extra time → penalties */
@@ -82,7 +110,8 @@ export class Match {
   offside = new OffsideTracker();
   keepers: [KeeperBrain, KeeperBrain];
   difficulty: Difficulty;
-  seats: [PlayerInput | null, PlayerInput | null];
+  /** Always SEAT_SLOTS long, whatever the caller handed us. */
+  seats: (PlayerInput | null)[];
 
   phase: MatchPhase = 'kickoff';
   phaseTimer = 0;
@@ -100,17 +129,20 @@ export class Match {
   shootoutWinner: number | null = null;
 
   possessionTeam = 0;
-  controlled: [PlayerEntity | null, PlayerEntity | null] = [null, null];
+  /** The player each seat slot is steering, by slot. */
+  controlled: (PlayerEntity | null)[] = [null, null, null, null];
   private lastAutoSwitch = [-99, -99];
+  /** simTime of the last partner handover, per team. */
+  private partnerSwitchAt = [-99, -99];
   /** Every goal of the match, in order — feeds the tournament Golden Boot. */
   goalLog: { teamIdx: number; scorerName: string; ownGoal: boolean; minute: number }[] = [];
 
   private cpuDecisionTimers = [0, 0];
+  private shotCharging = [false, false, false, false];
   /** Seconds of possession without reaching the final third (per team). */
   buildupTime = [0, 0];
   /** in-flight shot, if any — keepers keep their hands live while one exists */
   activeShot: ActiveShot | null = null;
-  private shotCharging = [false, false];
   private buildupTimer = 0;
   private prevBallPos: V2 = v2();
   private tackleCooldowns = new Map<PlayerEntity, number>();
@@ -122,10 +154,11 @@ export class Match {
 
   constructor(public opts: MatchOptions) {
     this.rng = new RNG(opts.seed ?? 0xC0FFEE);
-    this.seats = opts.seats;
+    this.seats = [];
+    for (let s = 0; s < SEAT_SLOTS; s++) this.seats.push(opts.seats[s] ?? null);
     this.teams = [
-      new Team(opts.home, 0, 1, opts.seats[0] !== null),
-      new Team(opts.away, 1, -1, opts.seats[1] !== null),
+      new Team(opts.home, 0, 1, this.primarySlot(0) >= 0),
+      new Team(opts.away, 1, -1, this.primarySlot(1) >= 0),
     ];
     this.keepers = [
       new KeeperBrain(this.teams[0], this.teams[0].keeper),
@@ -147,6 +180,52 @@ export class Match {
 
   get allPlayers(): PlayerEntity[] {
     return [...this.teams[0].players, ...this.teams[1].players];
+  }
+
+  // ---------------------------------------------------------------- seats (§5.4.6)
+  // Roles are DERIVED from which slots are occupied, never stored: the first
+  // seat a side has is its primary (the on-ball/switch driver), the second is
+  // its partner. That way the disconnect ladder emptying slot 0 quietly
+  // promotes the remaining human instead of leaving a side half-steered.
+
+  /** Slot driving this side's on-ball player; -1 when the side is CPU. */
+  primarySlot(teamIdx: number): number {
+    for (let role = 0; role < 2; role++) {
+      const s = teamSlot(teamIdx, role);
+      if (this.seats[s]) return s;
+    }
+    return -1;
+  }
+
+  /** Slot of this side's SECOND human; -1 when there isn't one. */
+  partnerSlot(teamIdx: number): number {
+    const primary = this.primarySlot(teamIdx);
+    if (primary < 0) return -1;
+    for (let role = 0; role < 2; role++) {
+      const s = teamSlot(teamIdx, role);
+      if (s !== primary && this.seats[s]) return s;
+    }
+    return -1;
+  }
+
+  /** The seat driving this side's on-ball player (null = CPU side). */
+  primarySeat(teamIdx: number): PlayerInput | null {
+    const s = this.primarySlot(teamIdx);
+    return s < 0 ? null : this.seats[s];
+  }
+
+  /** The player this side's on-ball human is steering. */
+  primaryPlayer(teamIdx: number): PlayerEntity | null {
+    const s = this.primarySlot(teamIdx);
+    return s < 0 ? null : this.controlled[s];
+  }
+
+  /** Is any human steering this player right now? (AI skips those.) */
+  humanDriven(p: PlayerEntity): boolean {
+    for (let s = 0; s < SEAT_SLOTS; s++) {
+      if (this.seats[s] && this.controlled[s] === p) return true;
+    }
+    return false;
   }
 
   private halfLenFor(half: number): number {
@@ -189,33 +268,44 @@ export class Match {
     this.keepers[1].reset();
     this.teams[0].lineUp(kickingTeam === 0);
     this.teams[1].lineUp(kickingTeam === 1);
+    for (let s = 0; s < SEAT_SLOTS; s++) {
+      this.controlled[s] = null;
+      this.shotCharging[s] = false;
+    }
     for (let i = 0; i < 2; i++) {
-      this.controlled[i] = this.seats[i] ? this.nearestOutfield(this.teams[i], v2(0, 0)) : null;
-      this.shotCharging[i] = false;
+      const primary = this.primarySlot(i);
+      if (primary < 0) continue;
+      this.controlled[primary] = this.nearestOutfield(this.teams[i], v2(0, 0));
+      this.assignPartner(i, true);
     }
   }
 
   /**
-   * Swap a seat mid-match — null hands the side to the CPU, a PlayerInput
+   * Swap a seat mid-match — null hands the slot to the CPU, a PlayerInput
    * takes it back (§5.4.5: a remote guest who drops out, and returns). The
-   * whole sim already branches on `seats[i] === null` and `Team.isHuman`, so
-   * this is the entire mechanism: nothing else needs to know it happened.
+   * whole sim already branches on which slots are filled and on
+   * `Team.isHuman`, so this is the entire mechanism: nothing else needs to
+   * know it happened. Emptying a side's primary slot promotes its partner.
    */
-  setSeat(idx: number, seat: PlayerInput | null): void {
-    if (idx !== 0 && idx !== 1 || this.seats[idx] === seat) return;
+  setSeat(slot: number, seat: PlayerInput | null): void {
+    if (slot < 0 || slot >= SEAT_SLOTS || this.seats[slot] === seat) return;
+    const teamIdx = slotTeam(slot);
     // a press buffered by the old occupant must not fire for the new one
-    this.seats[idx]?.clearBuffers();
-    this.seats[idx] = seat;
-    this.teams[idx].isHuman = seat !== null;
-    this.shotCharging[idx] = false;
+    this.seats[slot]?.clearBuffers();
+    this.seats[slot] = seat;
+    this.teams[teamIdx].isHuman = this.primarySlot(teamIdx) >= 0;
+    this.shotCharging[slot] = false;
     if (!seat) {
-      this.controlled[idx] = null;
-      return;
+      this.controlled[slot] = null;
+    } else {
+      seat.clearBuffers();
+      if (!this.controlled[slot] || this.controlled[slot]!.sentOff) {
+        this.controlled[slot] = this.nearestOutfield(this.teams[teamIdx], v2(this.ball.pos.x, this.ball.pos.y));
+      }
     }
-    seat.clearBuffers();
-    if (!this.controlled[idx] || this.controlled[idx]!.sentOff) {
-      this.controlled[idx] = this.nearestOutfield(this.teams[idx], v2(this.ball.pos.x, this.ball.pos.y));
-    }
+    // the side's roles may have just shuffled — re-derive the pairing so the
+    // two humans are never left wearing the same shirt
+    this.assignPartner(teamIdx, true);
   }
 
   private nearestOutfield(team: Team, to: V2): PlayerEntity {
@@ -264,7 +354,7 @@ export class Match {
     }
     for (const p of this.allPlayers) p.update(dt);
 
-    const seat = this.seats[this.kickoffTeam];
+    const seat = this.primarySeat(this.kickoffTeam);
     const ready = dist2(taker.pos, v2(0, 0)) < 1.6 && this.phaseTimer > 0.6;
     const go = ready && (seat
       ? (seat.consumePress('pass', 600) || this.phaseTimer > 4)
@@ -280,7 +370,7 @@ export class Match {
       taker.playAnim('pass', 0.2);
       this.phase = 'play';
       this.events.emit({ type: 'kickoff', half: this.half });
-      if (this.seats[mate.teamIdx]) this.controlled[mate.teamIdx] = mate;
+      this.setPrimaryControl(mate.teamIdx, mate);
       seat?.clearBuffers();
     }
   }
@@ -297,6 +387,8 @@ export class Match {
     // the tick against the freshly-spotted ball converted goalmouth offsides
     // into awarded GOALS (checkGoalAndBounds saw the reset as a plane crossing)
     if (this.phase !== 'play') return;
+    // the second human on a side follows the run of play, not the ball
+    for (let i = 0; i < 2; i++) this.assignPartner(i);
     this.updateHumanControl(dt);
     this.updateAI(dt);
     for (const p of this.allPlayers) p.update(dt);
@@ -490,19 +582,20 @@ export class Match {
     if (this.activeShot && best.teamIdx !== this.activeShot.shooter.teamIdx) this.activeShot = null;
     // auto-switch: humans always control the teammate on the ball — except
     // the keeper (steering a holding GK dragged held balls into own nets)
-    if (this.seats[best.teamIdx] && !best.isGK) {
-      this.controlled[best.teamIdx] = best;
-      this.shotCharging[best.teamIdx] = false;
+    const winner = this.primarySlot(best.teamIdx);
+    if (winner >= 0 && !best.isGK) {
+      this.setPrimaryControl(best.teamIdx, best);
+      this.shotCharging[winner] = false;
     }
     // defending seat: hand control to the best-placed defender, FIFA-style.
     // Without this the defending human is usually steering a player nowhere
     // near the ball (often off-screen) — which reads as "my input does nothing"
-    if (this.seats[1 - best.teamIdx]) this.autoSwitchDefender(1 - best.teamIdx);
+    if (this.primarySlot(1 - best.teamIdx) >= 0) this.autoSwitchDefender(1 - best.teamIdx);
   }
 
   private autoSwitchDefender(teamIdx: number): void {
     const team = this.teams[teamIdx];
-    const cur = this.controlled[teamIdx];
+    const cur = this.primaryPlayer(teamIdx);
     const ball = this.ball.pos;
     const ownGoalX = -HALF_L * team.attackDir;
     let best: PlayerEntity | null = null;
@@ -522,9 +615,92 @@ export class Match {
     // rate limit: quick opposition passing shouldn't hop control around
     // unless the new man is decisively better placed
     if (this.simTime - this.lastAutoSwitch[teamIdx] < 0.7 && curScore - bestScore < 6) return;
-    this.controlled[teamIdx] = best;
+    this.setPrimaryControl(teamIdx, best);
     this.lastAutoSwitch[teamIdx] = this.simTime;
-    this.events.emit({ type: 'switch', teamIdx });
+    this.events.emit({ type: 'switch', teamIdx, slot: this.primarySlot(teamIdx) });
+  }
+
+  // ------------------------------------------------- paired humans (§5.4.6)
+
+  /**
+   * Give a side's on-ball human a new player. Every path that moves the
+   * "switched" man — the auto-switches above, the switch button, restarts —
+   * goes through here, because a SECOND human on that side may be wearing
+   * the shirt he's switching to. When it collides the two humans swap: the
+   * partner inherits the man the primary just walked away from, which is
+   * deterministic and keeps both sticks on a player, rather than dumping the
+   * partner somewhere the arbitration happens to like this frame.
+   */
+  private setPrimaryControl(teamIdx: number, p: PlayerEntity): void {
+    const slot = this.primarySlot(teamIdx);
+    if (slot < 0) return;
+    const prev = this.controlled[slot];
+    this.controlled[slot] = p;
+    const mate = this.partnerSlot(teamIdx);
+    if (mate < 0 || this.controlled[mate] !== p) return;
+    this.controlled[mate] = prev && prev !== p && !prev.sentOff ? prev : null;
+    // a swap is a deliberate handover — hold it through the cooldown so the
+    // scoring below doesn't drag him off again on the very next tick
+    this.partnerSwitchAt[teamIdx] = this.simTime;
+    this.events.emit({ type: 'switch', teamIdx, slot: mate });
+  }
+
+  /**
+   * Hand a side's second human the best-placed OTHER player on his team.
+   *
+   * Defending, "best placed" is the shape autoSwitchDefender already uses —
+   * near the ball, goal-side of it — so the pair falls naturally into presser
+   * and cover. Attacking, the useful second man is not a shadow of the
+   * carrier but an outlet: about PARTNER_SUPPORT_RANGE metres off the ball
+   * and as far up the pitch as he can get, which is the run you actually want
+   * a human making while your mate carries.
+   *
+   * Two brakes stop it strobing between two near-equal candidates: the man
+   * he's already driving is credited PARTNER_STICKY, and a handover inside
+   * PARTNER_HOLD seconds has to be PARTNER_OVERRIDE better to happen at all.
+   * The keeper is never offered unless he is genuinely all that's left.
+   */
+  private assignPartner(teamIdx: number, force = false, avoid: PlayerEntity | null = null): void {
+    const slot = this.partnerSlot(teamIdx);
+    if (slot < 0) return;
+    const team = this.teams[teamIdx];
+    const primary = this.primaryPlayer(teamIdx);
+    let cur = this.controlled[slot];
+    // belt and braces: two humans must never end up on one shirt
+    if (cur && (cur === primary || cur.sentOff)) { cur = null; force = true; }
+    const ballV: V2 = { x: this.ball.pos.x, y: this.ball.pos.y };
+    const attacking = this.possessionTeam === teamIdx;
+    const ownGoalX = -HALF_L * team.attackDir;
+
+    let best: PlayerEntity | null = null;
+    let bestScore = Infinity;
+    let curScore = Infinity;
+    for (const p of team.players) {
+      if (p.isGK || p.sentOff || p.diving) continue;
+      if (p === primary || p === avoid) continue;
+      const d = dist2(p.pos, ballV);
+      let score: number;
+      if (attacking) {
+        const advance = p.pos.x * team.attackDir;
+        score = Math.abs(d - PARTNER_SUPPORT_RANGE) + (HALF_L - advance) * 0.25;
+      } else {
+        const goalSide = (p.pos.x - ballV.x) * Math.sign(ownGoalX - ballV.x) > 0;
+        score = d + (goalSide ? 0 : 9);
+      }
+      if (p === cur) { score -= PARTNER_STICKY; curScore = score; }
+      if (score < bestScore) { bestScore = score; best = p; }
+    }
+    // ten men down to the goalkeeper: the gloves are all that's left to give
+    const gk = team.keeper;
+    if (!best && gk !== primary && gk !== avoid && !gk.sentOff) best = gk;
+
+    if (!best || best === cur) return;
+    if (!force && cur
+      && this.simTime - this.partnerSwitchAt[teamIdx] < PARTNER_HOLD
+      && curScore - bestScore < PARTNER_OVERRIDE) return;
+    this.controlled[slot] = best;
+    this.partnerSwitchAt[teamIdx] = this.simTime;
+    this.events.emit({ type: 'switch', teamIdx, slot });
   }
 
   /** Close control: the ball is repeatedly touched ahead, never glued (§6.1). */
@@ -565,15 +741,16 @@ export class Match {
   // ---------------------------------------------------------------- human control
 
   private updateHumanControl(dt: number): void {
-    for (let i = 0; i < 2; i++) {
-      const seat = this.seats[i];
-      const p = this.controlled[i];
+    for (let s = 0; s < SEAT_SLOTS; s++) {
+      const seat = this.seats[s];
+      const p = this.controlled[s];
       if (!seat || !p || p.sentOff) continue;
-      this.updateSeat(dt, i, seat, p);
+      this.updateSeat(dt, s, seat, p);
     }
   }
 
-  private updateSeat(dt: number, teamIdx: number, seat: PlayerInput, p: PlayerEntity): void {
+  private updateSeat(dt: number, slot: number, seat: PlayerInput, p: PlayerEntity): void {
+    const teamIdx = slotTeam(slot);
     const team = this.teams[teamIdx];
     const stick = seat.getStick();
     const stickV: V2 = { x: stick.x, y: stick.y };
@@ -594,23 +771,23 @@ export class Match {
     const aimDir: V2 = stickLen > 0.15 ? norm2(stickV) : { x: Math.cos(p.facing), y: Math.sin(p.facing) };
 
     if (onBall) {
-      if (seat.isHeld('shoot')) this.shotCharging[teamIdx] = true;
+      if (seat.isHeld('shoot')) this.shotCharging[slot] = true;
       const rel = seat.consumeRelease('shoot');
       const held = seat.heldDuration('shoot');
-      if (this.shotCharging[teamIdx] && !rel && !seat.isHeld('shoot')) {
+      if (this.shotCharging[slot] && !rel && !seat.isHeld('shoot')) {
         // the release edge was destroyed (pause/replay/alt-tab mid-charge) —
         // cancel the charge instead of latching every button dead forever
-        this.shotCharging[teamIdx] = false;
+        this.shotCharging[slot] = false;
       }
-      if (rel || (this.shotCharging[teamIdx] && held >= SHOT_MAX_HOLD)) {
+      if (rel || (this.shotCharging[slot] && held >= SHOT_MAX_HOLD)) {
         const heldFor = rel ? rel.heldFor : SHOT_MAX_HOLD;
-        this.shotCharging[teamIdx] = false;
+        this.shotCharging[slot] = false;
         seat.clearBuffers();
         const power = clamp(heldFor / SHOT_MAX_HOLD, 0.15, 1);
         executeShot(this, p, clamp(aimDir.y * 1.4, -1, 1), power);
         return;
       }
-      if (this.shotCharging[teamIdx]) return; // don't pass while charging
+      if (this.shotCharging[slot]) return; // don't pass while charging
 
       if (seat.consumePress('pass')) {
         const target = bestPassTarget(this, p, aimDir, {});
@@ -621,8 +798,8 @@ export class Match {
       if (seat.consumePress('loft')) { executeLoft(this, p, aimDir); return; }
       if (seat.consumePress('through')) { executeThrough(this, p, aimDir); return; }
     } else {
-      this.shotCharging[teamIdx] = false;
-      if (seat.consumePress('switch')) this.switchPlayer(team, teamIdx);
+      this.shotCharging[slot] = false;
+      if (seat.consumePress('switch')) this.switchPlayer(slot);
       if (seat.isHeld('pass')) {
         p.moveToward({ x: this.ball.pos.x, y: this.ball.pos.y }, 1, sprint);
       }
@@ -630,22 +807,31 @@ export class Match {
     }
   }
 
-  private switchPlayer(team: Team, teamIdx: number): void {
+  private switchPlayer(slot: number): void {
+    const teamIdx = slotTeam(slot);
+    const team = this.teams[teamIdx];
+    if (slot !== this.primarySlot(teamIdx)) {
+      // the off-ball human wants a different shirt: re-roll HIS man only. He
+      // can't reach for the one his partner is driving — that's the primary's
+      // switch, and it lands as a swap.
+      this.assignPartner(teamIdx, true, this.controlled[slot]);
+      return;
+    }
     const ball = this.ball.pos;
     const ownGoalX = -HALF_L * team.attackDir;
     let best: PlayerEntity | null = null;
     let bestScore = Infinity;
     for (const p of team.players) {
-      if (p.isGK || p.sentOff || p === this.controlled[teamIdx]) continue;
+      if (p.isGK || p.sentOff || p === this.controlled[slot]) continue;
       const d = dist2(p.pos, { x: ball.x, y: ball.y });
       const goalSide = (p.pos.x - ball.x) * Math.sign(ownGoalX - ball.x) > 0;
       const score = d + (goalSide ? 0 : 9);
       if (score < bestScore) { bestScore = score; best = p; }
     }
     if (best) {
-      this.controlled[teamIdx] = best;
+      this.setPrimaryControl(teamIdx, best);
       this.lastAutoSwitch[teamIdx] = this.simTime;
-      this.events.emit({ type: 'switch', teamIdx });
+      this.events.emit({ type: 'switch', teamIdx, slot });
     }
   }
 
@@ -741,11 +927,12 @@ export class Match {
     p.pos = { x: clamp(p.pos.x, -30, 30), y: (HALF_W + 6) * Math.sign(p.pos.y || 1) };
     p.vel = v2();
     p.stop();
-    for (let i = 0; i < 2; i++) {
-      if (this.controlled[i] === p) {
-        this.controlled[i] = this.nearestOutfield(this.teams[i], p.pos);
-      }
+    for (let s = 0; s < SEAT_SLOTS; s++) {
+      if (this.controlled[s] !== p) continue;
+      this.controlled[s] = this.nearestOutfield(this.teams[slotTeam(s)], p.pos);
     }
+    // the replacement may be the shirt his partner was already wearing
+    this.assignPartner(p.teamIdx, true);
   }
 
   // ---------------------------------------------------------------- penalties (in-match)
@@ -809,7 +996,7 @@ export class Match {
       for (const p of team.players) {
         if (p.isGK) continue; // KeeperBrain owns the keeper
         if (p.sentOff) { p.stop(); continue; }
-        if (this.seats[team.idx] && p === this.controlled[team.idx]) continue;
+        if (this.humanDriven(p)) continue;
         if (p.diving) continue;
 
         if (owner === p) {
@@ -850,7 +1037,7 @@ export class Match {
 
   /** Desperate CPU slide when the carrier is getting away. */
   private maybeCpuSlide(dt: number, team: Team, p: PlayerEntity, carrier: PlayerEntity | null): void {
-    if (!carrier || this.seats[team.idx]) return; // human team defends manually
+    if (!carrier || team.isHuman) return; // human team defends manually
     if ((this.tackleCooldowns.get(p) ?? 0) > 0 || p.actionLock > 0) return;
     const d = dist2(p.pos, carrier.pos);
     if (d < 1.4 || d > 3.6) return;
@@ -1031,12 +1218,14 @@ export class Match {
     this.ball.reset(pos.x, pos.y);
     this.offside.clear();
     this.activeShot = null;
+    for (let s = 0; s < SEAT_SLOTS; s++) this.shotCharging[s] = false;
     for (let i = 0; i < 2; i++) {
-      this.shotCharging[i] = false;
-      if (!this.seats[i]) continue;
-      this.controlled[i] = i === teamIdx && !taker.isGK
+      const primary = this.primarySlot(i);
+      if (primary < 0) continue;
+      this.controlled[primary] = i === teamIdx && !taker.isGK
         ? taker
         : this.nearestOutfield(this.teams[i], pos);
+      this.assignPartner(i, true);
     }
   }
 
@@ -1078,7 +1267,7 @@ export class Match {
     const atSpot = dist2(r.taker.pos, r.pos) < 1.4;
     if (!atSpot && r.timer < 6) return;
 
-    const seat = this.seats[r.teamIdx];
+    const seat = this.primarySeat(r.teamIdx);
     let take = false;
     let action: 'short' | 'cross' = r.kind === 'corner' ? 'cross' : 'short';
     if (seat && r.timer > 0.5) {
@@ -1100,7 +1289,7 @@ export class Match {
     const taker = r.taker;
     taker.pos = { x: r.pos.x, y: r.pos.y };
     this.ball.reset(r.pos.x, r.pos.y);
-    const seat = this.seats[r.teamIdx];
+    const seat = this.primarySeat(r.teamIdx);
     const stick = seat ? seat.getStick() : { x: 0, y: 0 };
     const aimDir: V2 = seat && len2(stick) > 0.2
       ? norm2(stick)
