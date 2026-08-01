@@ -19,7 +19,7 @@ const CONTROLS_OPTIONS: [ControlsSetting, string][] = [
   ['fade', 'FADE'], ['on', 'ALWAYS'], ['off', 'OFF'],
 ];
 
-export type GameMode = 'kickoff' | 'versus' | 'shootout' | 'golden';
+export type GameMode = 'kickoff' | 'versus' | 'online' | 'shootout' | 'golden';
 
 export type MenuResult =
   | {
@@ -99,6 +99,10 @@ export class Menu {
           ? '2P couch play · keyboard vs gamepad'
           : '2P couch play · CONNECT A GAMEPAD', id: 'versus',
         disabled: this.padCount() === 0,
+      },
+      {
+        label: 'VERSUS — REMOTE', sub: 'Invite a friend by room code · they play from their own laptop',
+        id: 'online',
       },
       { label: 'GOLDEN GOAL', sub: 'Party mode · no clock · next goal wins', id: 'golden' },
       { label: 'TOURNAMENT', sub: '48 teams · groups · knockout · glory', id: 'tournament' },
@@ -331,7 +335,7 @@ export class Menu {
             <h1 class="menu-title">SUPER STRIKER '26</h1>
             <div class="menu-sub">THE PEOPLE'S FOOTBALL</div>
             <div class="menu-hint">PRESS ANY KEY</div>
-            <div class="controls-card">RUNS LOCALLY · 60FPS · 0 MICROTRANSACTIONS · NO PHONE REQUIRED</div>
+            <div class="controls-card">RUNS LOCALLY · 60FPS · 0 MICROTRANSACTIONS · NO ACCOUNT REQUIRED</div>
           </div>`;
         break;
       case 'mode':
@@ -372,7 +376,8 @@ export class Menu {
     const picking = this.mode === 'tournament'
       ? 'PICK YOUR NATION'
       : this.screen === 'pickHome' ? 'PICK YOUR TEAM'
-      : this.mode === 'versus' ? 'PLAYER 2 — PICK YOUR TEAM' : 'PICK YOUR OPPONENT';
+      : this.mode === 'versus' || this.mode === 'online'
+        ? 'PLAYER 2 — PICK YOUR TEAM' : 'PICK YOUR OPPONENT';
     const teams = this.sortedTeams();
     const cells = teams.map((t, i) => {
       const stars = '★'.repeat(Math.max(1, Math.min(5, t.tier))); // tier 5 = elite
@@ -414,7 +419,8 @@ export class Menu {
     const goLabel = this.mode === 'tournament'
       ? (this.overwriteArmed ? '⚠ OVERWRITES YOUR SAVED RUN — PRESS AGAIN' : 'START TOURNAMENT')
       : this.mode === 'shootout' ? 'TO THE SPOT!'
-      : this.mode === 'golden' ? 'NEXT GOAL WINS!' : 'KICK OFF!';
+      : this.mode === 'golden' ? 'NEXT GOAL WINS!'
+      : this.mode === 'online' ? 'INVITE PLAYERS' : 'KICK OFF!';
     const rowsHtml = rows.map(([k, v], i) =>
       `<div class="setting-row${i === this.focus ? ' focus' : ''}" data-row="${i}">
         <span>${k}</span><span class="value">◀ ${v} ▶</span>

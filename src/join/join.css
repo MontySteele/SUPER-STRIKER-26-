@@ -1,0 +1,232 @@
+/* Guest controller page (§5.4.2). Same broadcast package as the game overlay
+   — glossy dark, gold accents, hard italic headings — but this page renders
+   no gameplay at all. It is a terminal for one pair of hands. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: radial-gradient(120% 90% at 50% 0%, #131924 0%, #06090d 62%);
+  color: #eef1f6;
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+.join-shell {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 26px 20px 48px;
+}
+
+/* ---------- header ---------- */
+.join-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  padding-bottom: 14px;
+  margin-bottom: 24px;
+}
+.join-head .brand {
+  font-size: 24px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.06em;
+}
+.join-head .tag {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: #b89230;
+}
+
+/* ---------- generic blocks ---------- */
+h2 {
+  margin: 0 0 6px;
+  font-size: 19px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.07em;
+}
+.muted {
+  color: #8a93a8;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0 0 20px;
+}
+.panel {
+  background: linear-gradient(180deg, rgba(22, 27, 36, 0.94), rgba(9, 11, 16, 0.94));
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-left: 5px solid #b89230;
+  border-radius: 5px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: #8a93a8;
+  margin-bottom: 7px;
+}
+input {
+  width: 100%;
+  background: rgba(6, 9, 13, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  color: #eef1f6;
+  font-family: inherit;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 11px 13px;
+}
+input:focus {
+  outline: none;
+  border-color: #b89230;
+}
+input.code {
+  font-size: 30px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.36em;
+  text-align: center;
+  text-transform: uppercase;
+}
+.field { margin-bottom: 16px; }
+
+button {
+  width: 100%;
+  background: linear-gradient(180deg, #b89230, #8a6a1a);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 4px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.12em;
+  padding: 13px;
+  cursor: pointer;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+button:disabled {
+  filter: grayscale(1);
+  opacity: 0.45;
+  cursor: default;
+}
+button.ghost {
+  background: rgba(255, 255, 255, 0.06);
+  color: #eef1f6;
+  text-shadow: none;
+}
+
+/* ---------- connection strip ---------- */
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: linear-gradient(180deg, #262b36 0%, #14171e 55%, #0c0e13 100%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  padding: 9px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 18px;
+}
+.pip {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #d84a3a;
+  box-shadow: 0 0 8px currentColor;
+  color: #d84a3a;
+  flex: none;
+}
+.pip.ok { background: #62d26f; color: #62d26f; }
+.pip.warn { background: #ffce4a; color: #ffce4a; }
+.strip .sep { color: #4a5265; }
+.strip .rtt { font-variant-numeric: tabular-nums; color: #8a93a8; }
+
+/* ---------- input card ---------- */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.card-head .kind {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: #06090d;
+  background: #b89230;
+  border-radius: 3px;
+  padding: 3px 8px;
+}
+.binds {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px 14px;
+  font-size: 13px;
+}
+.binds .act { color: #c6cddc; }
+.binds .key {
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #ffce4a;
+  text-align: right;
+}
+
+/* ---------- slot banner ---------- */
+.slot-banner {
+  position: fixed;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  z-index: 20;
+  cursor: pointer;
+}
+.slot-banner.show { display: flex; }
+.slot-banner .who {
+  font-size: clamp(30px, 11vw, 76px);
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.04em;
+  line-height: 1.05;
+  text-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+}
+.slot-banner .team {
+  margin-top: 10px;
+  font-size: clamp(16px, 5vw, 30px);
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: 0.16em;
+  opacity: 0.86;
+}
+.slot-banner .dismiss {
+  margin-top: 34px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  opacity: 0.6;
+}
+
+/* ---------- error ---------- */
+.error {
+  border-left-color: #d84a3a;
+}
+.error h2 { color: #ff8d7d; }

@@ -1,17 +1,16 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
-import controllerRelay from './vite-plugin-controller';
 
 export default defineConfig({
   base: './',
-  plugins: [controllerRelay()],
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 1500,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
-        controller: resolve(__dirname, 'controller.html'),
+        // guest controller page (§5.4.2) — inputs only, renders no gameplay
+        join: resolve(__dirname, 'join.html'),
       },
     },
   },

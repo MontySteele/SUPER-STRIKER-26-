@@ -381,45 +381,148 @@
 .controls-card.dim {
   opacity: 0.35;
 }
-.phone-panel {
-  position: fixed;
-  bottom: 16px;
-  left: 16px;
-  display: none;
-  align-items: center;
-  gap: 12px;
-  background: rgba(8, 10, 14, 0.78);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 10px 14px;
-  z-index: 6;
-  pointer-events: none;
-}
-.phone-panel canvas {
-  width: 92px;
-  height: 92px;
-  image-rendering: pixelated;
-  border-radius: 4px;
-}
-.phone-panel .pp-text {
+/* ---------- invite lobby (§5.4.2) ---------- */
+.lobby-invite {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: center;
+  gap: 20px;
+  background: linear-gradient(180deg, rgba(22, 27, 36, 0.94), rgba(9, 11, 16, 0.94));
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-left: 5px solid #b89230;
+  border-radius: 5px;
+  padding: 14px 18px;
+  margin-bottom: 16px;
+  min-width: 430px;
+}
+.lobby-code-wrap { flex: 1; }
+.lobby-code-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  color: #8a93a8;
+}
+.lobby-code {
+  font-size: 52px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.2em;
+  line-height: 1.1;
+  color: #ffce4a;
+}
+.lobby-url {
   font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.03em;
   color: #8a93a8;
-  letter-spacing: 0.05em;
-  max-width: 300px;
   word-break: break-all;
+  max-width: 340px;
 }
-.phone-panel .pp-text b {
-  color: #ffce4a;
+.lobby-qr {
+  width: 96px;
+  height: 96px;
+  image-rendering: pixelated;
+  border-radius: 4px;
+  flex: none;
+}
+.lobby-err {
   font-size: 12px;
-  letter-spacing: 0.1em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #ff8d7d;
+  margin-bottom: 12px;
+  max-width: 430px;
 }
-.phone-panel .pp-on {
-  color: #62d26f;
+.lobby-err.warm { color: #ffce4a; }
+.guest-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 430px;
+  margin-bottom: 16px;
 }
+.guest-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.guest-row.empty {
+  color: #8a93a8;
+  font-weight: 600;
+  justify-content: center;
+}
+.guest-row .gname { color: #eef1f6; }
+.guest-row .gkind, .guest-row .grtt { color: #8a93a8; font-weight: 600; }
+.guest-row .grtt { font-variant-numeric: tabular-nums; }
+.guest-row .gseat { margin-left: auto; color: #ffce4a; }
+.pip {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #d84a3a;
+  flex: none;
+}
+.pip.ok { background: #62d26f; }
+.pip.warn { background: #ffce4a; }
+.setting-row .slot-sub {
+  display: block;
+  font-size: 12px;
+  color: #8a93a8;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin-top: 3px;
+}
+.swatch-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.setting-row .value.warn { color: #ff8d7d; }
+.setting-row.go.disabled {
+  background: rgba(255, 255, 255, 0.07);
+  color: #8a93a8;
+  cursor: default;
+}
+
+/* ---------- remote seat health (§5.4.5) ---------- */
+.net-toast {
+  position: absolute;
+  top: 78px;
+  left: 26px;
+  background: rgba(8, 10, 14, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-left: 4px solid #ffce4a;
+  border-radius: 4px;
+  padding: 8px 15px;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #ffce4a;
+  opacity: 0;
+  transition: opacity 0.25s;
+}
+.net-toast.show { opacity: 1; }
+.np-pip {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-left: 6px;
+  vertical-align: 1px;
+  background: #ffce4a;
+}
+.np-pip.lost { background: #d84a3a; }
+.np-pip.ai { background: #8a93a8; }
+
 .vs-strip {
   display: flex;
   align-items: center;
