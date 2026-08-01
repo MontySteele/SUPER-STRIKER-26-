@@ -3,8 +3,10 @@
 **A browser-based, PS3-era football game built to embarrass the official one.**
 
 Runs locally at 60fps. No cloud streaming, no accounts, and
-**0 microtransactions**. URL → kickoff in seconds. (Fine, there IS an optional
-phone-as-controller now — with a QR code — but only because it rules.)
+**0 microtransactions**. URL → kickoff in seconds. A friend on the other side
+of the country can grab a controller with a four-letter room code — and even
+*that* is peer-to-peer, with the whole simulation still running on one
+machine.
 
 ## Play it
 
@@ -44,26 +46,70 @@ link. Notes:
 - Everything runs client-side: the tunnel only serves ~200 KB once, then the
   laptop can even go to sleep. No latency concerns — the game runs on the
   player's machine.
-- 2-player Versus is couch co-op **on the same machine**: keyboard + a USB/BT
-  gamepad, two gamepads, or phones as controllers (below), all driving
-  whichever device opened the link.
+- There is **no server component at all** any more, so `dist/` on a static
+  host is the complete product, remote guests included.
+- 2-player Versus comes in two flavours: couch co-op on the same machine
+  (keyboard + gamepad, or two gamepads), or **VERSUS — REMOTE** with a friend
+  on their own laptop (below).
 
-## Phone as controller
+## Remote guest controllers
 
-When the game is served by `npm run dev` or `npm run preview` (NOT a static
-`dist/` deploy — the touch input rides a WebSocket relay inside the Vite
-server), the menus show a **PHONE CONTROLLER** panel with a QR code and URL.
-Scan it with a phone on the same network (or through the same Cloudflare
-tunnel) and the phone becomes a touch gamepad: virtual stick on the left,
-PASS / LOFT / SHOOT / THRU / SPRINT / SWITCH on the right.
+Pick **VERSUS — REMOTE** on the main menu, choose both teams, and you land on
+an **INVITE PLAYERS** lobby: a four-letter room code in large type, the join
+link, a QR code, and a live list of everyone who has connected. Your friend
+opens `join.html?c=CODE`, types a name, and their laptop becomes a controller.
+Give them P1 or P2, kick off.
 
-- In 1P modes a connected phone just works alongside the keyboard and pads.
-- In Versus / Golden Goal, phones count as controllers for seating (pads
-  first, then phones, keyboard fills the last seat) — two phones = 2P with
-  zero hardware.
-- The 4-char room code pairs the phone to *your* game, so a tunnel URL being
-  public doesn't let strangers grab your match. A phone that disconnects or
-  backgrounds goes neutral, exactly like a yanked gamepad.
+The important part: **the simulation never leaves your machine.** Their page
+draws no pitch, no ball, no scoreline — it is a controller and nothing else,
+and everyone watches your screen (a shared video call is the usual
+arrangement). That means no rollback, no prediction, no desync: there is only
+ever one game state.
+
+**How to run one:**
+
+```bash
+npm run build
+npm run preview                 # serves dist/ on http://localhost:4173
+# in a second terminal:
+cloudflared tunnel --url http://localhost:4173
+```
+
+Send the `https://<random>.trycloudflare.com` link, open VERSUS — REMOTE, read
+out the code. (Any static host works just as well — Cloudflare Pages, GitHub
+Pages, a USB stick behind nginx. The game no longer needs a dev server for
+anything.)
+
+**How it works:** inputs ride a WebRTC DataChannel opened directly between the
+two browsers, configured `ordered: false, maxRetransmits: 0` — a lost packet is
+never retransmitted, because a 16ms-old input is worthless. The guest samples
+at 60Hz and sends a **6-byte binary packet only when something actually
+changes** (`seq: u16, buttons: u16, stickX: i8, stickY: i8`), plus a 10Hz
+keepalive; no JSON is anywhere near the hot path. The host drops out-of-order
+packets by sequence number, diffs the button field into press/release edges,
+and feeds them into the same input hub a gamepad uses — past that point the
+simulation genuinely cannot tell the difference. A tiny ping/pong on the same
+channel gives the guest a real RTT read-out.
+
+**Room codes** are four characters from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no
+0/O/1/I/L to misread over a phone line). A new one is drawn every time the
+lobby opens, and it dies the moment you leave.
+
+**When someone drops out:** at 1.5s of silence their slot goes yellow on the
+HUD; at 5s the match stops with a "P2 RECONNECTING…" toast; at 15s the AI
+pulls the shirt on and play resumes. Reopening the join link puts them back in
+the same slot (reserved by a token in their browser), and the AI hands the
+shirt back at the next dead ball.
+
+**The asterisk:** WebRTC needs a signaling handshake, and that goes through the
+**free public PeerJS broker** — a third-party service with no uptime promise,
+which sees a room id and nothing else. No game traffic ever touches it. If you
+would rather not depend on it, run your own
+[PeerServer](https://github.com/peers/peerjs-server) and add `?b=<origin>` to
+the game URL (e.g. `?b=https://peer.example.com`); the join link carries the
+setting across to your guest automatically. A self-hosted TURN relay for
+players behind symmetric NATs is the documented next step if a direct
+connection can't be made — the guest page says so plainly when it fails.
 
 ## Controls (keyboard)
 
@@ -95,6 +141,9 @@ man is a foul, from behind is a card.
 - **Kick-Off** — 1P vs CPU, any two of the 48 teams.
 - **Versus** — 2P couch play (§3.4): keyboard vs gamepad, or two gamepads.
   The thing the official game marketed and fumbled.
+- **Versus — Remote** — the same 1v1 with your friend on their own laptop,
+  joined by a four-letter room code over a direct peer-to-peer connection.
+  Sim stays local; nobody needs an account.
 - **Tournament** — the full 48-team format: 12 groups of 4, top two + 8 best
   third-placers into a 32-team knockout. Group tables and a broadcast-style
   bracket; every other match is simulated from team ratings. Knockout draws go
@@ -171,6 +220,7 @@ thinks better, the game never cheats physics), and three kickoff times.
 
 ```bash
 npx tsx scripts/simTest.ts   # headless sims: league, knockouts+shootouts, tournament
+npx tsx scripts/netTest.ts   # remote-guest wire protocol, edge synthesis, seat swap
 npx tsc --noEmit             # typecheck
 ```
 
@@ -195,8 +245,10 @@ character viewer — open it with no `angle` for a live turntable.
 
 Architecture: `src/sim` (fixed 60Hz deterministic simulation, tournament
 engine, penalty controller), `src/render` (Three.js, interpolated),
-`src/ui` (HTML/CSS overlay), `src/audio` (Web Audio synthesis), `src/input`
-(seat-based, up to 2 local players), `src/data`.
+`src/ui` (HTML/CSS overlay + the invite lobby), `src/audio` (Web Audio
+synthesis), `src/input` (seat-based, local and remote players are the same
+thing by the time the sim sees them), `src/net` (WebRTC guest link and wire
+protocol), `src/join` (the guest's controller page), `src/data`.
 
 Built from `SUPERSTRIKER_SPEC.md`. Milestones M1–M4 are in. M5 stretch goals
 (Golden Goal, roster editor UI, replay theater) remain.

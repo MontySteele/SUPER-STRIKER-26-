@@ -39,6 +39,13 @@ export class HUD {
   private penHint!: HTMLElement;
   private replayBug!: HTMLElement;
   private prematch!: HTMLElement;
+  private netToast!: HTMLElement;
+  /** Persistent reconnect banner; outranks any transient flash. */
+  private netHold: string | null = null;
+  private netFlashText = '';
+  private netFlashTimer = 0;
+  /** Per-seat link health, drawn as a pip on that player's nameplate. */
+  private netSeat: ('ok' | 'degraded' | 'lost' | 'ai')[] = ['ok', 'ok'];
   private controlsTimer = 14;
   private controlsMode: ControlsSetting = controlsSetting();
   private controlsAttack = '';
@@ -71,7 +78,7 @@ export class HUD {
     const twoP = seats[0] !== null && seats[1] !== null;
     const dev = (i: number): string => {
       const kind = seats[i]?.kind;
-      return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'PHONE' : 'KEYBOARD';
+      return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'REMOTE' : 'KEYBOARD';
     };
     this.root.innerHTML = `
       <div class="letterbox-top"></div>
@@ -98,6 +105,7 @@ export class HUD {
       <div class="match-card"></div>
       <div class="prematch">${this.prematchHtml()}</div>
       <div class="controls-card"></div>
+      <div class="net-toast"></div>
       <div class="wipe"></div>
     `;
     this.controlsAttack = twoP
@@ -126,6 +134,7 @@ export class HUD {
     this.penHint = this.root.querySelector('.pen-hint')!;
     this.replayBug = this.root.querySelector('.replay-bug')!;
     this.prematch = this.root.querySelector('.prematch')!;
+    this.netToast = this.root.querySelector('.net-toast')!;
     if (this.match.mode === 'shootout') this.prematchTimer = 0;
     this.prematch.classList.toggle('show', this.prematchTimer > 0);
   }
@@ -146,6 +155,32 @@ export class HUD {
       ? '<div class="pm-vs golden">NEXT GOAL WINS</div>'
       : '<div class="pm-vs">TACTICS</div>';
     return side(this.match.teams[0].data) + mid + side(this.match.teams[1].data);
+  }
+
+  // ------------------------------------------------- remote seat health (§5.4.5)
+
+  /** Link health for a seat — a pip rides that player's nameplate. */
+  setSeatNet(idx: number, state: 'ok' | 'degraded' | 'lost' | 'ai'): void {
+    this.netSeat[idx] = state;
+  }
+
+  /** Sticky banner while the match is held for a reconnect; null clears it. */
+  setNetHold(text: string | null): void {
+    this.netHold = text;
+    this.paintNetToast();
+  }
+
+  /** One-shot announcement ("AI TAKES OVER", "P2 IS BACK"). */
+  netFlash(text: string, seconds = 3.5): void {
+    this.netFlashText = text;
+    this.netFlashTimer = seconds;
+    this.paintNetToast();
+  }
+
+  private paintNetToast(): void {
+    const text = this.netHold ?? (this.netFlashTimer > 0 ? this.netFlashText : '');
+    if (this.netToast.textContent !== text) this.netToast.textContent = text;
+    this.netToast.classList.toggle('show', text !== '');
   }
 
   setReplay(on: boolean, label = 'REPLAY'): void {
@@ -415,8 +450,11 @@ export class HUD {
             else if (seat.isHeld('pass')) mode = 'CHASING';
             else if (m.ball.owner && m.ball.owner.teamIdx !== i) mode = 'DEFEND';
           }
+          // a struggling remote guest gets a pip right on their own nameplate
+          const net = this.netSeat[i];
+          const pip = net === 'ok' ? '' : `<span class="np-pip ${net}"></span>`;
           const label = `${ctrl.data.num} ${ctrl.data.name.split(' ').pop()?.toUpperCase()}` +
-            (mode ? ` <span class="np-mode">· ${mode}</span>` : '');
+            (mode ? ` <span class="np-mode">· ${mode}</span>` : '') + pip;
           if (np.innerHTML !== label) np.innerHTML = label;
         } else {
           np.style.display = 'none';
@@ -450,6 +488,11 @@ export class HUD {
     if (this.prematchTimer > 0) {
       this.prematchTimer -= dt;
       if (this.prematchTimer <= 0) this.prematch.classList.remove('show');
+    }
+    // the reconnect banner ticks on real time: dt is 0 while the match is held
+    if (this.netFlashTimer > 0) {
+      this.netFlashTimer -= dt;
+      if (this.netFlashTimer <= 0) this.paintNetToast();
     }
   }
 

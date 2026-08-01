@@ -87,7 +87,7 @@ export class InputHub {
   keyboard = new DeviceState();
   private pads = new Map<number, DeviceState>();
   private prevPadButtons = new Map<number, boolean[]>();
-  /** Phone controllers (fed by RemoteInputHost over WebSocket). */
+  /** Remote guest controllers (fed by GuestHost over a WebRTC channel). */
   private remotes = new Map<number, DeviceState>();
   private keys = new Set<string>();
   /** Fired on any key/button press — unlocks audio, advances title screens. */
@@ -161,20 +161,20 @@ export class InputHub {
     return d;
   }
 
-  /** Device state for a connected phone controller (created on join). */
+  /** Device state for a connected remote guest (created on join). */
   remote(index: number): DeviceState {
     let d = this.remotes.get(index);
     if (!d) { d = new DeviceState(); this.remotes.set(index, d); }
     return d;
   }
 
-  /** A phone left — its player must go neutral, like a yanked pad. */
+  /** A guest left — its player must go neutral, like a yanked pad. */
   removeRemote(index: number): void {
     this.remotes.get(index)?.neutralize();
     this.remotes.delete(index);
   }
 
-  /** Indices of currently connected phone controllers. */
+  /** Indices of currently connected remote guests. */
   connectedRemotes(): number[] {
     return [...this.remotes.keys()].sort((a, b) => a - b);
   }
@@ -280,7 +280,7 @@ export class PlayerInput {
     if (this.kind === 'remote') return clampStick(this.hub.remote(this.padIndex).stick);
     const k = this.hub.keyboardStick();
     if (this.kind === 'keyboard') return k;
-    // merged: any deflected pad/phone stick wins over the keyboard
+    // merged: any deflected pad/guest stick wins over the keyboard
     for (const i of this.hub.connectedPads()) {
       const s = this.hub.pad(i).stick;
       if (Math.hypot(s.x, s.y) > 0.22) return clampStick(s);

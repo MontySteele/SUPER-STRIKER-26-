@@ -195,6 +195,29 @@ export class Match {
     }
   }
 
+  /**
+   * Swap a seat mid-match — null hands the side to the CPU, a PlayerInput
+   * takes it back (§5.4.5: a remote guest who drops out, and returns). The
+   * whole sim already branches on `seats[i] === null` and `Team.isHuman`, so
+   * this is the entire mechanism: nothing else needs to know it happened.
+   */
+  setSeat(idx: number, seat: PlayerInput | null): void {
+    if (idx !== 0 && idx !== 1 || this.seats[idx] === seat) return;
+    // a press buffered by the old occupant must not fire for the new one
+    this.seats[idx]?.clearBuffers();
+    this.seats[idx] = seat;
+    this.teams[idx].isHuman = seat !== null;
+    this.shotCharging[idx] = false;
+    if (!seat) {
+      this.controlled[idx] = null;
+      return;
+    }
+    seat.clearBuffers();
+    if (!this.controlled[idx] || this.controlled[idx]!.sentOff) {
+      this.controlled[idx] = this.nearestOutfield(this.teams[idx], v2(this.ball.pos.x, this.ball.pos.y));
+    }
+  }
+
   private nearestOutfield(team: Team, to: V2): PlayerEntity {
     const pool = team.players.filter((p) => !p.isGK && !p.sentOff);
     return pool.reduce((a, b) => (dist2(a.pos, to) < dist2(b.pos, to) ? a : b));

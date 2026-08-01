@@ -1,20 +1,19 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
-import controllerRelay from './vite-plugin-controller';
 
 export default defineConfig({
   base: './',
-  plugins: [controllerRelay()],
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 1500,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
-        controller: resolve(__dirname, 'controller.html'),
         // studio character viewer (§7A.9) — a build input so it works in dev
         // and survives into dist/ for reviewing kits on a deployed build
         viewer: resolve(__dirname, 'viewer.html'),
+        // guest controller page (§5.4.2) — inputs only, renders no gameplay
+        join: resolve(__dirname, 'join.html'),
       },
     },
   },

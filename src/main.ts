@@ -3,8 +3,10 @@
 
 import './ui/ui.css';
 import { InputHub, type PlayerInput } from './input/input';
-import { RemoteInputHost } from './input/remote';
-import { drawQr } from './ui/qr';
+import { GuestHost } from './net/hostLink';
+import { seatHealth } from './net/health';
+import { Lobby, readableOn, type SlotAssignment, type SlotDevice } from './ui/lobby';
+import { resolvedShirts } from './render/playerMesh';
 import { Match, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
@@ -28,45 +30,8 @@ const hub = new InputHub();
 const audio = new AudioEngine();
 const music = new MusicPlayer();
 const commentary = new Commentary();
-const remoteHost = new RemoteInputHost(hub);
 
 let inMenus = true;
-
-// ------------------------------------------------------- phone controller UI
-// Pairing panel lives outside #ui-root so menu re-renders leave it alone.
-// Only shown in menus, and only when the WS relay actually answers (dev /
-// preview server) — on static hosting the feature silently doesn't exist.
-const phonePanel = document.createElement('div');
-phonePanel.className = 'phone-panel';
-document.body.appendChild(phonePanel);
-const ppCanvas = document.createElement('canvas');
-const ppText = document.createElement('div');
-ppText.className = 'pp-text';
-phonePanel.append(ppCanvas, ppText);
-
-function refreshPhonePanel(): void {
-  const show = inMenus && remoteHost.status === 'ready';
-  phonePanel.style.display = show ? 'flex' : 'none';
-  if (!show) return;
-  const url = remoteHost.controllerUrl();
-  const n = remoteHost.connectedCount();
-  ppText.textContent = '';
-  const title = document.createElement('b');
-  title.textContent = 'PHONE CONTROLLER';
-  const urlEl = document.createElement('span');
-  urlEl.textContent = url;
-  const status = document.createElement('span');
-  status.textContent = n > 0 ? `CODE ${remoteHost.code} · ${n} CONNECTED` : `CODE ${remoteHost.code}`;
-  status.className = n > 0 ? 'pp-on' : '';
-  ppText.append(title, urlEl, status);
-  try {
-    drawQr(ppCanvas, url, 3);
-    ppCanvas.style.display = 'block';
-  } catch {
-    ppCanvas.style.display = 'none'; // URL too long for the mini encoder
-  }
-}
-remoteHost.onChange = refreshPhonePanel;
 
 /** Idempotent: start/stop/switch the right track for where we are. */
 function applyMusic(): void {
@@ -84,6 +49,9 @@ hub.onAnyButton = () => {
   applyMusic();
 };
 
+/** The MenuResult variants that carry a full match configuration. */
+type MatchMenuResult = Extract<MenuResult, { home: TeamData }>;
+
 interface MatchConfig {
   home: TeamData;
   away: TeamData;
@@ -96,6 +64,8 @@ interface MatchConfig {
   mode: 'match' | 'shootout' | 'golden';
   /** what happens after full time on button press */
   onDone: ((m: Match) => void) | null; // null = default rematch/menu choice
+  /** seat index → remote guest id, for the §5.4.5 disconnect ladder */
+  guestSlots?: Map<number, number>;
 }
 
 let match: Match | null = null;
@@ -111,6 +81,20 @@ let paused = false;
 let replayWatch = false; // user-triggered replay: sim frozen while it plays
 let lastPhase = '';
 let cardGraceUntil = 0;
+
+// --------------------------------------------------------- remote guests (§5.4)
+// The lobby's peer stays alive for the whole remote session: a guest who drops
+// out mid-match rejoins on the same room code, into the same seat.
+let guestHost: GuestHost | null = null;
+let lobby: Lobby | null = null;
+/** Seats the guests are sitting in, and the seat objects to hand back to. */
+let guestSlots = new Map<number, number>();
+let baseSeats: [PlayerInput | null, PlayerInput | null] = [null, null];
+/** Seat currently driven by the AI because its guest went away. */
+const seatOnAI = [false, false];
+/** Human is back but the ball is live — hand over at the next dead ball. */
+const seatHandback = [false, false];
+let netHold: string | null = null;
 
 // ------------------------------------------------------------ WebGL safety
 // GPU resets are real (driver hiccups, sleep/wake, iGPU pressure). Without
@@ -170,11 +154,11 @@ function stopLoop(): void {
 
 function showMenu(): void {
   stopLoop();
+  closeLobby(); // back at the menu = the room code is dead (§5.4.2)
   inMenus = true;
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
-  refreshPhonePanel();
   // menu first: it must exist even when the attract renderer can't
   new Menu(handleMenuResult, () => hub.connectedPads().length + hub.connectedRemotes().length);
   if (!attractMatch) startAttract(); // editor exit: don't restart the show
@@ -182,12 +166,15 @@ function showMenu(): void {
 
 function handleMenuResult(r: MenuResult): void {
   switch (r.kind) {
+    case 'online':
+      showLobby(r);
+      break;
     case 'kickoff':
     case 'versus':
     case 'shootout':
     case 'golden': {
       // golden goal 2P is opt-in via its PLAYERS setting — auto-seating any
-      // plugged-in pad/phone left the away team frozen when nobody was holding it
+      // plugged-in pad/guest left the away team frozen when nobody was holding it
       const twoP = r.kind === 'versus' || (r.kind === 'golden' && r.golden2p === true);
       const seats = makeSeats(twoP);
       startMatch({
@@ -218,9 +205,9 @@ function handleMenuResult(r: MenuResult): void {
 }
 
 function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
-  // 1P: merged seat already unions keyboard + pads + phones
+  // 1P: merged seat already unions keyboard + pads + remote guests
   if (!versus) return [hub.seat('merged'), null];
-  // 2P: pads first, then phones, keyboard fills the last empty seat
+  // 2P: pads first, then guests, keyboard fills the last empty seat
   const devs: PlayerInput[] = [
     ...hub.connectedPads().map((i) => hub.seat('pad', i)),
     ...hub.connectedRemotes().map((i) => hub.seat('remote', i)),
@@ -228,6 +215,135 @@ function makeSeats(versus: boolean): [PlayerInput | null, PlayerInput | null] {
   if (devs.length >= 2) return [devs[0], devs[1]];
   if (devs.length === 1) return [hub.seat('keyboard'), devs[0]];
   return [hub.seat('keyboard'), hub.seat('pad', 0)];
+}
+
+// ---------------------------------------------------------------- remote 1v1
+
+/** INVITE PLAYERS: open a room, seat the guests, kick off (§5.4.2). */
+function showLobby(r: MatchMenuResult): void {
+  stopLoop();
+  inMenus = true;
+  commentary.stop();
+  audio.setCrowd(false);
+  applyMusic();
+  if (!attractMatch) startAttract();
+
+  // a fresh code every time the lobby opens, and it dies when we leave
+  closeLobby();
+  const host = new GuestHost(hub);
+  guestHost = host;
+  host.open();
+
+  const shirts = resolvedShirts(r.home.kit, r.away.kit);
+  lobby = new Lobby(
+    host, [r.home, r.away],
+    (slots) => startRemoteMatch(r, slots),
+    () => showMenu(),
+  );
+  lobby.shirts = shirts;
+  lobby.refresh();
+  // debug hook for automated testing, same shape as __ss26 / __ss26Attract
+  (window as unknown as Record<string, unknown>).__ss26Net = { guestHost: host, hub };
+}
+
+function closeLobby(): void {
+  lobby?.destroy();
+  lobby = null;
+  guestHost?.close();
+  guestHost = null;
+  guestSlots = new Map();
+  baseSeats = [null, null];
+  (window as unknown as Record<string, unknown>).__ss26Net = null;
+}
+
+function seatForDevice(d: SlotDevice): PlayerInput {
+  if (d.kind === 'pad') return hub.seat('pad', d.index);
+  if (d.kind === 'guest') return hub.seat('remote', d.id);
+  return hub.seat('keyboard');
+}
+
+function startRemoteMatch(r: MatchMenuResult, slots: SlotAssignment): void {
+  lobby = null; // the lobby destroyed itself before handing us the seating
+  const seats: [PlayerInput | null, PlayerInput | null] = [null, null];
+  const map = new Map<number, number>();
+  for (let i = 0; i < 2; i++) {
+    const d = slots[i];
+    if (!d) continue;
+    seats[i] = seatForDevice(d);
+    if (d.kind === 'guest') map.set(i, d.id);
+  }
+  const shirts = resolvedShirts(r.home.kit, r.away.kit);
+  if (guestHost) {
+    guestHost.phase = 'match';
+    guestHost.note = null;
+    guestHost.describeSlot = (slot) => {
+      const team = slot === 0 ? r.home : r.away;
+      return {
+        teamName: team.name, teamCode: team.code,
+        shirt: shirts[slot], text: readableOn(shirts[slot]),
+      };
+    };
+    guestHost.broadcast();
+  }
+  startMatch({
+    home: r.home, away: r.away, seats,
+    halfLengthSec: r.halfLengthSec, difficulty: r.difficulty,
+    timeOfDay: r.timeOfDay, stadium: r.stadium,
+    knockout: false, mode: 'match', onDone: null,
+    guestSlots: map,
+  });
+}
+
+// --------------------------------------------------- guest health ladder (§5.4.5)
+
+function updateGuestHealth(): void {
+  if (!match || !hudUI || !guestHost || guestSlots.size === 0) return;
+  const now = performance.now();
+  let hold: string | null = null;
+
+  for (const [slot, id] of guestSlots) {
+    const state = seatHealth(guestHost.packetAge(id, now));
+    const who = `P${slot + 1}`;
+
+    if (state === 'gone' && !seatOnAI[slot]) {
+      // the friend isn't coming back this minute — play on, CPU takes the side
+      seatOnAI[slot] = true;
+      seatHandback[slot] = false;
+      match.setSeat(slot, null);
+      // a held button frozen at the moment of the dropout must not fire the
+      // instant the guest is seated again — same treatment as a yanked pad
+      hub.remote(id).neutralize();
+      hudUI.netFlash(`${who} DISCONNECTED — AI TAKES OVER`, 4);
+    } else if (state === 'lost' && !seatOnAI[slot]) {
+      hold = `${who} RECONNECTING… · K TO ABANDON`;
+    }
+
+    if (seatOnAI[slot] && state === 'ok') {
+      // human's back: hand the shirt over at the next dead ball, so nobody
+      // inherits a half-finished run at the near post
+      seatHandback[slot] = true;
+    }
+    if (seatHandback[slot] && match.phase !== 'play') {
+      seatOnAI[slot] = false;
+      seatHandback[slot] = false;
+      match.setSeat(slot, baseSeats[slot]);
+      hudUI.netFlash(`${who} IS BACK`, 3);
+    }
+
+    hudUI.setSeatNet(slot,
+      seatOnAI[slot] ? 'ai' : state === 'ok' ? 'ok' : state === 'degraded' ? 'degraded' : 'lost');
+  }
+
+  if (hold !== netHold) {
+    // entering the hold: drop buffered presses so the restart isn't a shot
+    if (hold && !netHold) hub.clearAll();
+    netHold = hold;
+    hudUI.setNetHold(hold);
+    if (guestHost) {
+      guestHost.note = hold;
+      guestHost.broadcast();
+    }
+  }
 }
 
 // ---------------------------------------------------------------- tournament
@@ -238,7 +354,6 @@ function showTournamentHub(): void {
   commentary.stop();
   audio.setCrowd(false);
   applyMusic();
-  refreshPhonePanel();
   if (!attractMatch) startAttract();
   if (!tournament) { showMenu(); return; }
   const ui = new TournamentUI(
@@ -395,7 +510,13 @@ function startMatch(config: MatchConfig): void {
   inMenus = false;
   applyMusic(); // 'match' groove under the crowd, or silence if set to MENUS/OFF
 
-  refreshPhonePanel();
+  // a rematch re-seats the same guests from scratch: nobody starts on the AI
+  guestSlots = config.guestSlots ?? new Map();
+  baseSeats = [config.seats[0], config.seats[1]];
+  seatOnAI[0] = seatOnAI[1] = false;
+  seatHandback[0] = seatHandback[1] = false;
+  netHold = null;
+
   match = new Match({
     home: config.home,
     away: config.away,
@@ -464,6 +585,7 @@ function loop(now: number): void {
   lastTime = now;
 
   hub.pollGamepads();
+  updateGuestHealth();
 
   // a whistle can land while a gameplay button edge is still buffered — clear
   // it on phase entry and give the card a beat on screen, or the half-time /
@@ -533,6 +655,14 @@ function loop(now: number): void {
         }
       }
     }
+  } else if (netHold) {
+    // §5.4.5: the match waits for a missing guest. Not the pause card — this
+    // isn't the local player's doing and they can't press their way out of it;
+    // the only choice offered is to abandon.
+    if (hub.anyPress(['loft'])) {
+      showMenu();
+      return;
+    }
   } else if (paused) {
     if (hub.anyPress(['pass', 'pause'])) {
       paused = false;
@@ -574,10 +704,11 @@ function loop(now: number): void {
 
   const alpha = Math.min(accumulator / SIM_DT, 1);
   // dt 0 while paused: the goal-sequence replay and letterbox must not play
-  // out underneath the PAUSED card
-  renderer.update(paused ? 0 : frameDt, alpha);
+  // out underneath the PAUSED card (or a reconnect hold)
+  const frozen = paused || netHold !== null;
+  renderer.update(frozen ? 0 : frameDt, alpha);
   hudUI.update(frameDt, (x, y, z) => renderer!.screenPos(x, y, z));
-  audio.update(paused ? 0 : frameDt); // no terrace claps over the PAUSED card
+  audio.update(frozen ? 0 : frameDt); // no terrace claps over the PAUSED card
 }
 
 // ------------------------------------------------------------ capture mode
@@ -587,11 +718,7 @@ function loop(now: number): void {
 // is loaded on demand so normal players never download the harness.
 const captureShot = new URLSearchParams(location.search).get('capture');
 if (captureShot) {
-  // the phone-pairing panel is the one piece of chrome that shows itself
-  // without the menus (the relay answers on the dev server) — it would sit in
-  // the corner of every capture
   inMenus = false;
-  phonePanel.remove();
   void import('./tools/capture').then((m) => m.runCapture(canvas, captureShot));
 } else {
   try {
