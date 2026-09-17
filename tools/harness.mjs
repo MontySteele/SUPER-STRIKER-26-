@@ -4,8 +4,8 @@
 // out are real renders rather than black rectangles.
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { inflateSync } from 'node:zlib';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { deflateSync, inflateSync } from 'node:zlib';
 import { chromium } from 'playwright';
 
 /**
@@ -96,7 +96,7 @@ export function startDevServer({ port = 5273 } = {}) {
 
 /** Minimal decoder: 8-bit non-interlaced RGB/RGBA PNG, which is what
  *  Playwright writes. Returns { width, height, pixels } (RGBA). */
-function decodePng(buf) {
+export function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error('not a PNG');
   let off = 8;
   let width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;
@@ -198,4 +198,72 @@ export function parseArgs(argv) {
     else { out[key] = next; i++; }
   }
   return out;
+}
+
+// ------------------------------------------------------- PNG encoding
+// Contact sheets and filmstrips need several captures in one file, and nothing
+// else in this repo pulls in an image library. Playwright hands us PNGs, so we
+// decode those and write one back: 8-bit RGBA, filter 0, which is all a
+// composite of screenshots ever needs.
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+function chunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body));
+  return Buffer.concat([len, body, crc]);
+}
+
+/** Write an 8-bit RGBA buffer (width*height*4) out as a PNG. */
+export function writePng(path, width, height, rgba) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;   // bit depth
+  ihdr[9] = 6;   // colour type: RGBA
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: none
+    rgba.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+  }
+  writeFileSync(path, Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflateSync(raw, { level: 6 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]));
+}
+
+/** Lay PNG files out left to right in one image. Cells must be the same size. */
+export function stripPngs(paths, outPath) {
+  const frames = paths.map((p) => decodePng(readFileSync(p)));
+  const cellW = frames[0].width, cellH = frames[0].height;
+  const out = Buffer.alloc(cellW * frames.length * cellH * 4, 255);
+  const outStride = cellW * frames.length * 4;
+  frames.forEach((f, i) => {
+    if (f.width !== cellW || f.height !== cellH) throw new Error('strip cells differ in size');
+    for (let y = 0; y < cellH; y++) {
+      f.pixels.copy(out, y * outStride + i * cellW * 4, y * f.width * 4, (y + 1) * f.width * 4);
+    }
+  });
+  writePng(outPath, cellW * frames.length, cellH, out);
+  return { width: cellW * frames.length, height: cellH };
 }

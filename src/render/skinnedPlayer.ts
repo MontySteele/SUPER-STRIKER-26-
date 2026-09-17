@@ -1,0 +1,618 @@
+// SkinnedPlayerMesh: the authored character, driven by the sim.
+//
+// Same contract as PlayerMesh — update(dt, x, y, z, facing, speed, anim, animT)
+// — so gameRenderer's call sites do not know which one it is holding.
+//
+// The state machine, top to bottom:
+//
+//   LOCOMOTION LAYER   a chain of looping clips ordered by the ground speed
+//                      they were captured at (LOCO_CHAIN: idle → trudge → walk
+//                      → jog → run). The sim's speed picks the bracketing pair
+//                      and crossfades them; playback rate is speed ÷ that
+//                      pair's blended natural speed. That ratio is what keeps
+//                      the feet on the grass instead of skating — a walk cycle
+//                      captured at 1.31 m/s and played at 1.31 m/s plants its
+//                      foot exactly. Adding a sprint is one row in the table.
+//
+//   ACTION LAYER       one shot, driven by ActionAnim. Every action names the
+//                      clip it wants and the procedural stand-in to use when
+//                      that clip is not on disk:
+//                        • CLIP  — its time set directly from the sim's animT,
+//                          so the contact frame lands on the frame the ball
+//                          actually left the foot (§8), crossfaded over the
+//                          locomotion layer by weight.
+//                        • POSE  — a procedural override on the root and a
+//                          handful of joints. Only ever evaluated when the
+//                          clip is missing, so a real slide or dive landing in
+//                          the library switches it off by existing.
+//
+//   PROCEDURAL TRIM    breathing on the idle, the lean/roll/drop a stand-in
+//                      asks for, and the strike clip's hip yaw at contact taken
+//                      back out — mocap actors are rarely square to the ball,
+//                      and without this a pass leaves the foot 25° off where
+//                      the sim aimed it.
+//
+// Everything above is data: ACTIONS is a table, CLIP_TABLE is a table, and the
+// loader FINDS each strike's contact frame rather than being told it.
+
+import * as THREE from 'three';
+import type { PlayerData } from '../data/types';
+import type { ActionAnim } from '../sim/player';
+import { LOCO_CHAIN, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
+  type ClipId, type PreparedClip } from './characterAssets';
+import { SHADOW_LAYER } from './materials';
+import type { KitSpec } from './playerMesh';
+
+/**
+ * §7A.2 detail bands, in metres from the camera, plus the hysteresis margin.
+ *
+ * Tuned against the shot list: goalmouth_scramble's camera sits 19–25m off the
+ * players around the ball, so lod0 has to reach 26m for them; midfield_wide is
+ * a 24m-high broadcast pose where the far shape is 60m+ and belongs on lod2.
+ * The margin stops a player jogging along a band edge from flickering between
+ * two detail levels once a frame.
+ */
+export const LOD_BANDS_M = [26, 52];
+const LOD_HYSTERESIS_M = 3;
+
+/** Beyond this the mixer ticks at half rate. */
+export const SKINNED_NEAR_M = 45;
+
+/** Playback rate is clamped: a walk cycle at 3x is a cartoon, at 0.2x it is a
+ *  freeze frame, and neither is better than a small amount of foot slide. */
+const RATE_MIN = 0.55;
+const RATE_MAX = 1.8;
+
+/** How fast an action's weight comes up over the locomotion layer, and how
+ *  long it takes to hand back. Fast in (a strike has to read as a strike),
+ *  slower out (the follow-through should settle, not snap). */
+/** Above this the keeper is running, not shuffling. */
+const SIDESTEP_MAX_SPEED = 2.4;
+
+const ACTION_IN = 0.05;
+const ACTION_OUT = 0.18;
+
+/** A procedural override, all in the character's own frame. */
+interface Pose {
+  /** forward lean, radians (+ = face down) */
+  lean?: number;
+  /** roll about the facing axis, radians */
+  roll?: number;
+  /** vertical offset, metres (+ = off the ground) */
+  lift?: number;
+  /** both arms up, 0..1 */
+  arms?: number;
+  /** head pitch, radians (+ = chin down) */
+  head?: number;
+  /** pretend the player is moving this fast for the locomotion layer */
+  loco?: number;
+}
+
+interface ActionDef {
+  /** one-shot clip, or a list to pick from per player for variety */
+  clip?: ClipId | ClipId[];
+  /** seconds the sim keeps this anim alive (mirrors PlayerEntity.update) */
+  dur: number;
+  /**
+   * The FALLBACK, used only when none of `clip` resolved at load. Every one of
+   * these is a stand-in, and when the real clip is on disk it is never
+   * evaluated — which is what makes "a real slide clip drops in by changing a
+   * row" true rather than aspirational.
+   */
+  pose?: (u: number) => Pose;
+}
+
+/**
+ * ActionAnim → what to play. The sim's durations (PlayerEntity.update) are
+ * mirrored here: 0.42s for a strike, 0.8 for a slide, 1.0 for a dive, 3.0 for
+ * the celebration and the trudge.
+ *
+ * Which of these is a real animation and which is the procedural stand-in
+ * depends on what is on disk, so the answer is printed at load
+ * (`characters: no clip for …`) rather than asserted in a comment here.
+ */
+const ACTIONS: Partial<Record<ActionAnim, ActionDef>> = {
+  pass: { clip: 'kickC', dur: 0.42 },
+  loft: { clip: 'kickA', dur: 0.42 },
+  // two strikes, picked per player, so a team does not shoot in unison
+  shoot: { clip: ['kickB', 'kickD'], dur: 0.42 },
+
+  // a header trimmed so the jump's apex is the contact frame; the stand-in is
+  // a procedural hop with the head thrown at the ball
+  header: {
+    clip: 'header',
+    dur: 0.42,
+    pose: (u) => ({ lift: Math.sin(u * Math.PI) * 0.34, lean: -0.25 + u * 0.55, arms: 0.35 }),
+  },
+
+  // stand-in: pitch the whole body back and sink it, which is the read that
+  // matters at broadcast distance; the legs keep running, which is not right
+  // but is closer than standing up
+  slide: {
+    clip: 'slide',
+    dur: 0.8,
+    pose: (u) => ({ lean: -1.15, lift: -0.52, loco: 4.2 * (1 - u * 0.6) }),
+  },
+
+  // stand-in: roll about the facing axis and lift, arms up — reads as a dive
+  // from anywhere but a close-up
+  diveL: {
+    clip: 'diveL',
+    dur: 1.0,
+    pose: (u) => ({ roll: -(0.5 + u * 0.95), lift: Math.sin(u * Math.PI) * 0.45 - u * 0.35, arms: 0.9 }),
+  },
+  diveR: {
+    clip: 'diveR',
+    dur: 1.0,
+    pose: (u) => ({ roll: 0.5 + u * 0.95, lift: Math.sin(u * Math.PI) * 0.45 - u * 0.35, arms: 0.9 }),
+  },
+
+  // stand-in: crouch over the ball
+  collect: {
+    clip: 'collect',
+    dur: 0.42,
+    pose: () => ({ lean: 0.62, lift: -0.3, arms: 0.25, head: 0.35 }),
+  },
+
+  // stand-in: walk with the arms up and a bounce. A kick clip's follow-through
+  // is emphatically NOT a celebration — the actor turns and walks off.
+  celebrate: {
+    clip: 'celebrate',
+    dur: 3.0,
+    pose: (u) => ({ arms: 1, loco: 1.05, lift: Math.abs(Math.sin(u * 18)) * 0.16, lean: -0.1 }),
+  },
+
+  // stand-in: slow trudge, head down — the locomotion chain's `trudge` entry
+  // does the work
+  dejected: {
+    clip: 'dejected',
+    dur: 3.0,
+    pose: () => ({ loco: 0.55, head: 0.5, lean: 0.14 }),
+  },
+};
+
+const EMPTY: Pose = {};
+
+/** One locomotion clip, ready to be weighted into a blend chain. */
+interface LocoEntry {
+  id: ClipId;
+  action: THREE.AnimationAction;
+  /** metres per second the clip was captured at; 0 for an idle */
+  speed: number;
+  dur: number;
+  /** last weight written, so a chain change can switch the strays off */
+  w: number;
+}
+
+/** Rotate a bone by `angle` about a WORLD-space axis, without ever assuming
+ *  which local axis runs down the bone. Survives any rig that keeps the Mixamo
+ *  names but not its axes. */
+const _q = new THREE.Quaternion();
+const _pq = new THREE.Quaternion();
+function rotateBoneWorld(bone: THREE.Object3D, axis: THREE.Vector3, angle: number): void {
+  if (Math.abs(angle) < 1e-4) return;
+  _q.setFromAxisAngle(axis, angle);
+  (bone.parent ?? bone).getWorldQuaternion(_pq);
+  bone.quaternion.premultiply(_pq.clone().invert().multiply(_q).multiply(_pq));
+}
+
+function hashStr(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+export class SkinnedPlayerMesh {
+  /** world position + facing; the same node gameRenderer toggles for a red card */
+  root = new THREE.Group();
+  /** action yaw correction and the procedural lean/roll/lift live here, so the
+   *  facing on `root` stays exactly what the sim asked for */
+  private pivot = new THREE.Group();
+  private inst: CharacterInstance;
+  private mixer: THREE.AnimationMixer;
+
+  /** every locomotion clip this player has an action for, by id */
+  private locoById = new Map<ClipId, LocoEntry>();
+  /** the chain in play this frame, slowest first; index 0 is the idle */
+  private loco: LocoEntry[] = [];
+  /** the outfield chain and, for a keeper, his own — swapped by sim state */
+  private chainOutfield: LocoEntry[] = [];
+  private chainKeeper: LocoEntry[] = [];
+
+  private act: THREE.AnimationAction | null = null;
+  private actClip: PreparedClip | null = null;
+  private actWeight = 0;
+  private curAnim: ActionAnim = 'none';
+  private curDef: ActionDef | null = null;
+
+  /** damped procedural state, so an overlay eases in instead of popping */
+  private lean = 0;
+  private roll = 0;
+  private lift = 0;
+  private arms = 0;
+  private headPitch = 0;
+  private actYaw = 0;
+  private breathe: number;
+
+  private starGlow: THREE.Mesh | null = null;
+  private tier = -1;
+  /** near enough for a mixer tick every frame (SKINNED_NEAR_M) */
+  private fullRate = true;
+  private halfTick = 0;
+  private readonly kickPick: number;
+  /** keeper state from the sim (§6.3), and how sideways he is moving */
+  private gkState: string | null = null;
+  private gkLateral = 0;
+
+  get lodTier(): number { return Math.max(0, this.tier); }
+
+  constructor(public data: PlayerData, kit: KitSpec, private rig: CharacterRig) {
+    this.inst = rig.instance(data, kit);
+    this.kickPick = hashStr(data.name) % 997;
+    this.breathe = (hashStr(data.name + 'b') % 628) / 100;
+
+    this.pivot.add(this.inst.root);
+    this.pivot.position.y = this.inst.groundOffset;
+    this.root.add(this.pivot);
+
+    this.mixer = new THREE.AnimationMixer(this.inst.root);
+    // Every locomotion clip gets an action up front; which of them form the
+    // chain this frame is a runtime choice, so a keeper can stand like a
+    // keeper without a second mixer or a second set of actions.
+    const chain = (ids: ClipId[]): LocoEntry[] => ids
+      .map((id) => this.entry(id))
+      .filter((e): e is LocoEntry => e !== null)
+      .sort((a, b) => a.speed - b.speed);
+    this.chainOutfield = chain(LOCO_CHAIN);
+    this.chainKeeper = chain(GK_CHAIN);
+    this.entry(GK_SIDESTEP.left);
+    this.entry(GK_SIDESTEP.right);
+    this.entry('gkHold');
+    this.loco = this.chainOutfield;
+
+    // star player flair (§4): pulsing gold ring at the feet, same as the
+    // capsule path so the two look like the same game
+    if (data.star) {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(0.5, 0.72, 24),
+        new THREE.MeshBasicMaterial({
+          color: 0xffce4a, transparent: true, opacity: 0.55,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        }),
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.03;
+      this.root.add(ring);
+      this.starGlow = ring;
+    }
+  }
+
+  /** One looping locomotion action, minted once and cached by clip id. */
+  private entry(id: ClipId): LocoEntry | null {
+    const hit = this.locoById.get(id);
+    if (hit) return hit;
+    const pc = this.rig.clip(id);
+    if (!pc) return null;
+    const e: LocoEntry = {
+      id, action: this.loop(pc), speed: pc.groundSpeed, dur: pc.clip.duration, w: 0,
+    };
+    this.locoById.set(id, e);
+    return e;
+  }
+
+  private loop(pc: PreparedClip): THREE.AnimationAction {
+    const a = this.mixer.clipAction(pc.clip);
+    a.setLoop(THREE.LoopRepeat, Infinity);
+    a.enabled = false;
+    a.setEffectiveWeight(0);
+    // start each player at a different phase or twenty-two men march in step
+    a.time = (this.kickPick / 997) * pc.clip.duration;
+    a.play();
+    return a;
+  }
+
+  /**
+   * §7A.2 detail selection. Three pre-built levels hang off ONE skeleton, so
+   * this is nothing but a visibility flag — no rebuild, no re-bind, and never
+   * a frame where the swapped-in mesh has not been posed yet.
+   *
+   * Shadows do not follow the visible level. The lowest level is permanently
+   * on SHADOW_LAYER, which the cascade cameras draw and the game camera does
+   * not: a close player is drawn once at 28k triangles and casts off 1.5k
+   * instead of feeding 28k into three cascades. That single change is most of
+   * the frame this pipeline got back.
+   *
+   * Mixer rate also drops past SKINNED_NEAR_M.
+   */
+  updateLOD(camera: THREE.Camera): void {
+    const p = this.root.position;
+    const c = camera.position;
+    const d = Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z);
+    // Mixer rate is its OWN distance test, not the detail level's. They used to
+    // share one, and moving the detail bands in tuned the animation rate down
+    // with them — a player at 27m suddenly animating at 30Hz, which is much
+    // easier to see than the geometry he swapped to.
+    this.fullRate = d <= SKINNED_NEAR_M;
+    // hysteresis: a band edge is a different distance depending on which side
+    // you are already on, so a player jogging along one cannot flicker
+    let tier = LOD_BANDS_M.length;
+    for (let i = 0; i < LOD_BANDS_M.length; i++) {
+      const edge = LOD_BANDS_M[i] + (this.tier > i ? LOD_HYSTERESIS_M : 0);
+      if (d <= edge) { tier = i; break; }
+    }
+    tier = Math.min(tier, this.inst.levels.length - 1);
+    if (tier === this.tier) return;
+    this.tier = tier;
+    for (let i = 0; i < this.inst.levels.length; i++) {
+      const on = i === tier;
+      for (const m of this.inst.levels[i].meshes) {
+        // the eyeballs are two hundred triangles nobody can resolve past the
+        // near band, but a draw call every frame
+        m.visible = on && (tier === 0 || !/low-poly|eye/i.test(m.name));
+      }
+    }
+    // the shadow proxy draws for the cascades only — unless it IS the visible
+    // level, in which case it needs the camera's layer back
+    for (const m of this.inst.shadowMeshes) {
+      m.layers.set(SHADOW_LAYER);
+      if (tier === this.inst.levels.length - 1) m.layers.enable(0);
+    }
+  }
+
+  update(dt: number, x: number, y: number, z: number, facing: number, speed: number,
+    anim: ActionAnim, animT: number): void {
+    this.root.position.set(x, z, y);
+    this.root.rotation.y = Math.PI / 2 - facing;
+
+    // ---- action layer: pick up a new one-shot the moment the sim starts it
+    if (anim !== this.curAnim) {
+      this.curAnim = anim;
+      this.curDef = anim === 'none' ? null : ACTIONS[anim] ?? null;
+      this.startClip(this.curDef);
+    }
+
+    const def = this.curDef;
+    const u = def ? Math.min(animT / def.dur, 1) : 0;
+    // the procedural pose is the STAND-IN: if the clip resolved, it is what
+    // plays, and nothing bends the root on top of it
+    const pose = def?.pose && !this.act ? def.pose(u) : EMPTY;
+
+    // Weight the one-shot clip in fast and out slow. The two ends are
+    // symmetric in seconds, not in fractions, so a 3s celebration and a 0.42s
+    // strike hand back the same way.
+    let wantW = 0;
+    if (def?.clip && this.act) {
+      const inW = Math.min(animT / ACTION_IN, 1);
+      const outW = Math.min(Math.max(def.dur - animT, 0) / ACTION_OUT, 1);
+      wantW = Math.min(inW, outW);
+    }
+    // taken straight, not damped: the in/out ramps above ARE the fade, and
+    // stacking a time constant on top of them cost the strike most of its
+    // weight over the twenty-five frames it is on screen — a kick that reads
+    // as a man standing still is the whole bug this pipeline exists to avoid
+    this.actWeight = wantW;
+    if (this.act && this.actClip) {
+      // The sim kicked the ball and called playAnim in the same tick, so
+      // animT = 0 IS the contact frame. Driving .time straight off animT (the
+      // action itself stays paused) is what guarantees they stay aligned no
+      // matter what the frame rate or the replay rate is doing.
+      const d = this.actClip.clip.duration;
+      this.act.time = Math.min(this.actClip.contact + animT, Math.max(d - 1e-4, 0));
+      this.act.setEffectiveWeight(this.actWeight);
+    }
+
+    // ---- locomotion layer: find the pair of clips that brackets this speed,
+    // crossfade between them, and play both at speed ÷ their blended natural
+    // ground speed so the planted foot stays planted
+    const locoSpeed = pose.loco ?? speed;
+    const locoW = 1 - this.actWeight;
+    this.loco = this.pickChain(locoSpeed);
+    if (this.loco.length >= 2) this.blendLoco(locoSpeed, locoW);
+
+    // ---- tick
+    let ticked = true;
+    if (this.fullRate) {
+      this.mixer.update(dt);
+    } else {
+      this.halfTick += dt;
+      ticked = this.halfTick >= 1 / 30;
+      if (ticked) { this.mixer.update(this.halfTick); this.halfTick = 0; }
+    }
+
+    // ---- procedural trim, damped so nothing pops
+    const k = 1 - Math.pow(6e-5, dt);
+    this.lean += ((pose.lean ?? 0) - this.lean) * k;
+    this.roll += ((pose.roll ?? 0) - this.roll) * k;
+    this.lift += ((pose.lift ?? 0) - this.lift) * k;
+    this.arms += ((pose.arms ?? 0) - this.arms) * k;
+    this.headPitch += ((pose.head ?? 0) - this.headPitch) * k;
+    // the mocap actor is turned this far off his run-up on the contact frame;
+    // take it back out, weighted with the clip, so the strike points where the
+    // sim aimed
+    this.actYaw = this.actClip ? -this.actClip.yawAtContact * this.actWeight : 0;
+
+    // A slow breath on top of the idle. The idle clip is sixteen seconds of an
+    // actor standing about, sliced to eight, and the seam where it loops is
+    // visible if you stare; a little independent motion hides it and stops
+    // twenty-two men from looping in lockstep.
+    this.breathe += dt * 1.6;
+    const breath = (this.loco[0]?.w ?? 0) * Math.sin(this.breathe) * 0.014;
+
+    this.pivot.rotation.set(this.lean + breath, this.actYaw, this.roll);
+    this.pivot.position.y = this.inst.groundOffset + this.lift;
+
+    // only on frames the mixer actually wrote the bones: these are relative
+    // rotations, and applying one twice to the same pose doubles it
+    const b = this.inst.bones;
+    if (ticked) {
+      if (this.arms > 0.01 && b.armL && b.armR) {
+        // the character's own forward axis, in world space: rotating an arm
+        // about it swings it up through the side, which is what an arms-aloft
+        // celebration and a keeper's dive both want
+        const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(this.root.quaternion);
+        rotateBoneWorld(b.armL, fwd, this.arms * 1.9);
+        rotateBoneWorld(b.armR, fwd, -this.arms * 1.9);
+      }
+      if (Math.abs(this.headPitch) > 0.01 && b.head) {
+        const side = new THREE.Vector3(1, 0, 0).applyQuaternion(this.root.quaternion);
+        rotateBoneWorld(b.head, side, this.headPitch);
+      }
+    }
+
+    if (this.starGlow) {
+      const m = this.starGlow.material as THREE.MeshBasicMaterial;
+      m.opacity = 0.35 + Math.abs(Math.sin(performance.now() * 0.004)) * 0.3;
+      this.starGlow.rotation.z += dt * 0.8;
+    }
+  }
+
+  /**
+   * Which blend chain this frame runs on.
+   *
+   * A goalkeeper is the one player whose idle is a decision rather than a
+   * default, and the sim already made it: KeeperBrain (§6.3) sits in
+   * 'position' when play is at the other end, goes to 'set'/'react' when a
+   * threat is on, and 'hold' when the ball is in his hands. So:
+   *
+   *   position  → a standing goalkeeper idle (hands low, watching)
+   *   set/react → the outfield crouch, which is a keeper's ready stance
+   *   hold      → the idle that has a ball in its hands
+   *
+   * and while he is shuffling slowly across his line rather than running, a
+   * sidestep replaces the walk — picked by which way the sim is sliding him,
+   * not by a guess about where the ball is.
+   */
+  private pickChain(locoSpeed: number): LocoEntry[] {
+    if (!this.gkState) return this.chainOutfield;
+    if (this.gkState === 'hold') {
+      const hold = this.locoById.get('gkHold');
+      if (hold) return [hold];
+    }
+    // 'set' and 'react' want the on-the-toes crouch: that is the outfield idle
+    const base = this.gkState === 'set' || this.gkState === 'react' || this.gkState === 'smother'
+      ? this.chainOutfield : this.chainKeeper;
+    if (locoSpeed > 0.25 && locoSpeed < SIDESTEP_MAX_SPEED && Math.abs(this.gkLateral) > 0.6) {
+      const step = this.locoById.get(
+        this.gkLateral < 0 ? GK_SIDESTEP.left : GK_SIDESTEP.right);
+      if (step) return [base[0], step].sort((a, b) => a.speed - b.speed);
+    }
+    return base;
+  }
+
+  /**
+   * The sim's keeper state (§6.3) and how sideways he is moving: -1 fully to
+   * his left, +1 fully to his right. Set from the renderer, which is the only
+   * place that can see both the KeeperBrain and the mesh. Null = outfielder.
+   */
+  setKeeperState(state: string | null, lateral: number): void {
+    this.gkState = state;
+    this.gkLateral = lateral;
+  }
+
+  /**
+   * Weight and rate the locomotion chain for this frame. Split out because it
+   * is the one piece of the state machine worth reading on its own.
+   */
+  private blendLoco(locoSpeed: number, locoW: number): void {
+    const n = this.loco.length;
+    let hi = 1;
+    while (hi < n - 1 && this.loco[hi].speed < locoSpeed) hi++;
+    const lo = Math.max(0, hi - 1);
+    const loA = this.loco[lo], loB = this.loco[hi];
+    const t = THREE.MathUtils.clamp(
+      (locoSpeed - loA.speed) / Math.max(loB.speed - loA.speed, 1e-3), 0, 1);
+    // the idle contributes no speed, so a blend against it must take its rate
+    // from the moving clip alone or the rate explodes as the player stops
+    const natural = loA.speed > 1e-3 ? loA.speed + (loB.speed - loA.speed) * t : loB.speed;
+    const rate = THREE.MathUtils.clamp(locoSpeed / Math.max(natural, 1e-3), RATE_MIN, RATE_MAX);
+    // anything outside the chain in play (the other idle, the sidesteps) has
+    // to be switched off or it keeps contributing its pose at full weight
+    for (const e of this.locoById.values()) {
+      if (this.loco.includes(e)) continue;
+      if (e.w >= 1e-3) { e.action.enabled = false; e.action.setEffectiveWeight(0); e.w = 0; }
+    }
+    for (let i = 0; i < n; i++) {
+      const e = this.loco[i];
+      const w = (i === lo ? 1 - t : i === hi ? t : 0) * locoW;
+      // A zero-weight action still costs a full pass over its 156 tracks in
+      // three, and there are twenty-two of these. enabled=false is the one
+      // switch that actually skips that work.
+      if (w < 1e-3) {
+        if (e.w >= 1e-3) { e.action.enabled = false; e.action.setEffectiveWeight(0); }
+        e.w = 0;
+        continue;
+      }
+      if (e.w < 1e-3) {
+        // coming in from nothing: pick up the outgoing clip's phase rather
+        // than whatever the loop happened to be at, so a walk→jog blend does
+        // not briefly grow a third leg
+        const from = this.loco.find((x) => x !== e && x.w > 0.1);
+        if (from) e.action.time = ((from.action.time % from.dur) / from.dur) * e.dur;
+        e.action.enabled = true;
+      }
+      e.w = w;
+      e.action.setEffectiveWeight(w);
+      e.action.setEffectiveTimeScale(i === 0 ? 1 : rate);
+    }
+  }
+
+  /** Swap the one-shot clip the action layer is holding. */
+  private startClip(def: ActionDef | null): void {
+    if (this.act) {
+      this.act.setEffectiveWeight(0);
+      this.act.stop();
+      this.act = null;
+      this.actClip = null;
+    }
+    if (!def?.clip) return;
+    const id = Array.isArray(def.clip)
+      ? def.clip[this.kickPick % def.clip.length] : def.clip;
+    const pc = this.rig.clip(id);
+    if (!pc) return;
+    const a = this.mixer.clipAction(pc.clip);
+    a.reset();
+    a.setLoop(THREE.LoopOnce, 1);
+    a.clampWhenFinished = true;
+    a.enabled = true;
+    a.paused = true;           // the sim's animT drives .time, not the mixer
+    a.time = pc.contact;
+    a.setEffectiveWeight(0);
+    a.play();
+    this.act = a;
+    this.actClip = pc;
+    this.actWeight = 0;
+  }
+
+  /**
+   * Detach and drop the per-player bits. Deliberately does NOT dispose
+   * geometry, textures or the archetype materials: those are page-level and
+   * shared by every player in every match. Removing the root from the scene
+   * first is what keeps SceneManager.dispose()'s traversal — which frees
+   * whatever it can reach — from eating them.
+   */
+  dispose(): void {
+    this.mixer.stopAllAction();
+    this.mixer.uncacheRoot(this.inst.root);
+    this.root.removeFromParent();
+    if (this.starGlow) {
+      this.starGlow.geometry.dispose();
+      (this.starGlow.material as THREE.Material).dispose();
+    }
+  }
+}
+
+/** Which ActionAnims are running on a real clip right now and which on the
+ *  procedural stand-in. Reported at match build so "what is still fake" is a
+ *  line in the console rather than a thing you have to read the table for. */
+export function actionClipReport(rig: CharacterRig): { real: string[]; stand: string[] } {
+  const real: string[] = [];
+  const stand: string[] = [];
+  for (const [anim, def] of Object.entries(ACTIONS) as [ActionAnim, ActionDef][]) {
+    const ids = def.clip ? (Array.isArray(def.clip) ? def.clip : [def.clip]) : [];
+    (ids.length && ids.every((id) => rig.clip(id)) ? real : stand).push(anim);
+  }
+  return { real, stand };
+}

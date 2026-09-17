@@ -6,3 +6,9 @@ captures/
 
 # Claude Code session worktrees
 .claude/
+
+# asset pipeline: sources and review renders (regenerable, large)
+pipeline/anim/mixamo/
+pipeline/anim/previews/
+captures/
+public/models/anim/

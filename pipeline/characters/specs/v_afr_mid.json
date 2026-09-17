@@ -1,0 +1,29 @@
+{
+ "gender": 0.98,
+ "age": 0.55,
+ "muscle": 0.8,
+ "weight": 0.5,
+ "height": 0.62,
+ "proportions": 0.6,
+ "race": {
+  "african": 0.95,
+  "asian": 0.02,
+  "caucasian": 0.03
+ },
+ "skin": "middleage_african_male.mhmat",
+ "hair": "afro01.mhclo",
+ "eyebrows": "eyebrow008.mhclo",
+ "shoes": "shoes06.mhclo",
+ "teeth": "teeth_shape01.mhclo",
+ "name": "v_afr_mid",
+ "hair_color": [
+  0.03,
+  0.02,
+  0.02
+ ],
+ "targets": {
+  "arms/measure-upperarm-length-incr": 0.7,
+  "arms/measure-lowerarm-length-incr": 0.7
+ },
+ "shorts": "mindfront_male_swimming_trunks_01.mhclo"
+}

@@ -10,6 +10,8 @@ import { SceneManager, type TimeOfDay } from './scene';
 import { buildPitch } from './pitch';
 import { Stadium, type StadiumSize } from './stadium';
 import { PlayerMesh, PlayerRig, resolveKits } from './playerMesh';
+import { CharacterRig, charactersReady } from './characterAssets';
+import { SkinnedPlayerMesh, actionClipReport } from './skinnedPlayer';
 import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
 import { CameraDirector, type CamMode } from './camera';
@@ -17,6 +19,38 @@ import { HALF_L } from '../sim/constants';
 
 interface Snap {
   x: number; y: number; facing: number; speed: number;
+}
+
+/**
+ * The two player pipelines share exactly this much. PlayerMesh (procedural
+ * capsules, §7.1) and SkinnedPlayerMesh (authored glTF characters) both
+ * implement it, which is why every call site below is blind to which is live.
+ */
+export interface PlayerView {
+  root: THREE.Group;
+  readonly lodTier: number;
+  updateLOD(camera: THREE.Camera): void;
+  /** §6.3 keeper state, for a pipeline that can use it. Outfielders get null;
+   *  the capsule path does not implement this at all. */
+  setKeeperState?(state: string | null, lateral: number): void;
+  update(dt: number, x: number, y: number, z: number, facing: number, speed: number,
+    anim: ActionAnim, animT: number): void;
+  dispose(): void;
+}
+
+/**
+ * Which player pipeline to build. Flip this to true to make the authored
+ * characters the default; `?players=skinned` / `?players=capsule` overrides it
+ * either way, and the skinned path silently falls back to capsules if the
+ * assets have not finished loading (see preloadCharacters).
+ */
+export const SKINNED_PLAYERS_DEFAULT = true;
+
+export function skinnedPlayersWanted(): boolean {
+  const p = new URLSearchParams(location.search).get('players');
+  if (p === 'skinned') return true;
+  if (p === 'capsule' || p === 'capsules') return false;
+  return SKINNED_PLAYERS_DEFAULT;
 }
 
 /** Switch-indicator colors by seat slot: P1, P2, P3, P4 (§5.4.6). */
@@ -49,9 +83,11 @@ export class GameRenderer {
   sceneMgr: SceneManager;
   stadium: Stadium;
   lab: TextureLab;
-  rig: PlayerRig;
+  /** exactly one of these two is built; the other stays null */
+  rig: PlayerRig | null = null;
+  charRig: CharacterRig | null = null;
   cam: CameraDirector;
-  playerMeshes: PlayerMesh[] = [];
+  playerMeshes: PlayerView[] = [];
   ballMesh: BallMesh;
   switchArrows: THREE.Mesh[];
   controlRings: THREE.Mesh[];
@@ -104,13 +140,34 @@ export class GameRenderer {
     this.cam = new CameraDirector(this.sceneMgr.camera);
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
-    this.rig = new PlayerRig(this.lab, timeOfDay);
-    match.teams[0].players.forEach((p) => {
-      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit, this.rig));
-    });
-    match.teams[1].players.forEach((p) => {
-      this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkB : awayKit, this.rig));
-    });
+    // §7A.2 players. The skinned path needs its GLBs in hand — it is built
+    // only if preloadCharacters() has already resolved, because a half-loaded
+    // match is worse than a capsule one. When it IS live, PlayerRig is never
+    // constructed at all: no capsule geometry, no kit atlas, no impostor cards.
+    const assets = skinnedPlayersWanted() ? charactersReady() : null;
+    if (assets) {
+      this.charRig = new CharacterRig(assets);
+      const cr = this.charRig;
+      match.teams[0].players.forEach((p) => {
+        this.playerMeshes.push(new SkinnedPlayerMesh(p.data, p.isGK ? gkA : homeKit, cr));
+      });
+      match.teams[1].players.forEach((p) => {
+        this.playerMeshes.push(new SkinnedPlayerMesh(p.data, p.isGK ? gkB : awayKit, cr));
+      });
+    } else {
+      if (skinnedPlayersWanted()) {
+        console.warn('players=skinned asked for, but the character assets are not'
+          + ' loaded yet — falling back to the capsule path');
+      }
+      this.rig = new PlayerRig(this.lab, timeOfDay);
+      const rig = this.rig;
+      match.teams[0].players.forEach((p) => {
+        this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkA : homeKit, rig));
+      });
+      match.teams[1].players.forEach((p) => {
+        this.playerMeshes.push(new PlayerMesh(p.data, p.isGK ? gkB : awayKit, rig));
+      });
+    }
     for (const pm of this.playerMeshes) this.sceneMgr.scene.add(pm.root);
 
     // chunky switch indicators (§5), one per seat slot (§5.4.6): warm for the
@@ -156,9 +213,18 @@ export class GameRenderer {
 
     // §7A.3 budget report, plus the per-tier triangle arithmetic that keeps
     // twenty-two players inside the 150k scene ceiling
-    const b = this.rig.budget();
-    console.info(`player LOD: full ${b.full} tris / decimated ${b.lod} / impostor ${b.impostor}`
-      + ` — 22 players worst case ${b.full * 22} tris`);
+    if (this.rig) {
+      const b = this.rig.budget();
+      console.info(`player LOD: full ${b.full} tris / decimated ${b.lod} / impostor ${b.impostor}`
+        + ` — 22 players worst case ${b.full * 22} tris`);
+    } else if (this.charRig) {
+      const t = this.charRig.budget();
+      const r = actionClipReport(this.charRig);
+      console.info(`player LOD: skinned ${t.map((n, i) => `lod${i} ${n}`).join(' / ')} tris`
+        + ` — 22 at lod0 would be ${t[0] * 22} tris; shadows cast off lod${t.length - 1}`
+        + `\n  animated actions: ${r.real.join(', ') || 'none'}`
+        + `\n  procedural stand-ins: ${r.stand.join(', ') || 'none'}`);
+    }
     this.lab.report();
 
     this.snapshot();
@@ -184,6 +250,33 @@ export class GameRenderer {
     const t: [number, number, number] = [0, 0, 0];
     for (const pm of this.playerMeshes) t[pm.lodTier]++;
     return t;
+  }
+
+  /**
+   * Hand each mesh the sim's view of its player's job.
+   *
+   * Only the keeper has one: §6.3's KeeperBrain already knows whether he is
+   * watching play at the other end, set for a shot, or holding the ball, and
+   * a renderer that guessed that from ball distance would be a second, worse
+   * copy of a state machine that already exists. `lateral` is how sideways he
+   * is moving, +1 to his right, so a shuffle along the line can pick the
+   * sidestep that matches instead of breaking into a walk.
+   */
+  private feedKeeperState(): void {
+    const all = this.match.allPlayers;
+    for (let i = 0; i < all.length; i++) {
+      this.playerMeshes[i]?.setKeeperState?.(null, 0);
+    }
+    for (const brain of this.match.keepers) {
+      const i = all.indexOf(brain.keeper);
+      if (i < 0) continue;
+      const k = brain.keeper;
+      const sp = Math.hypot(k.vel.x, k.vel.y);
+      // his own right, in sim coords: forward is (cos f, sin f)
+      const lateral = sp > 0.05
+        ? (k.vel.x * Math.sin(k.facing) - k.vel.y * Math.cos(k.facing)) / sp : 0;
+      this.playerMeshes[i]?.setKeeperState?.(brain.state, lateral);
+    }
   }
 
   /** Called after every fixed sim tick. */
@@ -402,6 +495,8 @@ export class GameRenderer {
       }
     }
 
+    this.feedKeeperState();
+
     const replaying = this.passes.length > 0;
     let ballX: number, ballY: number, ballZ: number;
 
@@ -608,7 +703,8 @@ export class GameRenderer {
     // scene; the rig's shared geometries and the lab's texture caches are held
     // outside it and have to be freed by hand or a tournament strands them
     for (const pm of this.playerMeshes) pm.dispose();
-    this.rig.dispose();
+    this.rig?.dispose();
+    this.charRig?.dispose();
     this.lab.dispose();
     this.sceneMgr.dispose();
   }

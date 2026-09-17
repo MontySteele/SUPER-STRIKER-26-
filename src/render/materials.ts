@@ -17,6 +17,18 @@ import * as THREE from 'three';
 
 export type ShaderPatch = (shader: THREE.WebGLProgramParametersWithUniforms) => void;
 
+/**
+ * The shadow-proxy layer.
+ *
+ * Objects on it are drawn by the cascade shadow cameras and NOT by the game
+ * camera (Atmosphere enables it on each cascade; nothing enables it on the
+ * camera). The skinned players use it to cast their shadows off their cheapest
+ * mesh while the camera draws their most expensive one — see SkinnedPlayerMesh.
+ * It lives here, in the leaf module, so the lighting rig does not have to pull
+ * the whole character loader in to learn one integer.
+ */
+export const SHADOW_LAYER = 1;
+
 /** Queue a fragment-shader patch. Nothing happens until applyShaderPatches(). */
 export function queueShaderPatch(mat: THREE.Material, patch: ShaderPatch): void {
   const list = (mat.userData.ss26Patches ?? (mat.userData.ss26Patches = [])) as ShaderPatch[];

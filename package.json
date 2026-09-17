@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "capture": "node tools/capture.mjs",
-    "shoot-player": "node tools/shoot-player.mjs"
+    "shoot-player": "node tools/shoot-player.mjs",
+    "shoot-model": "node tools/shoot-model.mjs"
   },
   "repository": {
     "type": "git",

@@ -9,7 +9,8 @@
 // the frame count, the camera pose, and — via installDeterministicEnv — the
 // render layer's Math.random and wall clock.
 
-import { GameRenderer } from '../render/gameRenderer';
+import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
+import { preloadCharacters } from '../render/characterAssets';
 import { forceQuality, type QualityLevel } from '../render/quality';
 import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
@@ -82,6 +83,12 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
       ? override : shot.quality ?? 'high';
     forceQuality(level);
 
+    // `?players=skinned` swaps the capsules for the authored characters. The
+    // GLBs have to be in hand BEFORE the renderer is constructed or it falls
+    // back to capsules and the shot silently measures the wrong pipeline — so
+    // this await is load-bearing, not politeness.
+    if (skinnedPlayersWanted()) await preloadCharacters();
+
     // both seats null = CPU vs CPU = the sim is a pure function of the seed
     const match = new Match({
       home: findTeam(shot.home),
@@ -144,6 +151,9 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
       triangles: still.triangles,
       fps: Math.round(fps * 10) / 10,
     };
+    // the live objects, so an ad-hoc probe can re-aim the camera at one player
+    // and draw again without inventing a new shot (shots.json is a contract)
+    w.__ss26 = { match, renderer };
     w.__ss26Capture = { ready: true, shot: shot.name, stats };
   } catch (err) {
     console.error('capture failed:', err);

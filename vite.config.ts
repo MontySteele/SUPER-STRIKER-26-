@@ -12,6 +12,9 @@ export default defineConfig({
         // studio character viewer (§7A.9) — a build input so it works in dev
         // and survives into dist/ for reviewing kits on a deployed build
         viewer: resolve(__dirname, 'viewer.html'),
+        // rigged-glTF model lab (§7A.9) — the studio set with an authored
+        // skinned character in it instead of the procedural match mesh
+        modellab: resolve(__dirname, 'modellab.html'),
         // guest controller page (§5.4.2) — inputs only, renders no gameplay
         join: resolve(__dirname, 'join.html'),
       },

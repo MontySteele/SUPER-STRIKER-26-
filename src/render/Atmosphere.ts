@@ -21,7 +21,7 @@
 import * as THREE from 'three';
 import { CSM } from 'three/examples/jsm/csm/CSM.js';
 import { Sky, type SkyPreset } from './sky';
-import { applyShaderPatches } from './materials';
+import { SHADOW_LAYER, applyShaderPatches } from './materials';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
 
@@ -226,6 +226,12 @@ export class Atmosphere {
     });
     for (const light of this.csm.lights) {
       light.color.set(p.keyColor);
+      // The cascade shadow cameras also draw the SHADOW-PROXY layer, which the
+      // game camera does not. That is how a skinned player casts a shadow off
+      // his cheapest mesh while the camera draws his most expensive one — see
+      // SHADOW_LAYER in skinnedPlayer.ts. Harmless for everything else: nothing
+      // outside that pipeline puts anything on the layer.
+      light.shadow.camera.layers.enable(SHADOW_LAYER);
       // CSM has no knob for either of these. normalBias kills the acne a 105m
       // pitch under a low sun would otherwise show everywhere; radius is what
       // the PCF tap kernel spreads by, i.e. how soft the edge reads.

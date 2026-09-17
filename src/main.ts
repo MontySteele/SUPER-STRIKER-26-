@@ -11,7 +11,8 @@ import { Match, SEAT_SLOTS, type DifficultyName } from './sim/match';
 import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
 import type { MatchEvent } from './sim/matchEvents';
-import { GameRenderer } from './render/gameRenderer';
+import { GameRenderer, skinnedPlayersWanted } from './render/gameRenderer';
+import { preloadCharacters } from './render/characterAssets';
 import type { TimeOfDay } from './render/scene';
 import type { StadiumSize } from './render/stadium';
 import { HUD } from './ui/hud';
@@ -741,6 +742,15 @@ if (captureShot) {
   inMenus = false;
   void import('./tools/capture').then((m) => m.runCapture(canvas, captureShot));
 } else {
+  // §7A.2 skinned players: ~10MB of glTF, so it is fetched in the background
+  // while the menu is already up rather than held in front of the boot. The
+  // renderer falls back to the capsule path for anything built before this
+  // lands, which is why the attract match gets restarted when it does.
+  if (skinnedPlayersWanted()) {
+    void preloadCharacters().then(() => {
+      if (inMenus) startAttract();
+    }).catch(() => { /* preloadCharacters already logged it */ });
+  }
   try {
     applyRosterOverrides();
     showMenu();

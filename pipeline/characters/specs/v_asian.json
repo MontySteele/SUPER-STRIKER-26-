@@ -1,0 +1,29 @@
+{
+ "gender": 0.98,
+ "age": 0.38,
+ "muscle": 0.6,
+ "weight": 0.4,
+ "height": 0.66,
+ "proportions": 0.6,
+ "race": {
+  "african": 0.02,
+  "asian": 0.95,
+  "caucasian": 0.03
+ },
+ "skin": "young_asian_male.mhmat",
+ "hair": "short04.mhclo",
+ "eyebrows": "eyebrow005.mhclo",
+ "shoes": "shoes06.mhclo",
+ "teeth": "teeth_shape01.mhclo",
+ "name": "v_asian",
+ "hair_color": [
+  0.04,
+  0.03,
+  0.03
+ ],
+ "targets": {
+  "arms/measure-upperarm-length-incr": 0.7,
+  "arms/measure-lowerarm-length-incr": 0.7
+ },
+ "shorts": "mindfront_male_swimming_trunks_01.mhclo"
+}

@@ -1,0 +1,29 @@
+{
+ "gender": 0.98,
+ "age": 0.4,
+ "muscle": 0.7,
+ "weight": 0.42,
+ "height": 0.65,
+ "proportions": 0.7,
+ "race": {
+  "african": 0.02,
+  "asian": 0.03,
+  "caucasian": 0.95
+ },
+ "skin": "young_caucasian_male.mhmat",
+ "hair": "short01.mhclo",
+ "eyebrows": "eyebrow003.mhclo",
+ "shoes": "shoes06.mhclo",
+ "teeth": "teeth_shape01.mhclo",
+ "name": "v_cauc_blond",
+ "hair_color": [
+  0.55,
+  0.42,
+  0.22
+ ],
+ "targets": {
+  "arms/measure-upperarm-length-incr": 0.7,
+  "arms/measure-lowerarm-length-incr": 0.7
+ },
+ "shorts": "mindfront_male_swimming_trunks_01.mhclo"
+}

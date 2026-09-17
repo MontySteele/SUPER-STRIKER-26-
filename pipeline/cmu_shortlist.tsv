@@ -1,0 +1,582 @@
+01_01	22s	playground - forward jumps, turn around
+02_01	2s	walk
+02_02	2s	walk
+02_03	1s	run/jog
+02_04	4s	jump, balance
+05_01	4s	walk
+06_01	4s	walk
+07_01	2s	walk
+07_02	2s	walk
+07_03	3s	walk
+07_04	3s	slow walk
+07_05	4s	slow walk
+07_06	3s	walk
+07_07	3s	walk
+07_08	3s	walk
+07_09	2s	walk
+07_10	2s	walk
+07_11	2s	walk
+07_12	2s	brisk walk
+08_01	2s	walk
+08_02	2s	walk
+08_03	2s	walk
+08_04	4s	slow walk
+08_05	2s	walk/stride
+08_06	2s	walk
+08_07	2s	walk, exaggerated stride
+08_08	2s	walk
+08_09	2s	walk
+08_10	2s	walk
+08_11	3s	slow walk/stride
+09_01	1s	run
+09_02	1s	run
+09_03	1s	run
+09_04	1s	run
+09_05	1s	run
+09_06	1s	run
+09_07	1s	run
+09_08	1s	run
+09_09	1s	run
+09_10	1s	run
+09_11	1s	run
+09_12	15s	navigate - walk forward, backward, sideways
+10_01	6s	soccer - kick ball
+10_02	4s	soccer - kick ball
+10_03	3s	soccer - kick ball
+10_04	4s	walk
+10_05	3s	soccer - kick ball
+10_06	4s	soccer - kick ball
+11_01	4s	soccer - kick ball
+12_01	4s	walk
+12_02	5s	walk
+12_03	4s	walk
+13_01	19s	sit on high stool, stand up
+13_02	28s	sit on high stool, stand up
+13_03	30s	sit on high stool, stand up
+13_05	36s	sit on stepstool, hands against chin, fidget, stand up
+13_06	36s	sit on stepstool, hands against chin, elbow out, stand up
+13_10	19s	jump up to grab, reach for, tiptoe
+13_11	3s	forward jump
+13_12	28s	jump up to grab, reach for, tiptoe
+13_13	3s	forward jump
+13_19	3s	forward jump
+13_26	25s	direct traffic, wave
+13_27	34s	direct traffic, wave, point
+13_28	34s	direct traffic, wave, point
+13_29	38s	jumping jacks, side twists, bend over, squats
+13_30	20s	jumping jacks, side twists, squats, jog
+13_31	25s	jumping jacks, side twists, bend over, jog
+13_32	2s	forward jump
+13_39	2s	jump
+13_40	2s	jump
+13_41	3s	jump
+13_42	3s	jump
+14_06	44s	jumping jacks, jog, squats, side twists, stretches
+14_07	18s	jump up to grab, reach for, tiptoe
+14_08	21s	jump up to grab, reach for, tiptoe
+14_09	27s	jump up to grab, reach for, tiptoe
+14_14	38s	jumping jacks, jog, squats, side twists, stretches
+14_20	38s	jumping jacks, side twists, reach up, bend over
+14_24	30s	direct traffic, wave, point
+14_25	36s	direct traffic, wave, point
+14_26	39s	direct traffic, wave, point
+14_27	17s	sit on high stool, stand up
+14_28	17s	sit on high stool, stand up
+14_31	17s	sit on stepstool, stand up
+14_32	21s	sit on stepstool, stand up
+14_36	17s	sit on stepstool, stand up
+15_01	46s	walk/wander
+15_03	104s	walk/wander
+15_09	65s	walk/wander
+15_10	23s	sit on high stool, stand up
+15_14	75s	walk/wander
+16_01	2s	jump
+16_02	3s	jump
+16_03	3s	high jump
+16_04	3s	high jump
+16_05	2s	forward jump
+16_06	3s	forward jump
+16_07	3s	forward jump
+16_08	2s	run/jog, sudden stop
+16_09	4s	forward jump
+16_10	3s	forward jump
+16_11	4s	walk, veer left
+16_12	3s	walk, veer left
+16_13	3s	walk, veer right
+16_14	3s	walk, veer right
+16_15	3s	walk
+16_16	4s	walk
+16_17	4s	walk, 90-degree left turn
+16_18	4s	walk, 90-degree left turn
+16_19	3s	walk, 90-degree right turn
+16_20	4s	walk, 90-degree right turn
+16_21	2s	walk
+16_22	2s	walk
+16_23	2s	walk, veer left
+16_24	2s	walk, veer left
+16_25	2s	walk, veer right
+16_26	2s	walk, veer right
+16_27	2s	walk, 90-degree left turn
+16_28	2s	walk, 90-degree left turn
+16_29	2s	walk, 90-degree right turn
+16_30	2s	walk, 90-degree right turn
+16_31	3s	walk
+16_32	4s	walk
+16_33	2s	slow walk, stop
+16_34	2s	slow walk, stop
+16_35	1s	run/jog
+16_36	1s	run/jog
+16_37	1s	run/jog, veer left
+16_38	1s	run/jog, veer left
+16_39	1s	run/jog, veer right
+16_40	1s	run/jog, veer right
+16_41	1s	run/jog, 90-degree left turn
+16_42	1s	run/jog, 90-degree left turn
+16_43	1s	run/jog, 90-degree right turn
+16_44	1s	run/jog, 90-degree right turn
+16_45	1s	run/jog
+16_46	1s	run/jog
+16_47	3s	walk
+16_48	1s	run, veer left
+16_49	1s	run, veer right
+16_50	1s	run, veer right
+16_51	1s	run, 90-degree left turn
+16_52	1s	run, 90-degree left turn
+16_53	1s	run, 90-degree right turn
+16_54	1s	run, 90-degree right turn
+16_55	1s	run
+16_56	1s	run/jog
+16_57	2s	run/jog, sudden stop
+16_58	2s	walk
+17_01	52s	walk with anger, frustration
+17_02	53s	walk with anger, frustration
+17_03	52s	walk stealthily
+17_04	53s	walk stealthily
+17_05	52s	walk/hobble
+17_06	51s	whistle, walk jauntily
+17_07	53s	whistle, walk jauntily
+17_08	51s	muscular, heavyset person's walk
+17_09	50s	muscular, heavyset person's walk
+35_01	2s	walk
+35_02	3s	walk
+35_03	3s	walk
+35_04	3s	walk
+35_05	3s	walk
+35_06	3s	walk
+35_07	3s	walk
+35_08	3s	walk
+35_09	3s	walk
+35_10	3s	walk
+35_11	3s	walk
+35_12	3s	walk
+35_13	3s	walk
+35_14	3s	walk
+35_15	3s	walk
+35_16	3s	walk
+35_17	1s	run/jog
+35_18	1s	run/jog
+35_19	1s	run/jog
+35_20	1s	run/jog
+35_21	1s	run/jog
+35_22	1s	run/jog
+35_23	1s	run/jog
+35_24	1s	run/jog
+35_25	1s	run/jog
+35_26	1s	run/jog
+35_28	3s	walk
+35_29	4s	walk
+35_30	3s	walk
+35_31	3s	walk
+35_32	3s	walk
+35_33	3s	walk
+35_34	3s	walk
+36_02	35s	walk forward, turn around, walk back
+36_03	32s	walk forward, turn around, walk back
+36_09	32s	walk forward, turn around, walk back
+37_01	4s	slow walk
+38_01	2s	walk
+38_02	3s	walk
+38_03	6s	run around in a circle
+38_04	71s	walk around, frequent turns, cyclic walk along a line
+39_01	3s	walk
+39_02	3s	walk
+39_03	3s	walk
+39_04	3s	walk
+39_05	3s	walk
+39_06	3s	walk
+39_07	3s	walk
+39_08	2s	walk
+39_09	3s	walk
+39_10	3s	walk
+39_11	7s	walk forward, turn around, walk back
+39_12	3s	walk
+39_13	3s	walk
+39_14	3s	walk
+69_01	3s	walk forward
+69_02	2s	walk forward
+69_03	3s	walk forward
+69_04	3s	walk forward
+69_05	3s	walk forward
+69_06	43s	walk and turn (repeated)
+69_07	43s	walk and turn (repeated)
+69_08	44s	walk and turn (repeated)
+69_09	42s	walk and turn (repeated)
+69_10	47s	walk and turn (repeated)
+69_11	41s	walk and turn (repeated)
+69_12	40s	walk and turn both directions (repeated)
+69_13	39s	walk, turn in place (repeated)
+69_14	40s	walk, turn in place (repeated)
+69_15	37s	walk, turn in place (repeated)
+69_16	9s	turn in place
+69_17	8s	turn in place
+69_18	8s	turn in place (opposite direction)
+69_19	9s	turn in place (opposite direction)
+69_20	4s	walk forward 90 degree right turn
+69_21	5s	walk forward 90 degree right turn
+69_22	4s	walk forward 90 degree right turn
+69_23	4s	walk forward 90 degree right turn
+69_24	3s	walk forward 90 degree left turn
+69_25	3s	walk forward 90 degree left turn
+69_26	3s	walk forward 90 degree left turn
+69_27	3s	walk forward 90 degree left turn
+69_28	3s	walk forward 90 degree smooth right turn
+69_29	3s	walk forward 90 degree smooth right turn
+69_30	3s	walk forward 90 degree smooth right turn
+69_31	3s	walk forward 90 degree smooth left turn
+69_32	3s	walk forward 90 degree smooth left turn
+69_33	3s	walk forward 90 degree smooth left turn
+69_34	39s	walk backwards and turn
+69_35	34s	walk backwards and turn
+69_36	38s	walk backwards and turn
+69_37	36s	walk backwards and turn
+69_38	41s	walk backwards and turn (repeated)
+69_39	37s	walk backward, turn in place
+69_40	38s	walk backward, turn in place
+69_41	39s	walk backward, turn in place
+69_42	42s	walk sideways and turn (repeated)
+69_43	41s	walk sideways and turn (repeated)
+69_44	47s	walk sideways and turn (repeated)
+69_45	39s	walk sideways and turn (repeated)
+69_46	47s	walk sideways and turn (repeated)
+69_47	44s	walk sideways and turn (repeated)
+69_48	41s	walk sideways and turn (opposite direction)
+69_49	47s	walk sideways and turn (opposite direction)
+69_50	4s	walk sideways and backwards
+69_51	5s	walk backwards and turn
+69_52	4s	walk backwards and turn
+69_53	3s	walk backwards and turn
+69_54	4s	walk backwards and turn
+69_55	3s	walk backwards and turn
+69_56	6s	walk sideways and turn (opposite direction)
+69_57	5s	walk sideways and turn (opposite direction)
+69_58	6s	walk sideways and turn (opposite direction)
+69_59	5s	walk sideways and turn
+69_60	5s	walk sideways and turn
+69_61	5s	walk sideways and turn
+69_62	5s	walk sideways and turn (opposite direction)
+69_63	4s	walk sideways and turn (opposite direction)
+69_64	4s	walk sideways and turn (opposite direction)
+69_65	5s	walk sideways and turn
+69_66	4s	walk sideways and turn
+69_67	5s	walk sideways and turn
+69_68	6s	walk forward and pick up object, set down object
+69_69	6s	walk forward and pick up object, carry back object
+69_70	8s	walk up to object, squat, pick up object, set down in another place.
+69_71	10s	walk up to object, squat, pick up object, set down in another place
+69_72	9s	walk up to object, pick up object, set down in another place
+69_73	9s	walk up to object, lean over, pick up object, set down in another place
+69_74	8s	walk up to object, lean over, pick up object, set down in another place
+69_75	9s	walk up to object, squat, pick up object, set down in another place
+74_01	3s	stiff walk
+74_02	2s	stiff walk
+74_03	3s	kick
+74_04	2s	kick
+74_05	2s	kick
+74_06	2s	kick
+74_20	4s	stiff walk
+75_01	3s	run jump
+75_02	2s	run jump
+75_03	1s	run jump
+75_04	2s	wide leg run
+75_05	2s	cross leg run
+75_06	6s	180 jump
+75_07	9s	angle jumps
+75_08	9s	360 jumps
+75_09	3s	360 jump
+75_10	2s	2 jump
+75_11	1s	2 jump
+75_15	14s	long jumps
+75_16	2s	jump kick
+86_03	70s	walking, running, jumping, kicking, and stretching
+86_09	39s	walking, sitting, looking, stand up
+86_10	63s	walk around, sit, stand up, and running
+86_11	47s	walking, stretching, walking and turning
+86_12	73s	walking, dragging, sweeping, dustpan, wipe window, and wipe mirror
+86_15	59s	walking, sitting, hand motions
+87_01	5s	Jump with kick and spin
+88_06	1s	jump and spin kick
+88_10	3s	stretch and spin
+88_11	16s	stretches and jumps
+90_05	4s	jump kick
+90_06	5s	jump kick
+90_07	7s	jump kick
+90_12	6s	bck flp twst fall
+90_13	7s	bck flp twst fall
+90_16	6s	fall on face
+90_18	3s	RugPullFall
+90_22	5s	straight walk
+90_23	9s	straight walk
+90_25	10s	fwd ball walk
+90_26	11s	fwd ball walk
+90_27	10s	bwk ball walk
+90_32	6s	moonwalk
+91_01	22s	Walk digital figure eight
+91_02	14s	WalkStraight
+91_03	15s	Walk figure eight
+91_04	18s	Walking
+91_05	22s	Mummy Walk
+91_10	26s	SlowWalk
+91_11	15s	LavishWalk
+91_12	18s	TooCoolWalk
+91_13	24s	SadWalk
+91_14	23s	DepressedWalk
+91_15	25s	ClumsyWalk
+91_17	12s	QuickWalk
+91_18	28s	CarefulWalk LookingAround
+91_20	23s	ShyWalk
+91_21	32s	acheyWalk
+91_22	17s	CasualQuickWalk
+91_23	22s	CoolWalk
+91_25	26s	DragBadLegWalk
+91_27	24s	SlowWalk
+91_28	27s	GhettoWalk
+91_29	18s	NormalWalk
+91_30	26s	SexyWalk
+91_31	16s	NormalWalk
+91_32	31s	ScaredWalk
+91_33	22s	MachoWalk
+91_34	18s	NormalWalk
+91_35	25s	TrafficWalk
+91_36	7s	WalkStraight
+91_39	3s	JumpForward
+91_40	3s	JumpForward
+91_41	4s	JumpForward
+91_42	4s	JumpForward
+91_43	1s	JumpSmallForward
+91_44	2s	JumpSmallForward
+91_45	3s	JumpForward
+91_46	2s	Jump Turn
+91_47	3s	Jump Turn
+91_48	3s	JumpTurn
+91_49	4s	Jump Turn
+91_50	5s	JumpTurn
+91_51	4s	FurtherJumpTurn
+91_52	4s	SmallJumpTurn
+91_53	4s	180 degree jump
+91_57	9s	WalkForward
+91_62	15s	walkFigure8
+93_07	1s	Casual Walk
+102_01	2s	RightWideTurn
+102_02	1s	LeftWideTurn
+102_05	0s	RunningStraight
+102_06	1s	RunningWideRight
+102_07	0s	RunningWideLeft
+102_08	1s	RunningTighterRight
+102_10	0s	RunningNoBall
+102_16	1s	WalkEvasiveLeft
+102_17	1s	WalkEvasiveRight
+102_22	2s	DefensiveStraightNoStop
+102_23	2s	DefensiveStraightWithStop
+102_24	2s	DefensiveRightStopToStop
+102_25	2s	DefensiveLeftStopToStop
+102_30	1s	SraightDriveFromStop
+102_33	1s	RightTightTurn
+103_07	1s	Casual Walk
+104_01	3s	JogThrough
+104_02	7s	neutral Male walk, exact footfalls
+104_03	13s	Frankenstein male walk, exact footfalls
+104_04	1s	JogThrough
+104_06	2s	StartJog
+104_08	2s	StartJog
+104_09	2s	JogStop
+104_10	2s	JogStop
+104_11	4s	HappyGoLuckWalk
+104_12	3s	ExcitedWalk
+104_13	4s	StumbleWalk
+104_14	5s	HappyStartWalk
+104_16	2s	SpasticWalk
+104_17	3s	SpasticStop
+104_18	5s	SpasticStop
+104_19	7s	CasualWalk
+104_22	15s	RegularWalk8
+104_27	20s	RegularWalkRightAngleTurns
+104_28	4s	SternWalk
+104_29	4s	SternWalk
+104_30	11s	SternWalk8
+104_32	13s	SternWalkRightAngleTurns
+104_35	8s	SlowWalk
+104_36	19s	SlowWalk8
+104_37	1s	RunThrough
+104_39	26s	SlowWalkRightAngleTurns
+104_44	9s	AttitudeWalk
+104_45	18s	AttitudeWalk8
+104_46	23s	AttitudeWalkRightAngleTurns
+104_48	1s	RunThrough
+104_53	2s	StartRun
+104_54	2s	StartRun
+104_55	4s	StartRun
+104_56	3s	RunStop
+104_57	3s	RunStop
+105_01	22s	WalkDigital8
+105_02	14s	WalkStraight
+105_03	15s	Walk8
+105_05	22s	mummyWalk
+105_10	26s	SlowWalk
+105_11	15s	LavishWalk
+105_12	18s	TooCoolWalk
+105_13	24s	SadWalk
+105_14	23s	DepressedWalk
+105_15	25s	ClumsyWalk
+105_17	12s	QuickWalk
+105_18	28s	CarefulWalk LookingAround
+105_20	23s	ShyWalk
+105_21	32s	acheyWalk
+105_22	17s	CasualQuickWalk
+105_23	22s	CoolWalk
+105_25	26s	DragBadLegWalk
+105_27	24s	SlowWalk
+105_28	27s	GhettoWalk
+105_29	18s	NormalWalk
+105_30	26s	SexyWalk
+105_31	16s	NormalWalk
+105_32	31s	ScaredWalk
+105_33	22s	MachoWalk
+105_34	18s	NormalWalk
+105_35	25s	TrafficWalk
+105_36	7s	WalkStraight
+105_39	3s	JumpForward
+105_40	3s	JumpForward
+105_41	4s	JumpForward
+105_42	4s	JumpForward
+105_43	1s	JumpSmallForward
+105_44	2s	JumpSmallForward
+105_45	3s	JumpForward
+105_46	2s	Jump Turn
+105_47	3s	Jump Turn
+105_48	3s	JumpTurn
+105_49	4s	Jump Turn
+105_50	5s	JumpTurn
+105_51	4s	FurtherJumpTurn
+105_52	4s	SmallJumpTurn
+105_57	9s	WalkForward
+105_62	15s	walkFigure8
+111_01	8s	Walk backwards
+111_23	9s	Run
+111_24	7s	Run
+111_26	22s	Walk sideways
+111_28	15s	Standing still
+111_32	6s	Stretch and yawn
+111_33	17s	Throwing
+111_34	15s	Walk
+111_35	12s	Walk
+111_36	12s	Walk and carry
+111_37	2s	Wave
+113_01	6s	Walk backwards
+113_05	22s	Walk digital 8
+113_06	16s	Walk figure 8
+113_07	4s	Run
+113_10	11s	Walk, mope around
+113_17	15s	Walk sideway
+113_18	18s	Walk sideways
+113_21	11s	Standing Still
+113_23	8s	Stretch and yawn
+113_24	9s	Throw
+113_25	5s	Walk
+113_26	10s	Walk and carry
+113_27	2s	Wave
+114_10	67s	Stretching
+114_12	9s	Stretching
+114_13	26s	Walk
+114_14	48s	Walk
+114_15	11s	Walk
+114_16	14s	Sit down and stretch
+118_01	5s	Jump
+118_02	5s	Jump
+118_03	4s	Jump
+118_04	5s	Jump
+118_05	5s	Jump
+118_06	4s	Jump
+118_07	5s	Jump
+118_08	5s	Jump
+118_09	4s	Jump
+118_10	4s	Jump
+118_11	5s	Jump
+118_12	5s	Jump
+118_13	5s	Jump
+118_14	6s	Jump
+118_15	5s	Jump
+118_16	5s	Jump
+118_17	5s	Jump
+118_18	4s	Jump
+118_19	5s	Jump
+118_20	4s	Jump
+118_21	6s	Jump
+118_22	5s	Jump
+118_23	5s	Jump
+118_24	5s	Jump
+118_25	4s	Jump
+118_26	5s	Jump
+118_27	5s	Jump
+118_28	5s	Jump
+118_29	4s	Jump
+118_30	6s	Jump
+120_01	10s	Alien Turn
+120_19	106s	Walk slow
+120_20	89s	Walk
+124_11	8s	2 Foot Jump
+127_03	2s	Run
+127_04	3s	Walk to Run
+127_05	3s	Run to Quick Stop
+127_06	1s	Run
+127_07	1s	Run
+127_08	1s	Run
+127_09	1s	Run Right
+127_10	1s	Run Right
+127_11	1s	Run Left
+127_12	1s	Run Left
+127_13	1s	Run Side Step Left
+127_14	1s	Run Side Step Right
+127_15	1s	Run Turn Left
+127_16	2s	Run Turn Right
+127_17	3s	Run Stop Run
+127_18	3s	Run Stop Run
+127_19	3s	Run Quick Stop Run
+127_20	3s	Run Quick Stop Run
+127_21	2s	Run Jump Stop Run
+127_22	3s	Run Jump Stop Run
+127_23	2s	Run Dive Over Roll Run
+127_24	2s	Run Dive Over Roll Run
+127_25	1s	Run Jump Over
+127_26	2s	Run Jump Over
+127_27	2s	Run Jump Over
+127_28	1s	Run Jump Over
+127_29	1s	Run Duck Underneath
+127_30	2s	Run Duck Underneath
+127_31	4s	Run Duck Underneath
+127_32	2s	Run Duck Underneath
+127_33	1s	Run Over
+127_34	1s	Run Over
+127_35	2s	Run Over
+127_36	1s	Run Over
+127_37	2s	Run Duck Underneath
+127_38	1s	Run Duck Underneath
+128_02	1s	Run Left
+128_03	1s	Run Right
+128_04	1s	Run Duck Underneath
+128_05	1s	Run Stop Run
+128_06	1s	Run Stop Run
+128_07	2s	Run Stop Run
+128_08	2s	Run Stop Run
+128_09	1s	Run Roll Underneath
+128_10	3s	Run Dive Over Roll Run
+128_11	3s	Run Dive Over Roll Run

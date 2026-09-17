@@ -8,6 +8,7 @@
 //   npm run capture -- --list            # print the shot list and exit
 //   npm run capture -- --shots midfield_wide,celebration_closeup
 //   npm run capture -- --out /tmp/before --url http://localhost:5173
+//   npm run capture -- --players skinned  # authored characters, not capsules
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -72,7 +73,7 @@ try {
     page.on('console', (m) => {
       const text = m.text();
       if (m.type() === 'error') logs.push(text);
-      else if (/^(TextureLab|player LOD)/.test(text)) notes.push(text);
+      else if (/^(TextureLab|player LOD|characters)/.test(text)) notes.push(text);
     });
     page.on('pageerror', (e) => logs.push(String(e)));
 
@@ -82,7 +83,10 @@ try {
       // checks (does RETRO still boot?) — a PNG taken this way is NOT that
       // shot's baseline.
       const q = typeof args.quality === 'string' ? `&quality=${encodeURIComponent(args.quality)}` : '';
-      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}`,
+      // --players skinned | capsule: which player pipeline the shot draws.
+      // Same rules as --quality — an ad-hoc override, not a new baseline.
+      const pl = typeof args.players === 'string' ? `&players=${encodeURIComponent(args.players)}` : '';
+      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}${pl}`,
         { waitUntil: 'load' });
       await page.waitForFunction(() => window.__ss26Capture?.ready === true,
         null, { timeout: SHOT_TIMEOUT_MS });
@@ -90,7 +94,8 @@ try {
       if (result.error) throw new Error(result.error);
 
       const file = join(outDir, `${shot.name}.png`);
-      await page.screenshot({ path: file, clip: { x: 0, y: 0, width: WIDTH, height: HEIGHT } });
+      await page.screenshot({ path: file, timeout: SHOT_TIMEOUT_MS,
+        clip: { x: 0, y: 0, width: WIDTH, height: HEIGHT } });
       const px = pixelStats(file);
       if (px.blank) throw new Error(`blank frame (lum ${px.minLum}..${px.maxLum}, ${px.colors} colours)`);
 
@@ -104,6 +109,10 @@ try {
       stats[shot.name] = { error: String(err.message ?? err) };
       console.error(`${shot.name.padEnd(24)} FAILED: ${err.message ?? err}`);
       for (const l of logs.slice(0, 5)) console.error(`  page: ${l}`);
+      // the asset/budget notes are the usual reason a shot dies (a clip that
+      // did not load, a bake that threw) — never swallow them on the one run
+      // where they matter
+      for (const n of notes.slice(0, 12)) console.error(`  note: ${n.split('\n')[0]}`);
     } finally {
       await page.close();
     }
