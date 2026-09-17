@@ -70,6 +70,39 @@ skinned mesh replaces `buildParts()` and nothing above it changes.
 
 ---
 
+## Audio
+
+### Commentary voices — Kokoro-82M (Apache-2.0)
+
+Spoken commentary is rendered offline by [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+(model weights Apache-2.0) through
+[`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (MIT), with
+phonemisation by [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0,
+used as a build-time tool only — nothing GPL ships in the game). Voices
+`bm_george` (play-by-play) and `bm_lewis` (colour). The rendered audio is ours
+to use; see `pipeline/README.md` for the bake.
+
+### Crowd recordings — CC0
+
+The stadium bed in `public/audio/crowd/` is derived from two public-domain
+recordings, layered and pitched in `pipeline/audio/bake_crowd.py`:
+
+| Source | Author | Licence | Used for |
+| --- | --- | --- | --- |
+| [Crowd Shouting/Speaking Ambience](https://opengameart.org/content/crowd-shoutingspeaking-ambience) | StarNinjas (OpenGameArt) | CC0 | murmur, anticipation, roar, eruption, groan, chant body |
+| [Applause in a large hall or church](https://opengameart.org/content/applause-in-a-large-hall-or-church) | eXpl0it3r (OpenGameArt) | CC0 | applause bed, clap burst, chant transients |
+
+CC0 requires no attribution; both authors are credited here anyway because they
+asked nicely and it costs nothing.
+
+### Everything else
+
+Whistles, kick weights, the post DOINK, net swish, tackle thumps, the goal horn
+and all broadcast stingers are synthesized at runtime in `src/audio/audio.ts` —
+no samples, no licences.
+
+---
+
 ## Names & data
 
 Player names, squad numbers and positions in `src/data/teams.json` are the real

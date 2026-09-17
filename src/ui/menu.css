@@ -1,0 +1,1247 @@
+/* ===========================================================================
+   SUPER STRIKER '26 — FRONT END (§2 zero friction, §7.1 "dark UI with
+   depth-of-field 3D player render backdrop").
+
+   Everything the menus wear lives here. ui.css is the HUD agent's file and is
+   never edited from this side: the front end uses its own `fe-` class prefix
+   so the two stylesheets cannot collide at all. The handful of rules that DO
+   have to beat a ui.css rule (the tournament hub and the roster editor still
+   use its tables) are scoped under `.fe-skin`, which is strictly more
+   specific than the bare class selectors over there.
+
+   Look: FIFA 09-12. Dark glossy panels with a steel-blue vertical gradient, a
+   1px bright top edge, a gold accent rail, condensed heavy caps, colour blocks
+   for kits, and 180ms eased moves. No web page rounded-everything.
+   =========================================================================== */
+
+:root {
+  /* the front end's own tokens — deliberately not shared with ui.css */
+  --fe-gold: #ffce4a;
+  --fe-gold-dim: #b89230;
+  --fe-ink: #eef2f8;
+  --fe-ink-dim: #8e98ad;
+  --fe-panel-top: rgba(38, 46, 60, 0.94);
+  --fe-panel-bot: rgba(10, 13, 19, 0.96);
+  --fe-edge: rgba(255, 255, 255, 0.14);
+  --fe-ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --fe-fast: 150ms;
+  --fe-mid: 200ms;
+  --fe-slow: 250ms;
+}
+
+/* The display face. No webfonts (offline build), so this is the heaviest
+   condensed grotesque each platform actually ships, backed by a letter-spaced
+   fallback that still reads as a sports package. */
+.fe,
+.fe-skin {
+  --fe-display: 'Helvetica Neue Condensed Bold', 'HelveticaNeue-CondensedBold',
+    'Arial Narrow', 'Roboto Condensed', 'Liberation Sans Narrow', Impact,
+    'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --fe-body: 'Helvetica Neue', Helvetica, Arial, 'Liberation Sans', sans-serif;
+}
+
+/* --------------------------------------------------------------- the stage */
+
+.fe {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  color: var(--fe-ink);
+  font-family: var(--fe-body);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* the 3D backdrop lives behind this; the grade is what fakes the DOF haze */
+  background:
+    radial-gradient(ellipse 120% 80% at 50% 120%, rgba(30, 70, 40, 0.30), transparent 60%),
+    radial-gradient(ellipse 90% 70% at 50% -20%, rgba(36, 60, 118, 0.34), transparent 65%),
+    linear-gradient(180deg, rgba(4, 6, 10, 0.55) 0%, rgba(4, 6, 10, 0.2) 38%,
+      rgba(4, 6, 10, 0.55) 72%, rgba(3, 4, 7, 0.92) 100%);
+}
+
+/* the live character render, half-res and CSS-upscaled: the softness IS the
+   depth of field (§7.1) and it costs nothing */
+.fe-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 0;
+  /* The lens is the RENDER SCALE, not a CSS filter: MenuBackdrop drops the
+     backing store to ~0.42 on the title and ~0.26 in the menus and lets the
+     compositor's bilinear upscale do the defocusing. A full-screen
+     `filter: blur()` looks the same and costs a whole extra raster pass —
+     enough to stall a software-GL capture, never mind a laptop. */
+  image-rendering: auto;
+}
+
+/* Screens with no 3D backdrop of their own (the lobby, which deliberately
+   leaves the attract match playing behind it) get a solid ground instead, or a
+   floodlit pitch bleeds through every panel on the page. */
+.fe--solid {
+  background:
+    radial-gradient(ellipse 120% 80% at 50% 120%, rgba(30, 70, 40, 0.30), transparent 60%),
+    radial-gradient(ellipse 90% 70% at 50% -20%, rgba(36, 60, 118, 0.30), transparent 65%),
+    linear-gradient(180deg, rgba(4, 6, 10, 0.93), rgba(3, 4, 7, 0.97));
+}
+
+/* vignette + a faint broadcast scanline, painted over the render */
+.fe-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background:
+    /* the reading scrim: the UI column sits on darkness, the figures do not */
+    linear-gradient(90deg, rgba(3, 5, 9, 0.93) 0%, rgba(3, 5, 9, 0.80) 30%,
+      rgba(3, 5, 9, 0.30) 58%, rgba(3, 5, 9, 0.06) 78%, transparent 100%),
+    radial-gradient(ellipse 78% 68% at 50% 46%, transparent 40%, rgba(0, 0, 0, 0.78) 100%),
+    repeating-linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 3px);
+  transition: background var(--fe-slow) var(--fe-ease);
+}
+/* the title screen is a poster, not a column of text — no side scrim there */
+.fe--title .fe-vignette {
+  background:
+    radial-gradient(ellipse 52% 34% at 50% 45%, rgba(3, 5, 9, 0.72), transparent 72%),
+    radial-gradient(ellipse 78% 68% at 50% 46%, transparent 38%, rgba(0, 0, 0, 0.82) 100%),
+    repeating-linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 3px);
+}
+
+/* the styled stand-in while the 10MB of glTF is still coming down */
+.fe-backdrop-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background:
+    radial-gradient(circle 240px at 32% 62%, rgba(120, 150, 200, 0.16), transparent 70%),
+    radial-gradient(circle 200px at 68% 66%, rgba(200, 160, 90, 0.13), transparent 70%),
+    linear-gradient(180deg, #0a0f18 0%, #070a10 60%, #05070b 100%);
+}
+.fe-backdrop-fallback::after {
+  /* two soft shoulder-and-head silhouettes, pure CSS, so an empty backdrop
+     still reads as "players in the dark" rather than a blank div */
+  content: '';
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 62%;
+  background:
+    radial-gradient(ellipse 90px 130px at 33% 100%, rgba(150, 175, 215, 0.20), transparent 72%),
+    radial-gradient(ellipse 34px 38px at 33% 34%, rgba(150, 175, 215, 0.17), transparent 72%),
+    radial-gradient(ellipse 78px 120px at 67% 100%, rgba(210, 175, 110, 0.16), transparent 72%),
+    radial-gradient(ellipse 30px 34px at 67% 40%, rgba(210, 175, 110, 0.14), transparent 72%);
+  filter: blur(6px);
+}
+
+.fe-layer {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* every screen swap rides the same 200ms move — snappy, never a fade-in wait */
+@keyframes feIn {
+  from { opacity: 0; transform: translate3d(26px, 0, 0); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes feUp {
+  from { opacity: 0; transform: translate3d(0, 18px, 0); }
+  to   { opacity: 1; transform: none; }
+}
+.fe-anim { animation: feIn var(--fe-mid) var(--fe-ease) both; }
+.fe-anim-up { animation: feUp var(--fe-mid) var(--fe-ease) both; }
+
+/* ------------------------------------------------------------- chrome bars */
+
+.fe-topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 20px 46px 0;
+}
+.fe-mark {
+  font-family: var(--fe-display);
+  font-weight: 900;
+  font-style: italic;
+  font-size: 19px;
+  letter-spacing: 0.10em;
+  color: var(--fe-ink);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.fe-mark b { color: var(--fe-gold); font-weight: 900; }
+.fe-crumb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-crumb span.on { color: var(--fe-gold); }
+.fe-crumb i { font-style: normal; opacity: 0.4; }
+.fe-topbar-rule {
+  flex: 1;
+  height: 2px;
+  background: linear-gradient(90deg, rgba(255, 206, 74, 0.55), rgba(255, 255, 255, 0.05) 70%, transparent);
+}
+
+.fe-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0 46px;
+}
+
+.fe-h1 {
+  font-family: var(--fe-display);
+  font-weight: 900;
+  font-style: italic;
+  font-size: 34px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin: 0 0 4px;
+  color: #fff;
+  text-shadow: 0 4px 22px rgba(0, 0, 0, 0.8);
+}
+.fe-h1 em { color: var(--fe-gold); font-style: italic; }
+.fe-sub {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+  margin: 0 0 20px;
+}
+
+/* the bottom prompt rail, where the pad glyphs live */
+.fe-prompts {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  padding: 14px 46px 20px;
+  background: linear-gradient(180deg, transparent, rgba(3, 5, 9, 0.85) 55%);
+}
+.fe-prompt {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.17em;
+  color: #c3cbdc;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.fe-prompt.dim { color: var(--fe-ink-dim); }
+.fe-prompt-spacer { flex: 1; }
+
+/* ------------------------------------------------------------ pad glyphs */
+
+.fe-g {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 21px;
+  height: 21px;
+  padding: 0 5px;
+  border-radius: 11px;
+  font-family: var(--fe-body);
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0;
+  color: #0b0e14;
+  background: #dfe5f0;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+/* PlayStation faces keep their colours; Xbox letters keep theirs */
+.fe-g.ps-cross    { background: #7c8cf0; color: #fff; }
+.fe-g.ps-circle   { background: #e06a72; color: #fff; }
+.fe-g.ps-square   { background: #d98ac4; color: #fff; }
+.fe-g.ps-triangle { background: #4fc6a4; color: #0b0e14; }
+.fe-g.xb-a { background: #6bbf4a; color: #0b0e14; }
+.fe-g.xb-b { background: #d9483f; color: #fff; }
+.fe-g.xb-x { background: #3f77d9; color: #fff; }
+.fe-g.xb-y { background: #e0b03a; color: #0b0e14; }
+.fe-g.bumper, .fe-g.sys {
+  background: linear-gradient(180deg, #4a5468, #262d3a);
+  color: #eef2f8;
+  border-radius: 5px;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.fe-g.dpad, .fe-g.stick {
+  background: linear-gradient(180deg, #4a5468, #262d3a);
+  color: #eef2f8;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.fe-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  color: #aab3c6;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-bottom-width: 2px;
+}
+
+/* =========================================================== TITLE / ATTRACT */
+
+.fe-title {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 0;
+}
+.fe-logo {
+  position: relative;
+  padding: 0 44px;
+}
+.fe-logo-sup {
+  font-family: var(--fe-display);
+  font-size: clamp(30px, 4.4vw, 64px);
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.30em;
+  color: var(--fe-ink);
+  text-shadow: 0 6px 30px rgba(0, 0, 0, 0.9);
+  margin-bottom: -6px;
+}
+.fe-logo-main {
+  font-family: var(--fe-display);
+  font-size: clamp(64px, 12.5vw, 188px);
+  font-weight: 900;
+  font-style: italic;
+  line-height: 0.88;
+  letter-spacing: -0.005em;
+  text-transform: uppercase;
+  background: linear-gradient(177deg, #ffffff 8%, #fdf3d4 34%, var(--fe-gold) 58%, #9a6f10 88%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 10px 34px rgba(255, 190, 60, 0.28))
+          drop-shadow(0 2px 0 rgba(0, 0, 0, 0.55));
+}
+.fe-logo-rule {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  justify-content: center;
+  margin-top: 12px;
+}
+.fe-logo-rule::before,
+.fe-logo-rule::after {
+  content: '';
+  width: clamp(40px, 12vw, 190px);
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(255, 206, 74, 0.8), transparent);
+}
+.fe-logo-year {
+  font-family: var(--fe-display);
+  font-size: 15px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.52em;
+  color: var(--fe-gold);
+  text-transform: uppercase;
+  padding-left: 0.52em;
+}
+.fe-tagline {
+  margin-top: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.44em;
+  color: #97a1b6;
+  text-transform: uppercase;
+  padding-left: 0.44em;
+}
+
+.fe-start {
+  margin-top: clamp(32px, 6vh, 78px);
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 34px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.02));
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-top-color: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
+  font-family: var(--fe-display);
+  font-size: 19px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.30em;
+  text-transform: uppercase;
+  color: #fff;
+  animation: fePulse 1.5s var(--fe-ease) infinite;
+  padding-left: 34px;
+}
+@keyframes fePulse {
+  0%, 100% { opacity: 1; box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6), 0 0 0 rgba(255, 206, 74, 0); }
+  50%      { opacity: 0.55; box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6), 0 0 24px rgba(255, 206, 74, 0.22); }
+}
+.fe-title-foot {
+  position: absolute;
+  bottom: 22px;
+  left: 0; right: 0;
+  text-align: center;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.30em;
+  color: #6d778b;
+  text-transform: uppercase;
+}
+
+/* ============================================================== MAIN MENU */
+
+.fe-tilerow {
+  display: flex;
+  gap: 14px;
+  padding: 4px 0 0;
+}
+.fe-tile {
+  position: relative;
+  flex: 0 0 auto;
+  width: 194px;
+  height: 128px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  cursor: pointer;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--fe-panel-top), var(--fe-panel-bot));
+  border: 1px solid var(--fe-edge);
+  border-radius: 3px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 8px 22px rgba(0, 0, 0, 0.55);
+  transition: transform var(--fe-mid) var(--fe-ease),
+              box-shadow var(--fe-mid) var(--fe-ease),
+              border-color var(--fe-fast) linear,
+              background var(--fe-fast) linear;
+}
+.fe-tile::before {
+  /* the accent rail along the top of every tile */
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 4px;
+  background: var(--fe-accent, #6b7890);
+  opacity: 0.85;
+  transition: opacity var(--fe-fast) linear, height var(--fe-fast) var(--fe-ease);
+}
+.fe-tile::after {
+  /* glossy sweep — the single most PS3 thing in the file */
+  content: '';
+  position: absolute;
+  inset: 1px 1px 46% 1px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+.fe-tile-ico {
+  position: absolute;
+  top: 16px; right: 14px;
+  font-size: 40px;
+  line-height: 1;
+  opacity: 0.30;
+  filter: grayscale(1) brightness(1.7);
+  transition: opacity var(--fe-mid) var(--fe-ease), transform var(--fe-mid) var(--fe-ease);
+}
+.fe-tile-name {
+  font-family: var(--fe-display);
+  font-size: 22px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #d6dde9;
+  transition: color var(--fe-fast) linear;
+}
+.fe-tile-note {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: #6f7a8f;
+  text-transform: uppercase;
+  margin-top: 4px;
+}
+.fe-tile.focus {
+  transform: translateY(-8px) scale(1.035);
+  border-color: var(--fe-gold);
+  background: linear-gradient(180deg, rgba(58, 68, 86, 0.96), rgba(16, 20, 28, 0.97));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26),
+              0 16px 38px rgba(0, 0, 0, 0.7),
+              0 0 0 1px rgba(255, 206, 74, 0.35);
+}
+.fe-tile.focus::before { height: 6px; opacity: 1; }
+.fe-tile.focus .fe-tile-name { color: #fff; }
+.fe-tile.focus .fe-tile-ico { opacity: 0.55; transform: scale(1.06); }
+
+/* the vertical sub-list under the focused tile */
+.fe-sublist {
+  margin-top: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: min(660px, 62vw);
+  animation: feUp var(--fe-mid) var(--fe-ease) both;
+}
+.fe-subrow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 18px;
+  cursor: pointer;
+  background: linear-gradient(90deg, rgba(26, 33, 44, 0.96), rgba(12, 16, 22, 0.80) 70%, rgba(8, 10, 15, 0.1));
+  border-left: 3px solid rgba(255, 255, 255, 0.10);
+  transition: background var(--fe-fast) linear,
+              border-color var(--fe-fast) linear,
+              transform var(--fe-fast) var(--fe-ease);
+}
+.fe-subrow-label {
+  font-family: var(--fe-display);
+  font-size: 17px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #c9d2e0;
+  min-width: 250px;
+}
+.fe-subrow-note {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #79839a;
+}
+.fe-subrow-go {
+  margin-left: auto;
+  color: rgba(255, 255, 255, 0.18);
+  font-size: 15px;
+}
+.fe-subrow.focus {
+  background: linear-gradient(90deg, rgba(255, 206, 74, 0.20), rgba(255, 206, 74, 0.03) 72%, transparent);
+  border-left-color: var(--fe-gold);
+  transform: translateX(6px);
+}
+.fe-subrow.focus .fe-subrow-label { color: #fff; }
+.fe-subrow.focus .fe-subrow-go { color: var(--fe-gold); }
+.fe-subrow.disabled { opacity: 0.4; }
+.fe-subrow.disabled .fe-subrow-note { color: #d8734f; }
+
+/* ============================================================ TEAM SELECT */
+
+.fe-versus {
+  display: grid;
+  grid-template-columns: 1fr 108px 1fr;
+  align-items: stretch;
+  gap: 0;
+  margin-bottom: 16px;
+}
+.fe-side {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 16px 22px;
+  min-height: 176px;
+  /* nearly opaque on purpose: a lit 3D player behind a 6%-transparent panel
+     reads as a smudge, and the kit block has to be the brightest thing here */
+  background: linear-gradient(180deg, rgba(34, 42, 55, 0.985), rgba(8, 11, 16, 0.99));
+  border: 1px solid var(--fe-edge);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 10px 30px rgba(0, 0, 0, 0.55);
+  transition: border-color var(--fe-fast) linear, box-shadow var(--fe-mid) var(--fe-ease);
+}
+.fe-side.away { flex-direction: row-reverse; text-align: right; }
+.fe-side.active {
+  border-color: var(--fe-gold);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24),
+              0 10px 30px rgba(0, 0, 0, 0.6),
+              0 0 0 1px rgba(255, 206, 74, 0.32);
+}
+/* dim the CONTENTS, never the panel: opacity on the box turns the whole
+   thing translucent and the backdrop player walks straight through it */
+.fe-side.empty .fe-side-info { opacity: 0.4; }
+.fe-side-tag {
+  position: absolute;
+  top: 12px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-side.home .fe-side-tag { left: 22px; }
+.fe-side.away .fe-side-tag { right: 22px; }
+.fe-side.active .fe-side-tag { color: var(--fe-gold); }
+
+.fe-shirt {
+  flex: 0 0 auto;
+  width: 112px;
+  height: 118px;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.65));
+}
+.fe-side-info { min-width: 0; padding-top: 14px; }
+.fe-side-name {
+  font-family: var(--fe-display);
+  font-size: clamp(22px, 2.5vw, 38px);
+  font-weight: 900;
+  font-style: italic;
+  line-height: 1;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fe-side-code {
+  font-family: var(--fe-display);
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.34em;
+  color: var(--fe-gold);
+  margin-top: 3px;
+}
+.fe-side-meta {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-side.away .fe-side-meta { justify-content: flex-end; }
+.fe-side-meta b { color: #dbe2ee; font-weight: 800; }
+
+.fe-stars { letter-spacing: 0.1em; font-size: 13px; color: #3c4456; }
+.fe-stars i { font-style: normal; color: var(--fe-gold); }
+.fe-bar {
+  margin-top: 8px;
+  height: 6px;
+  width: 190px;
+  max-width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.fe-side.away .fe-bar { margin-left: auto; }
+.fe-bar i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--fe-gold-dim), var(--fe-gold));
+  transition: width var(--fe-slow) var(--fe-ease);
+}
+
+.fe-vsbadge {
+  align-self: center;
+  height: 94px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--fe-display);
+  font-size: 44px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: -0.02em;
+  color: #0a0d13;
+  background: linear-gradient(180deg, #fdf0cc, var(--fe-gold) 45%, #8d6a12);
+  clip-path: polygon(24% 0, 100% 0, 76% 100%, 0 100%);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+/* the 48-crest grid */
+.fe-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 48 crests at eight across is six rows: at 1080p they all fit, and the
+     scroll is there for short windows rather than as the normal case */
+  max-height: 44vh;
+  padding: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+.fe-grid::-webkit-scrollbar { width: 6px; }
+.fe-grid::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.18); }
+.fe-cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  cursor: pointer;
+  background: linear-gradient(180deg, rgba(30, 37, 49, 0.96), rgba(11, 14, 20, 0.95));
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 2px;
+  overflow: hidden;
+  transition: transform var(--fe-fast) var(--fe-ease),
+              border-color var(--fe-fast) linear,
+              background var(--fe-fast) linear;
+}
+.fe-crest {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 26px;
+  border-radius: 2px 2px 8px 8px / 2px 2px 14px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: inset 0 -6px 8px rgba(0, 0, 0, 0.35), inset 0 3px 4px rgba(255, 255, 255, 0.25);
+}
+.fe-cell-name {
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: #c3cbda;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fe-cell-tier {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--fe-gold);
+  letter-spacing: -0.04em;
+  opacity: 0.8;
+}
+.fe-cell.focus {
+  border-color: var(--fe-gold);
+  background: linear-gradient(180deg, rgba(255, 206, 74, 0.24), rgba(120, 88, 18, 0.30));
+  transform: scale(1.05);
+  z-index: 1;
+}
+.fe-cell.focus .fe-cell-name { color: #fff; }
+.fe-cell.taken { opacity: 0.28; }
+
+/* the stadium / kick-off / difficulty strip beneath the grid */
+.fe-strip {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.fe-stripitem {
+  flex: 1 1 0;
+  padding: 9px 14px;
+  cursor: pointer;
+  background: linear-gradient(180deg, rgba(26, 33, 44, 0.96), rgba(10, 13, 19, 0.95));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 2px;
+  transition: border-color var(--fe-fast) linear, background var(--fe-fast) linear;
+}
+.fe-stripitem-k {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.24em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-stripitem-v {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 3px;
+  font-family: var(--fe-display);
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: #dde4f0;
+}
+.fe-stripitem-v u { font-style: normal; text-decoration: none; color: rgba(255, 255, 255, 0.2); font-size: 12px; }
+.fe-stripitem.focus {
+  border-color: var(--fe-gold);
+  background: linear-gradient(180deg, rgba(255, 206, 74, 0.18), rgba(60, 44, 10, 0.5));
+}
+.fe-stripitem.focus .fe-stripitem-k { color: var(--fe-gold); }
+.fe-stripitem.focus .fe-stripitem-v { color: #fff; }
+.fe-stripitem.focus .fe-stripitem-v u { color: var(--fe-gold); }
+
+/* ================================================================ SETTINGS */
+
+.fe-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  /* left column, like the tiles above it — the backdrop figures own the right */
+  width: min(700px, 58vw);
+  margin: 16px 0 0;
+}
+.fe-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 12px 20px;
+  cursor: pointer;
+  background: linear-gradient(90deg, rgba(26, 33, 44, 0.97), rgba(11, 14, 21, 0.93));
+  border-left: 3px solid rgba(255, 255, 255, 0.10);
+  transition: background var(--fe-fast) linear,
+              border-color var(--fe-fast) linear,
+              transform var(--fe-fast) var(--fe-ease);
+}
+.fe-row-k {
+  font-family: var(--fe-display);
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: #bcc5d4;
+}
+.fe-row-sub {
+  display: block;
+  font-family: var(--fe-body);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #6f7a8f;
+  text-transform: none;
+  margin-top: 2px;
+}
+.fe-row-v {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--fe-display);
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fe-gold);
+  white-space: nowrap;
+}
+.fe-row-v u { font-style: normal; text-decoration: none; color: rgba(255, 255, 255, 0.18); font-size: 12px; }
+.fe-row-v.warn { color: #ff8d7d; }
+.fe-row.focus {
+  background: linear-gradient(90deg, rgba(255, 206, 74, 0.22), rgba(255, 206, 74, 0.02) 78%);
+  border-left-color: var(--fe-gold);
+  transform: translateX(5px);
+}
+.fe-row.focus .fe-row-k { color: #fff; }
+.fe-row.focus .fe-row-v u { color: var(--fe-gold); }
+.fe-row.disabled { opacity: 0.42; }
+
+.fe-go {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 15px 20px;
+  cursor: pointer;
+  font-family: var(--fe-display);
+  font-size: 21px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: #1a1305;
+  background: linear-gradient(180deg, #ffe08a, var(--fe-gold) 42%, #9c7412);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 2px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition: transform var(--fe-fast) var(--fe-ease), filter var(--fe-fast) linear;
+  padding-left: calc(20px + 0.24em);
+}
+.fe-go.focus { transform: scale(1.02); filter: brightness(1.12); }
+.fe-go.armed { background: linear-gradient(180deg, #ffb27a, #d4552c 60%, #7d2a10); color: #fff; text-shadow: none; }
+.fe-go.disabled {
+  background: linear-gradient(180deg, rgba(60, 68, 84, 0.9), rgba(24, 29, 38, 0.9));
+  color: #8e98ad;
+  text-shadow: none;
+  box-shadow: none;
+}
+
+/* =================================================================== LOBBY */
+
+.fe-lobby {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  width: min(1100px, 92vw);
+  margin: 0 auto;
+}
+.fe-lobby-main { flex: 1 1 auto; min-width: 0; }
+.fe-invite {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+  background: linear-gradient(180deg, var(--fe-panel-top), var(--fe-panel-bot));
+  border: 1px solid var(--fe-edge);
+  border-left: 4px solid var(--fe-gold);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+.fe-invite-wrap { flex: 1; min-width: 0; }
+.fe-invite-k {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-invite-code {
+  font-family: var(--fe-display);
+  font-size: 44px;
+  font-weight: 900;
+  font-style: italic;
+  line-height: 1;
+  letter-spacing: 0.16em;
+  color: #fff;
+  margin: 2px 0 4px;
+  text-shadow: 0 0 22px rgba(255, 206, 74, 0.35);
+}
+.fe-invite-url {
+  font-size: 11px;
+  font-weight: 600;
+  color: #7d879c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fe-qr {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+  image-rendering: pixelated;
+  background: #fff;
+  padding: 5px;
+  border-radius: 2px;
+}
+.fe-status {
+  padding: 8px 14px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  background: rgba(200, 60, 40, 0.16);
+  border-left: 3px solid #d9483f;
+  color: #ff9d8e;
+}
+.fe-status.warm { background: rgba(255, 206, 74, 0.12); border-left-color: var(--fe-gold); color: var(--fe-gold); }
+
+/* four seats, side by side, PS3-lobby style */
+.fe-seats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.fe-seat {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 12px 14px;
+  min-height: 150px;
+  cursor: pointer;
+  background: linear-gradient(180deg, var(--fe-panel-top), var(--fe-panel-bot));
+  border: 1px solid var(--fe-edge);
+  border-radius: 3px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  transition: border-color var(--fe-fast) linear,
+              transform var(--fe-fast) var(--fe-ease),
+              box-shadow var(--fe-mid) var(--fe-ease);
+}
+.fe-seat::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 4px;
+  background: var(--fe-accent, #55607a);
+}
+.fe-seat-no {
+  font-family: var(--fe-display);
+  font-size: 13px;
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.22em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+}
+.fe-seat-team {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: #aab4c6;
+  text-transform: uppercase;
+}
+.fe-seat-team .fe-dot {
+  width: 11px; height: 11px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  flex: 0 0 auto;
+}
+/* device badge. Deliberately letters and not an emoji: ⌨ is a tofu box on
+   half the machines this runs on, and a seat that says "KEY" is never wrong. */
+.fe-seat-pad {
+  margin: 12px auto 4px;
+  width: 52px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid rgba(255, 255, 255, 0.22);
+  border-radius: 50%;
+  font-family: var(--fe-display);
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.7);
+}
+.fe-seat-dev {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--fe-display);
+  font-size: 12.5px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: var(--fe-gold);
+  text-transform: uppercase;
+}
+.fe-seat-dev u { font-style: normal; text-decoration: none; color: rgba(255, 255, 255, 0.2); font-size: 11px; }
+.fe-seat.open .fe-seat-dev { color: #6f7a8f; }
+.fe-seat.open .fe-seat-pad {
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.28);
+  animation: fePulse 1.8s var(--fe-ease) infinite;
+}
+.fe-seat:not(.open) .fe-seat-pad {
+  border-color: var(--fe-accent, #55607a);
+  color: #fff;
+  box-shadow: 0 0 18px -4px var(--fe-accent, transparent);
+}
+.fe-seat.warn { border-color: #d9483f; }
+.fe-seat.warn .fe-seat-dev { color: #ff8d7d; }
+.fe-seat.focus {
+  border-color: var(--fe-gold);
+  transform: translateY(-5px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26),
+              0 14px 32px rgba(0, 0, 0, 0.65),
+              0 0 0 1px rgba(255, 206, 74, 0.35);
+}
+.fe-seat-role {
+  position: absolute;
+  top: 12px; right: 12px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: #6f7a8f;
+}
+
+.fe-guests {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 12px;
+  max-height: 128px;
+  overflow-y: auto;
+}
+.fe-guest {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.035);
+  color: #aab4c6;
+}
+.fe-guest.empty { color: #626c80; justify-content: center; letter-spacing: 0.22em; }
+.fe-guest .fe-pip {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #d9483f;
+  box-shadow: 0 0 8px currentColor;
+  flex: 0 0 auto;
+}
+.fe-guest .fe-pip.ok { background: #58c04a; }
+.fe-guest .fe-pip.warn { background: var(--fe-gold); }
+.fe-guest .fe-gname { color: #eef2f8; }
+.fe-guest .fe-gseat { margin-left: auto; color: var(--fe-gold); }
+
+/* ================================================================== PAUSE */
+
+.fe-pause {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--fe-body);
+  color: var(--fe-ink);
+  background:
+    radial-gradient(ellipse 80% 70% at 50% 50%, rgba(4, 7, 12, 0.72), rgba(2, 3, 6, 0.93));
+  backdrop-filter: blur(5px) saturate(0.7);
+  -webkit-backdrop-filter: blur(5px) saturate(0.7);
+  animation: feUp var(--fe-fast) var(--fe-ease) both;
+}
+.fe-pause-card {
+  width: min(560px, 80vw);
+  padding: 28px 34px 26px;
+  background: linear-gradient(180deg, var(--fe-panel-top), var(--fe-panel-bot));
+  border: 1px solid var(--fe-edge);
+  border-top: 4px solid var(--fe-gold);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 24px 60px rgba(0, 0, 0, 0.8);
+}
+.fe-pause-h {
+  font-family: var(--fe-display);
+  font-size: 44px;
+  font-weight: 900;
+  font-style: italic;
+  line-height: 1;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #fff;
+  padding-left: 0.22em;
+}
+.fe-pause-sub {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  color: var(--fe-ink-dim);
+  text-transform: uppercase;
+  margin: 6px 0 20px;
+}
+.fe-pause-opt {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  margin-bottom: 6px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.06), transparent);
+  border-left: 3px solid rgba(255, 255, 255, 0.14);
+  font-family: var(--fe-display);
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #d6dde9;
+}
+.fe-pause-opt.primary { border-left-color: var(--fe-gold); color: #fff; }
+
+/* =============================== tournament hub / roster editor overrides ==
+   Those two screens still build ui.css tables. `.fe-skin` is added to their
+   root so these rules win on specificity without ui.css being touched. */
+
+.fe-skin.menu-screen {
+  background:
+    radial-gradient(ellipse 120% 80% at 50% 120%, rgba(30, 70, 40, 0.28), transparent 60%),
+    radial-gradient(ellipse 90% 70% at 50% -20%, rgba(36, 60, 118, 0.32), transparent 65%),
+    linear-gradient(180deg, rgba(4, 6, 10, 0.94), rgba(3, 4, 7, 0.97));
+  font-family: var(--fe-body);
+}
+.fe-skin .menu-h2 {
+  font-family: var(--fe-display);
+  font-size: 30px;
+  letter-spacing: 0.14em;
+  color: #fff;
+  text-transform: uppercase;
+}
+.fe-skin .tour-title {
+  font-family: var(--fe-display);
+  letter-spacing: 0.34em;
+  color: var(--fe-gold);
+}
+.fe-skin .tour-btn {
+  font-family: var(--fe-display);
+  font-weight: 900;
+  font-style: italic;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  background: linear-gradient(180deg, rgba(58, 68, 86, 0.95), rgba(16, 20, 28, 0.96));
+  border: 1px solid var(--fe-edge);
+  border-radius: 2px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  color: #d6dde9;
+  transition: filter var(--fe-fast) linear, transform var(--fe-fast) var(--fe-ease);
+}
+.fe-skin .tour-btn:hover { transform: translateY(-2px); filter: brightness(1.15); }
+.fe-skin .tour-btn.primary {
+  background: linear-gradient(180deg, #ffe08a, var(--fe-gold) 42%, #9c7412);
+  color: #1a1305;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+.fe-skin .tour-table {
+  background: linear-gradient(180deg, rgba(24, 30, 40, 0.86), rgba(11, 14, 20, 0.86));
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.fe-skin .tour-table .hdr th {
+  letter-spacing: 0.2em;
+  color: var(--fe-ink-dim);
+  background: rgba(255, 255, 255, 0.05);
+}
+.fe-skin .team-cell {
+  background: linear-gradient(180deg, rgba(30, 36, 48, 0.86), rgba(11, 14, 20, 0.86));
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 2px;
+  transition: transform var(--fe-fast) var(--fe-ease), border-color var(--fe-fast) linear;
+}
+.fe-skin .team-cell:hover,
+.fe-skin .team-cell.focus {
+  border-color: var(--fe-gold);
+  transform: scale(1.04);
+}
+/* those screens are a centred column, so the rail has to be pinned itself */
+.fe-skin.menu-screen .fe-prompts {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  justify-content: center;
+}
+.fe-skin .ros-in {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  color: var(--fe-ink);
+}
+
+/* ------------------------------------------------------------- small sizes */
+@media (max-width: 1280px) {
+  .fe-body, .fe-topbar, .fe-prompts { padding-left: 28px; padding-right: 28px; }
+  .fe-tile { width: 164px; height: 114px; }
+  .fe-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .fe-seats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-height: 820px) {
+  .fe-side { min-height: 148px; }
+  .fe-shirt { width: 92px; height: 96px; }
+  .fe-grid { max-height: 26vh; }
+}

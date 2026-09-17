@@ -2,8 +2,11 @@
 // 2002-broadcast style. The player's matches run in-engine; everything else
 // is simulated the moment you move on.
 
+import './menu.css';
 import { findTeam } from '../data/loader';
 import { esc } from './escape';
+import { MenuNav } from './menuNav';
+import { promptBar } from './menuGlyphs';
 import type { Fixture, Stage, Tournament } from '../sim/tournament';
 
 const STAGE_LABEL: Record<string, string> = {
@@ -20,7 +23,7 @@ const STAGE_LABEL: Record<string, string> = {
 
 export class TournamentUI {
   private root: HTMLElement;
-  private keyHandler: (e: KeyboardEvent) => void;
+  private nav: MenuNav;
   /** No confirms until the hub has been visible a beat — a double-tapped or
    *  held J from the previous screen must not sim rounds (or skip the
    *  champion screen and delete the save) before the player can even look. */
@@ -33,16 +36,20 @@ export class TournamentUI {
   ) {
     this.root = document.getElementById('ui-root')!;
     this.graceUntil = performance.now() + 600;
-    this.keyHandler = (e) => {
-      if (e.repeat || performance.now() < this.graceUntil) return;
-      if (e.code === 'KeyJ' || e.code === 'Enter') this.primary();
-      if (e.code === 'KeyK' || e.code === 'Escape') { this.destroy(); this.onExit(); }
-    };
-    window.addEventListener('keydown', this.keyHandler);
+    // pad-first like the rest of the front end; the J/K bindings are exactly
+    // the ones MenuNav maps confirm/back onto, so nothing moved
+    this.nav = new MenuNav({
+      onConfirm: () => { if (performance.now() >= this.graceUntil) this.primary(); },
+      onBack: () => {
+        if (performance.now() < this.graceUntil) return;
+        this.destroy();
+        this.onExit();
+      },
+    });
   }
 
   destroy(): void {
-    window.removeEventListener('keydown', this.keyHandler);
+    this.nav.destroy();
     this.root.innerHTML = '';
   }
 
@@ -71,9 +78,10 @@ export class TournamentUI {
         <div class="menu-h2" style="margin:0">${title}</div>
       </div>
       <div class="tour-actions">
-        <button class="tour-btn primary" data-act="primary">${action} <small>(J)</small></button>
-        <button class="tour-btn" data-act="exit">SAVE & EXIT <small>(K)</small></button>
-      </div>`;
+        <button class="tour-btn primary" data-act="primary">${action}</button>
+        <button class="tour-btn" data-act="exit">SAVE &amp; EXIT</button>
+      </div>
+      ${promptBar([['confirm', action], ['back', 'SAVE & EXIT']])}`;
   }
 
   private wire(): void {
@@ -115,7 +123,7 @@ export class TournamentUI {
       .map((g) => this.groupTableHtml(g, false)).join('');
 
     this.root.innerHTML = `
-      <div class="menu-screen tour-screen">
+      <div class="menu-screen tour-screen fe-skin">
         ${this.header(STAGE_LABEL[t.state.stage], action)}
         ${this.goldenBootHtml()}
         <div class="tour-main">
@@ -189,7 +197,7 @@ export class TournamentUI {
     }).join('');
 
     this.root.innerHTML = `
-      <div class="menu-screen tour-screen">
+      <div class="menu-screen tour-screen fe-skin">
         ${this.header(STAGE_LABEL[t.state.stage], action)}
         ${t.playerAlive() ? '' : '<div class="tour-note out">YOU ARE OUT — but the show goes on. Sim to the final.</div>'}
         ${this.goldenBootHtml()}
@@ -207,7 +215,7 @@ export class TournamentUI {
       ? `<div class="champ-boot">👟 GOLDEN BOOT: ${esc(boot.name.toUpperCase())} (${this.code(boot.teamId)}) — ${boot.goals} GOALS</div>`
       : '';
     this.root.innerHTML = `
-      <div class="menu-screen">
+      <div class="menu-screen fe-skin">
         <div class="menu-h2">WORLD CHAMPIONS</div>
         <div class="champ-card">
           <div class="champ-trophy">🏆</div>
@@ -216,8 +224,9 @@ export class TournamentUI {
           ${mine ? '<div class="champ-you">THAT\'S YOU. TELL YOUR FRIEND.</div>' : ''}
         </div>
         <div class="tour-actions">
-          <button class="tour-btn primary" data-act="primary">BACK TO MENU <small>(J)</small></button>
+          <button class="tour-btn primary" data-act="primary">BACK TO MENU</button>
         </div>
+        ${promptBar([['confirm', 'BACK TO MENU']])}
       </div>`;
     this.root.querySelector('[data-act="primary"]')?.addEventListener('click', () => {
       this.destroy(); this.onExit();

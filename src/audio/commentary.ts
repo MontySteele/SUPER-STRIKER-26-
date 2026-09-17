@@ -1,11 +1,25 @@
-// Speech-synthesis commentary: a real voice calling the match, straight from
-// the browser's SpeechSynthesis API — zero assets, like everything else here.
-// Big moments interrupt small ones; small ones are rationed so the voice
-// never talks over itself. Behind a settings toggle (voice quality varies
-// wildly by machine).
+// Commentary: a real voice calling the match, from PRE-BAKED local TTS.
+//
+// The old build used the browser's SpeechSynthesis API — zero assets, but the
+// voice varied from "passable" to "robot reading a spreadsheet" depending on
+// the machine, and there is no way to tune its delivery. Now the lines are
+// rendered ahead of time by Kokoro-82M (pipeline/audio/bake_commentary.py),
+// packed into Opus sprites, and spliced at runtime around baked clips of every
+// team name and player surname in the game.
+//
+// Division of labour:
+//   commentaryScript.ts  what to say and when   (pure logic — also dry-run-able)
+//   commentaryBank.ts    the baked audio        (manifest, sprites, splicing)
+//   this file            the plumbing           (unlock, ducking, settings)
+//
+// Everything degrades to silence: no manifest, no audio context, no voice pack
+// on disk — the game plays on, just without a commentator. Behind the same
+// settings toggle as before (COMMENTARY_KEY).
 
 import type { Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
+import { CommentaryBank, type Utterance } from './commentaryBank';
+import { CommentaryDirector, CommentaryQueue, type Cue } from './commentaryScript';
 
 export const COMMENTARY_KEY = 'ss26.commentary';
 
@@ -17,171 +31,143 @@ export function commentaryEnabled(): boolean {
   }
 }
 
-/** Priorities: 3 = goals/verdicts, 2 = drama, 1 = chances, 0 = color. */
-type Priority = 0 | 1 | 2 | 3;
+/** What the commentary engine needs from the audio engine (AudioEngine fits). */
+export interface CommentaryHost {
+  context(): AudioContext | null;
+  /** Destination for speech — post-crowd, pre-limiter. */
+  voiceBus(): GainNode | null;
+  /** Pull the crowd down while he talks, like a real broadcast mix. */
+  duckCrowd(on: boolean): void;
+}
 
-const pick = (arr: string[]): string => arr[Math.floor(Math.random() * arr.length)];
-const last = (name: string): string => name.split(' ').pop() ?? name;
+/** Speech starts this far in the future so the graph has time to be built. */
+const SCHEDULE_AHEAD = 0.06;
 
 export class Commentary {
   private enabled = commentaryEnabled();
-  private supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
-  private voice: SpeechSynthesisVoice | null = null;
-  private currentPriority: Priority = 0;
-  private current: SpeechSynthesisUtterance | null = null;
-  private lastLowAt = -1e9;
+  private host: CommentaryHost | null;
+  private bank = new CommentaryBank();
+  private director = new CommentaryDirector();
+  private queue = new CommentaryQueue();
+  private teamIds: string[] = [];
+  private teamNames: string[] = [];
+  private cancelCurrent: (() => void) | null = null;
+  private clock = 0;              // seconds of "commentary time" (pause-aware)
+  private prefetched = '';
+  /** Last few lines actually spoken — for the headless pacing harness. */
+  readonly log: { t: number; group: string; pri: number; text: string; voice: string }[] = [];
 
-  constructor() {
-    if (!this.supported) return;
-    // Chrome loads voices asynchronously
-    this.pickVoice();
-    window.speechSynthesis.addEventListener?.('voiceschanged', () => this.pickVoice());
+  constructor(host?: CommentaryHost) {
+    this.host = host ?? null;
+    // the manifest is tiny; grab it early so the first kickoff isn't silent
+    void this.bank.load();
   }
 
-  /** Re-read the settings toggle (called at every match start). */
-  refresh(): void {
+  /** Re-read the settings toggle and warm this match's voice clips. */
+  refresh(m?: Match): void {
     this.enabled = commentaryEnabled();
-    if (!this.enabled) this.stop();
+    this.stop();
+    this.director.reset();
+    this.clock = 0;
+    this.log.length = 0;
+    if (!m) return;
+    this.teamIds = [m.teams[0].data.id, m.teams[1].data.id];
+    this.teamNames = [m.teams[0].data.name, m.teams[1].data.name];
+    this.warm();
+  }
+
+  private warm(): void {
+    const ctx = this.host?.context();
+    if (!ctx || !this.teamIds.length) return;
+    const key = this.teamIds.join('|');
+    if (this.prefetched === key) return;
+    this.prefetched = key;
+    void this.bank.prefetch(ctx, this.teamIds);
   }
 
   stop(): void {
-    if (this.supported) window.speechSynthesis.cancel();
-    this.currentPriority = 0;
-    this.current = null;
+    this.cancelCurrent?.();
+    this.cancelCurrent = null;
+    this.queue.clear();
+    this.host?.duckCrowd(false);
   }
 
-  private pickVoice(): void {
-    const voices = window.speechSynthesis.getVoices();
-    if (!voices.length) return;
-    // a British voice sells the broadcast; otherwise any English, then default
-    this.voice = voices.find((v) => v.lang === 'en-GB' && v.localService)
-      ?? voices.find((v) => v.lang === 'en-GB')
-      ?? voices.find((v) => v.lang.startsWith('en') && v.localService)
-      ?? voices.find((v) => v.lang.startsWith('en'))
-      ?? voices[0];
-  }
-
-  private say(text: string, priority: Priority): void {
-    if (!this.enabled || !this.supported) return;
-    const synth = window.speechSynthesis;
-    const now = performance.now();
-    if (synth.speaking || synth.pending) {
-      // never step on a bigger call; equal-or-bigger cuts in
-      if (priority < this.currentPriority) return;
-      synth.cancel();
-    } else if (priority <= 1) {
-      // ration the chatter
-      if (now - this.lastLowAt < 4500) return;
-    }
-    if (priority <= 1) this.lastLowAt = now;
-    this.currentPriority = priority;
-    const u = new SpeechSynthesisUtterance(text);
-    if (this.voice) u.voice = this.voice;
-    u.rate = 1.12;
-    u.pitch = 1.0;
-    u.volume = 1.0;
-    // a cancelled utterance's onend fires AFTER the replacement started —
-    // only the live utterance may release the priority, or chatter can
-    // interrupt a goal call
-    this.current = u;
-    const release = (): void => {
-      if (this.current === u) { this.currentPriority = 0; this.current = null; }
-    };
-    u.onend = release;
-    u.onerror = release;
-    synth.speak(u);
+  /** True when a voice pack was found — the HUD can show it if it wants. */
+  get hasVoice(): boolean {
+    return this.bank.ready;
   }
 
   onEvent(e: MatchEvent, m: Match): void {
-    if (!this.enabled || !this.supported) return;
-    const team = (idx: number): string => m.teams[idx].data.name;
-    switch (e.type) {
-      case 'kickoff':
-        // post-goal restarts re-emit kickoff — don't re-announce the match
-        if (m.clock >= 1) break;
-        if (e.half === 1) {
-          this.say(m.mode === 'golden'
-            ? `${team(0)} against ${team(1)} — golden goal, next one wins it, here we go!`
-            : pick([
-              `${team(0)} against ${team(1)}. Here we go!`,
-              `And we're under way — ${team(0)} versus ${team(1)}!`,
-            ]), 2);
-        } else if (e.half === 2) {
-          this.say(pick(['Second half under way.', 'Back out for the second half.']), 1);
-        } else if (e.half === 3) {
-          this.say('Extra time. The next thirty minutes decide it.', 2);
-        }
-        break;
-      case 'goal': {
-        const name = last(e.scorerName);
-        this.say(e.ownGoal
-          ? pick([
-            `Oh no — it's an own goal! ${name} has turned it into his own net!`,
-            `Disaster for ${name} — an own goal!`,
-          ])
-          : pick([
-            `GOAL! What a strike from ${name}!`,
-            `${name} scores! ${team(e.teamIdx)} have it! Unbelievable!`,
-            `It's in! ${name}, with a goal ${team(e.teamIdx)} fans will remember!`,
-            `GOAL for ${team(e.teamIdx)}! ${name} finds the net!`,
-          ]), 3);
-        break;
-      }
-      case 'save':
-        if (e.shotStop && Math.random() < 0.6) {
-          this.say(pick([
-            `What a save by ${last(e.keeperName)}!`,
-            `Brilliant from ${last(e.keeperName)} — kept it out!`,
-            `Denied! ${last(e.keeperName)} says no!`,
-          ]), 1);
-        }
-        break;
-      case 'post':
-        this.say(pick(['Off the woodwork!', 'The post! So close!', 'Rattled the frame!']), 1);
-        break;
-      case 'miss':
-        if (Math.random() < 0.4) {
-          this.say(pick([
-            `Wide! ${last(e.shooterName)} will want that one back.`,
-            `Just off target from ${last(e.shooterName)}.`,
-          ]), 1);
-        }
-        break;
-      case 'card':
-        this.say(e.color === 'red'
-          ? `It's a red card! ${last(e.playerName)} is off — down to ten men!`
-          : `Yellow card. Into the book goes ${last(e.playerName)}.`,
-        e.color === 'red' ? 2 : 1);
-        break;
-      case 'penaltyAwarded':
-        this.say(`Penalty! The referee points to the spot — huge moment for ${team(e.teamIdx)}!`, 2);
-        break;
-      case 'penKick':
-        this.say(e.result === 'goal' ? pick([`${last(e.takerName)} buries it!`, 'He scores! Ice cold!'])
-          : e.result === 'saved' ? pick(['Saved! Incredible!', 'The keeper guesses right — saved!'])
-          : `He's missed it! ${last(e.takerName)} puts it wide!`, 2);
-        break;
-      case 'shootoutEnd':
-        this.say(`${team(e.winnerIdx)} win the shootout! What drama!`, 3);
-        break;
-      case 'break':
-        this.say(e.label === 'HALF-TIME'
-          ? `That's half time. ${this.scoreline(m, false)}`
-          : e.label === 'PENALTIES' ? 'We are going to penalties!'
-          : 'The whistle goes — we need extra time.', 2);
-        break;
-      case 'fulltime':
-        this.say(`There's the final whistle! ${this.scoreline(m, true)}`, 3);
-        break;
-      default:
-        break;
+    if (!this.enabled) return;
+    if (!this.teamIds.length) {
+      this.teamIds = [m.teams[0].data.id, m.teams[1].data.id];
+      this.teamNames = [m.teams[0].data.name, m.teams[1].data.name];
+      this.warm();
     }
+    const cue = this.director.onEvent(e, m);
+    if (cue) this.queue.push(cue, this.clock);
+    // a goal/verdict should be heard the instant it is due, not up to a frame
+    // late — but everything else can wait for the next update()
+    if (cue && cue.priority >= 3) this.pump();
   }
 
-  private scoreline(m: Match, final: boolean): string {
-    const [h, a] = m.teams;
-    if (h.score === a.score) return `${h.data.name} ${h.score}, ${a.data.name} ${a.score}.`;
-    const [w, l] = h.score > a.score ? [h, a] : [a, h];
-    return `${w.data.name} ${final ? 'beat' : 'lead'} ${l.data.name}, ${w.score} to ${l.score}.`;
+  /**
+   * Per frame. `dt` should be 0 while the game is frozen (a card on screen) so
+   * the commentator's sense of "how long since anyone spoke" matches the
+   * player's.
+   */
+  update(dt: number): void {
+    if (!this.enabled) return;
+    this.clock += Math.max(0, dt);
+    this.warm();
+    const idle = this.director.tick(dt);
+    if (idle) this.queue.push(idle, this.clock);
+    this.pump();
+  }
+
+  private pump(): void {
+    const wasSpeaking = this.queue.speaking;
+    const follow = this.queue.settle(this.clock);
+    if (wasSpeaking && !this.queue.speaking) {
+      this.cancelCurrent = null;
+      this.host?.duckCrowd(false);
+    }
+    if (follow) this.queue.push(follow, this.clock);
+    const next = this.queue.take(this.clock);
+    if (!next) return;
+    if (!this.speak(next.cue, next.interrupt)) this.queue.abandoned();
+  }
+
+  private speak(cue: Cue, interrupt: boolean): boolean {
+    const ctx = this.host?.context();
+    const bus = this.host?.voiceBus();
+    if (!ctx || !bus || !this.bank.ready) return false;
+    const u = this.bank.resolve(cue, this.teamIds, Math.random, this.teamNames);
+    if (!u) return false;
+    if (interrupt) this.cancelCurrent?.();
+    const at = ctx.currentTime + SCHEDULE_AHEAD;
+    this.host?.duckCrowd(true);
+    this.cancelCurrent = this.bank.play(ctx, bus, u, at, () => {
+      // the queue's own clock retires the line; this just lifts the duck the
+      // moment the audio really stops (interrupts land here too)
+      if (!this.queue.speaking) this.host?.duckCrowd(false);
+    });
+    this.queue.began(cue, u.duration + SCHEDULE_AHEAD, this.clock);
+    this.director.noteSpoken(cue.priority);
+    this.note(cue, u);
+    return true;
+  }
+
+  private note(cue: Cue, u: Utterance): void {
+    this.log.push({
+      t: Math.round(this.clock * 10) / 10,
+      group: cue.group, pri: cue.priority, text: u.text, voice: u.voice,
+    });
+    if (this.log.length > 64) this.log.shift();
+  }
+
+  /** Team display names, for anything that wants to pretty-print the log. */
+  get names(): string[] {
+    return this.teamNames;
   }
 }

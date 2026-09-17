@@ -2,7 +2,7 @@
 // game loop (§8): sim at 60Hz, render interpolated, URL → kickoff in seconds.
 
 import './ui/ui.css';
-import { InputHub, type PlayerInput } from './input/input';
+import { InputHub, type PlayerInput, type RumbleCue } from './input/input';
 import { GuestHost } from './net/hostLink';
 import { seatHealth } from './net/health';
 import { Lobby, readableOn, type SlotAssignment, type SlotDevice } from './ui/lobby';
@@ -12,11 +12,14 @@ import { Tournament, type Fixture } from './sim/tournament';
 import { TEAMS, findTeam } from './data/loader';
 import type { MatchEvent } from './sim/matchEvents';
 import { GameRenderer, skinnedPlayersWanted } from './render/gameRenderer';
+import { Presentation, walkoutWanted } from './present/director';
 import { preloadCharacters } from './render/characterAssets';
 import type { TimeOfDay } from './render/scene';
 import type { StadiumSize } from './render/stadium';
 import { HUD } from './ui/hud';
+import type { CameraCutSource } from './ui/broadcast';
 import { Menu, type MenuResult } from './ui/menu';
+import { hidePauseOverlay, showPauseOverlay } from './ui/menuPause';
 import { RosterEditor } from './ui/rosterEditor';
 import { applyRosterOverrides } from './data/roster';
 import { TournamentUI } from './ui/tournamentUI';
@@ -30,7 +33,12 @@ const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
 const hub = new InputHub();
 const audio = new AudioEngine();
 const music = new MusicPlayer();
-const commentary = new Commentary();
+// the audio engine is the commentary engine's host: it owns the context, the
+// voice bus and the crowd duck
+const commentary = new Commentary(audio);
+// always-on audio hook: pipeline/audio/smoke.mjs checks the voice pack and the
+// stingers from the menu, long before any match publishes `__ss26`
+(window as unknown as Record<string, unknown>).__ss26audio = { audio, commentary };
 
 let inMenus = true;
 
@@ -52,9 +60,40 @@ window.addEventListener('ss26-quality-change', () => {
   if (inMenus && attractMatch) startAttract();
 });
 
+// The front end runs its own small three.js scene behind the menus (§7.1's
+// depth-of-field player backdrop), so the CPU-vs-CPU attract match sleeps while
+// that is on screen and comes back for everything else (tournament hub, lobby,
+// roster editor). Menu.destroy() fires the resume asynchronously, which is why
+// a menu that is tearing down INTO a match never rebuilds one just to drop it.
+let attractSuspended = false;
+window.addEventListener('ss26-attract-suspend', () => {
+  attractSuspended = true;
+  if (attractMatch) stopAttract();
+});
+window.addEventListener('ss26-attract-resume', () => {
+  attractSuspended = false;
+  if (inMenus && !attractMatch) startAttract();
+});
+
 hub.onAnyButton = () => {
   audio.unlock();
   applyMusic();
+};
+
+// §5.4 hot-plug. In the menus a new pad just shows up (Menu and Lobby both
+// listen for gamepadconnected and re-render, so it can take a seat straight
+// away). Mid-match a yanked pad is a dropout: its shirt would stand still, so
+// hold the game on the pause card exactly as Esc would — the same treatment
+// the §5.4.5 ladder gives a guest who vanishes.
+hub.onPadDisconnected = (index) => {
+  hub.stopRumble();
+  if (inMenus || !match || !hudUI || paused || netHold) return;
+  const seated = baseSeats.some((s) => s?.kind === 'pad' && s.padIndex === index);
+  if (!seated) return;
+  paused = true;
+  hudUI.showPauseCard();
+  paintPause('GAMEPAD DISCONNECTED');
+  hub.clearAll();
 };
 
 /** The MenuResult variants that carry a full match configuration. */
@@ -80,6 +119,8 @@ interface MatchConfig {
 let match: Match | null = null;
 let renderer: GameRenderer | null = null;
 let hudUI: HUD | null = null;
+/** §7 scripted scenes: walkout, goal celebration, the walk off at the whistle. */
+let presentation: Presentation | null = null;
 let currentConfig: MatchConfig | null = null;
 let tournament: Tournament | null = null;
 let accumulator = 0;
@@ -121,6 +162,7 @@ canvas.addEventListener('webglcontextlost', (e) => {
   if (live && !paused) {
     paused = true;
     hudUI?.showPauseCard();
+    paintPause('GRAPHICS CONTEXT LOST');
     hub.clearAll(); // a stale buffered press must not instantly resume
   }
 });
@@ -146,15 +188,33 @@ function showFatal(html: string): void {
     </div>`;
 }
 
+/** The front-end pause screen (src/ui/menuPause.ts) over the HUD's own card. */
+function paintPause(reason?: string): void {
+  showPauseOverlay({
+    home: currentConfig?.home.name,
+    away: currentConfig?.away.name,
+    homeColor: currentConfig?.home.kit.home,
+    awayColor: currentConfig?.away.kit.home,
+    quitTo: currentConfig?.onDone && tournament ? 'TOURNAMENT HUB' : 'MAIN MENU',
+    reason,
+  });
+}
+
 function stopLoop(): void {
   cancelAnimationFrame(rafId);
+  hidePauseOverlay();
   match = null;
+  presentation?.dispose();   // unhook before the renderer it points at dies
+  presentation = null;
   renderer?.dispose();
   renderer = null;
   hudUI?.destroy();
   hudUI = null;
   paused = false;
   replayWatch = false;
+  // §5.4: no seats, no haptics — a motor must never be left running into the menus
+  hub.stopRumble();
+  hub.clearSeatPads();
   // don't pin the disposed renderer/scene in memory while idling in menus
   (window as unknown as Record<string, unknown>).__ss26 = null;
 }
@@ -245,7 +305,13 @@ function showLobby(r: MatchMenuResult): void {
   closeLobby();
   const host = new GuestHost(hub);
   guestHost = host;
-  host.open();
+  try {
+    host.open();
+  } catch (err) {
+    // PeerJS can throw synchronously (no network, blocked WebRTC); the local
+    // lobby must still come up so pads can be seated
+    console.warn('[lobby] guest host failed to open', err);
+  }
 
   const shirts = resolvedShirts(r.home.kit, r.away.kit);
   lobby = new Lobby(
@@ -436,6 +502,7 @@ let attractAcc = 0;
 function startAttract(): void {
   stopAttract();
   if (glLost) return; // no renderer while the context is down
+  if (attractSuspended) return; // the front end's own 3D backdrop has the screen
   try {
     const pool = TEAMS.filter((t) => t.tier >= 3);
     const home = pool[Math.floor(Math.random() * pool.length)];
@@ -452,6 +519,9 @@ function startAttract(): void {
     // wired, they get the full celebration + two-angle replay show
     const m = attractMatch, r = attractRenderer;
     m.events.on((e) => r.onEvent(e));
+    // §7.2 pre-match: open behind the menu on the stadium beauty crane and
+    // only then hand the rig to the live package
+    r.openOnBeauty(8);
     attractLast = performance.now();
     attractAcc = 0;
     attractRaf = requestAnimationFrame(attractLoop);
@@ -498,23 +568,35 @@ function attractLoop(now: number): void {
 
 // ---------------------------------------------------------------- rumble
 
+/**
+ * A cue felt only by the pads holding one side's shirts (§5.4.6). In 1P the
+ * seats are 'merged', so every pad is on every seat and this is the same as
+ * cueing the room — which is right: there is only one player.
+ */
+function cueSide(teamIdx: number, name: RumbleCue, scale = 1): void {
+  for (let slot = teamIdx; slot < SEAT_SLOTS; slot += 2) hub.cueSeat(slot, name, scale);
+}
+
 /** Haptics: the pad speaks the language of the match (§5 feel). */
 function rumbleFor(e: MatchEvent): void {
   switch (e.type) {
-    case 'kick': hub.rumble(0, Math.min(0.1 + e.power * 0.35, 0.5), 60); break;
-    case 'shot': hub.rumble(0.45, 0.3, 140); break;
-    case 'tackle': hub.rumble(0.5, 0.2, 110); break;
-    case 'switch': hub.rumble(0, 0.2, 40); break;
-    case 'post': hub.rumble(0.8, 0.4, 220); break;
-    case 'goal': hub.rumble(1, 1, 550); break;
-    case 'save': hub.rumble(0.4, 0.3, 130); break;
-    case 'card': hub.rumble(0.3, 0.5, e.color === 'red' ? 350 : 180); break;
-    case 'penaltyAwarded': hub.rumble(0.5, 0.5, 250); break;
-    case 'penKick':
-      hub.rumble(e.result === 'goal' ? 0.9 : 0.5, 0.5, e.result === 'goal' ? 450 : 200);
+    // the ball leaving a boot is felt by whoever is holding it; the sim does
+    // not say whose, so this one stays a room-wide thump
+    case 'kick':
+      hub.cue(e.power > 0.66 ? 'kickHeavy' : e.power > 0.33 ? 'kickMedium' : 'kickLight');
       break;
-    case 'shootoutEnd': hub.rumble(1, 1, 700); break;
-    case 'fulltime': hub.rumble(0.4, 0.6, 300); break;
+    case 'shot': cueSide(e.teamIdx, 'kickHeavy'); break;
+    case 'tackle': hub.cue('tackle'); break;
+    case 'switch': hub.cueSeat(e.slot, 'switch'); break;
+    case 'post': hub.cue('post'); break;
+    case 'goal': hub.cue('goal'); break;
+    case 'save': cueSide(e.teamIdx, 'save'); break;
+    case 'card': cueSide(e.teamIdx, 'card', e.color === 'red' ? 1.3 : 1); break;
+    case 'foul': hub.cue('whistle', undefined, 0.6); break;
+    case 'penaltyAwarded': hub.cue('whistle'); break;
+    case 'penKick': hub.cue(e.result === 'goal' ? 'goal' : 'save'); break;
+    case 'shootoutEnd': hub.cue('goal'); break;
+    case 'fulltime': hub.cue('whistle'); break;
     default: break;
   }
 }
@@ -536,6 +618,9 @@ function startMatch(config: MatchConfig): void {
     seatOnAI[s] = false;
     seatHandback[s] = false;
   }
+  // §5.4: tell the hub which pad sits in which seat, so a card shown to the
+  // away side buzzes the away pad and nobody else's
+  hub.registerSeatPads(baseSeats);
   netHold = null;
 
   match = new Match({
@@ -569,8 +654,19 @@ function startMatch(config: MatchConfig): void {
   }
   hudUI = new HUD(match);
   hudUI.fulltimeHint = config.onDone ? 'PRESS J TO CONTINUE' : null;
+  // §7 presentation. A shootout has no walkout (there is no match to walk out
+  // for), and `?walkout=0` turns it off for anyone who has seen it enough.
+  presentation = new Presentation(renderer, match, {
+    walkout: walkoutWanted(config.mode !== 'shootout'),
+    // audio's stinger hook is optional and may not exist in this build yet
+    stinger: (name) => (audio as unknown as {
+      stinger?: (n: string) => void }).stinger?.(name),
+  });
   audio.setCrowd(true);
-  commentary.refresh();
+  // the stands belong to the home side, and the match tells the commentary
+  // engine which two squads' name clips to pull
+  audio.setHomeTeam(0);
+  commentary.refresh(match);
   hub.clearAll();
   paused = false;
   replayWatch = false;
@@ -587,6 +683,16 @@ function startMatch(config: MatchConfig): void {
   });
   m.ball.onBounce = (speed) => audio.onEvent({ type: 'bounce', speed });
   r.onReplayStateChange = (on, label) => h.setReplay(on, label);
+  // Camera director → broadcast wipes: every hard cut the director makes gets
+  // a 0.6s wipe laid over it, and the package stops firing its own event-driven
+  // wipes the moment this callback speaks, so a dead ball never wipes twice.
+  (r as CameraCutSource).onCut = (kind) => h.onCameraCut(kind);
+  // and the package's own audio cues ('whoosh' under a wipe, 'goal' under the
+  // banner, 'cardSting', 'replayIn'/'replayOut') — guarded inside the package
+  h.bc.stinger = (name) => audio.stinger(name);
+  // the line-up graphic belongs over the walkout; with no walkout the package
+  // falls back to showing it for 5s on the first kickoff event
+  if (walkoutWanted()) h.showLineups(0);
 
   h.playWipe();
   accumulator = 0;
@@ -595,6 +701,9 @@ function startMatch(config: MatchConfig): void {
   // debug hook for automated testing
   (window as unknown as Record<string, unknown>).__ss26 = {
     match: m, renderer: r, hub, tournament, music, isPaused: () => paused,
+    // audio + commentary for pipeline/audio/smoke.mjs (stingers, ducking, and
+    // `commentary.log`, the last 64 lines actually spoken)
+    audio, commentary,
   };
 }
 
@@ -607,6 +716,12 @@ function loop(now: number): void {
 
   hub.pollGamepads();
   updateGuestHealth();
+
+  // §7 presentation, polled every frame so it sees every phase change whatever
+  // branch below we end up in. Only the pre-match walkout asks the sim to wait
+  // for it — the celebration and the walk-offs run under phases the sim
+  // already spends standing still.
+  const holdForScene = presentation?.frame() ?? false;
 
   // a whistle can land while a gameplay button edge is still buffered — clear
   // it on phase entry and give the card a beat on screen, or the half-time /
@@ -688,6 +803,7 @@ function loop(now: number): void {
     if (hub.anyPress(['pass', 'pause'])) {
       paused = false;
       hudUI.hideCard();
+      hidePauseOverlay();
       hub.clearAll();
     } else if (hub.anyPress(['loft'])) {
       if (currentConfig?.onDone && tournament) showTournamentHub();
@@ -700,7 +816,16 @@ function loop(now: number): void {
     if (hub.anyPress(['pause'])) {
       paused = true;
       hudUI.showPauseCard();
+      paintPause();
       hub.clearAll();
+    } else if (holdForScene) {
+      // the pre-match walkout owns the pitch and the sim waits at kickoff for
+      // it; any gameplay button cuts it short, under the usual wipe
+      if (hub.anyPress(['pass', 'loft', 'shoot', 'through', 'replay'])) {
+        presentation?.skip();
+        hudUI.playWipe();
+        hub.clearAll();
+      }
     } else if ((match.phase === 'play' || match.phase === 'restart')
       && hub.anyPress(['replay'], 2000)
       && renderer.startManualReplay('live')) {
@@ -730,6 +855,7 @@ function loop(now: number): void {
   renderer.update(frozen ? 0 : frameDt, alpha);
   hudUI.update(frameDt, (x, y, z) => renderer!.screenPos(x, y, z));
   audio.update(frozen ? 0 : frameDt); // no terrace claps over the PAUSED card
+  commentary.update(frozen ? 0 : frameDt); // ...and no commentary over it either
 }
 
 // ------------------------------------------------------------ capture mode
@@ -737,8 +863,16 @@ function loop(now: number): void {
 // It deliberately bypasses everything above — no menus, no attract match, no
 // audio, and no roster overrides (localStorage is not reproducible). The module
 // is loaded on demand so normal players never download the harness.
+// `?broadcast=<shot>` is the same idea for the TV package (§7.1): one graphic
+// of the broadcast kit driven into its settled state over a seeded match and
+// frozen for a screenshot. Separate module, separate shot list — a UI tweak
+// must never invalidate a lighting baseline.
 const captureShot = new URLSearchParams(location.search).get('capture');
-if (captureShot) {
+const tvShot = new URLSearchParams(location.search).get('broadcast');
+if (tvShot) {
+  inMenus = false;
+  void import('./ui/broadcastShots').then((m) => m.runBroadcastShot(canvas, tvShot));
+} else if (captureShot) {
   inMenus = false;
   void import('./tools/capture').then((m) => m.runCapture(canvas, captureShot));
 } else {

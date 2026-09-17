@@ -12,3 +12,16 @@ pipeline/anim/mixamo/
 pipeline/anim/previews/
 captures/
 public/models/anim/
+
+# audio bake: venv, TTS weights (~350MB), the render cache, the CC0 source
+# recordings and the listen-to-me previews. All regenerable by
+# pipeline/audio/bake_*.py; the bake OUTPUT (public/audio/, 5.7MB) is committed.
+pipeline/audio/.venv/
+pipeline/audio/models/
+pipeline/audio/.cache/
+pipeline/audio/sources/
+pipeline/audio/samples/
+
+# native shell: packaged .app and its staging tree (regenerable, ~400MB)
+release/
+build/

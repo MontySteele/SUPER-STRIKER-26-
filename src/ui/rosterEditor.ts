@@ -3,9 +3,12 @@
 // browser only) — teams.json on disk is never touched, and every team has a
 // RESET back to factory.
 
+import './menu.css';
 import { TEAMS, overall, teamRating } from '../data/loader';
 import { factoryPlayers, resetTeamRoster, sanitizePlayer, saveTeamRoster, teamEdited } from '../data/roster';
 import { esc } from './escape';
+import { MenuNav } from './menuNav';
+import { promptBar } from './menuGlyphs';
 import type { PlayerData, TeamData } from '../data/types';
 
 const STAT_COLS: [keyof PlayerData, string][] = [
@@ -18,6 +21,8 @@ export class RosterEditor {
   private team: TeamData | null = null;
   private draft: PlayerData[] = [];
   private keyHandler: (e: KeyboardEvent) => void;
+  /** pad only: this screen has real text inputs and owns its own keyboard */
+  private nav: MenuNav;
 
   constructor(private onExit: () => void) {
     this.root = document.getElementById('ui-root')!;
@@ -32,11 +37,13 @@ export class RosterEditor {
       this.back();
     };
     window.addEventListener('keydown', this.keyHandler);
+    this.nav = new MenuNav({ onBack: () => this.back() }, { padOnly: true });
     this.renderPick();
   }
 
   private destroy(): void {
     window.removeEventListener('keydown', this.keyHandler);
+    this.nav.destroy();
     this.root.innerHTML = '';
   }
 
@@ -61,10 +68,11 @@ export class RosterEditor {
         <span class="tier">${teamEdited(t.id) ? 'EDITED' : '★'.repeat(Math.max(1, Math.min(5, t.tier)))}</span>
       </div>`).join('');
     this.root.innerHTML = `
-      <div class="menu-screen tour-screen">
+      <div class="menu-screen tour-screen fe-skin">
         <div class="menu-h2">EDIT TEAMS</div>
         <div class="tour-note" style="margin-bottom:12px">Pick a squad — changes save to this browser only. K / ESC to go back.</div>
         <div class="team-grid">${cells}</div>
+        ${promptBar([['back', 'BACK TO MENU']])}
       </div>`;
     this.root.querySelectorAll('.team-cell').forEach((el) => {
       el.addEventListener('click', () => {
@@ -93,7 +101,7 @@ export class RosterEditor {
       </tr>`;
     }).join('');
     this.root.innerHTML = `
-      <div class="menu-screen tour-screen">
+      <div class="menu-screen tour-screen fe-skin">
         <div class="menu-h2">EDIT — ${t.name.toUpperCase()} <small class="ros-rating">(${Math.round(teamRating(t))})</small></div>
         <div class="tour-note" style="margin-bottom:8px">Type to edit · ★ = star player (+10 all stats, gold ring) · position is fixed by formation</div>
         <div class="roster-wrap">
@@ -108,6 +116,7 @@ export class RosterEditor {
           <button class="tour-btn" data-act="back">BACK <small>(ESC)</small></button>
         </div>
         ${note ? `<div class="tour-note boot">${note}</div>` : ''}
+        ${promptBar([['back', 'BACK']])}
       </div>`;
 
     this.root.querySelectorAll<HTMLInputElement>('.ros-in').forEach((input) => {

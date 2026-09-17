@@ -111,7 +111,14 @@ export type ClipId =
   | 'idle' | 'trudge' | 'walk' | 'jog' | 'run' | 'sprint'
   | 'gkIdle' | 'gkHold' | 'gkStepL' | 'gkStepR'
   | 'kickA' | 'kickB' | 'kickC' | 'kickD' | 'header'
-  | 'slide' | 'diveL' | 'diveR' | 'collect' | 'celebrate' | 'dejected';
+  | 'slide' | 'diveL' | 'diveR' | 'collect' | 'celebrate' | 'dejected'
+  // --- presentation (§7, src/present): the cutscene set. These are never
+  // reached by the sim's ActionAnim table — a scripted scene names them.
+  | 'strut' | 'happyWalk' | 'happyRun'
+  | 'standA' | 'standB' | 'standC'
+  | 'clap' | 'cheer' | 'jumpCheer'
+  | 'celebB' | 'celebC' | 'celebD'
+  | 'victoryIdle' | 'sadIdle' | 'frustrated';
 
 /**
  * WHAT PLAYS WHEN — the whole animation set, as data.
@@ -190,6 +197,44 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
   },
   celebrate: { anim: ['mx_Celebrating_After_A_Win', 'mx_Aj_Victory_Idle', 'mx_Big_Vegas_Victory_Idle'] },
   dejected: { anim: ['mx_Aj_Defeat_Idle', 'mx_Big_Vegas_Defeat_Idle', 'mx_Standing_In_A_Sad_Disposition'] },
+
+  // --- the presentation set (§7, driven from src/present).
+  //
+  // Two kinds live here and the difference matters. The first three are
+  // LOCOMOTION: they go into a blend chain (WALKOUT_CHAIN / CELEBRATE_CHAIN)
+  // and their measured ground speed is what rate-matches playback to the
+  // distance the actor actually covers, so a man walking out of the tunnel
+  // plants his feet instead of skating. Everything after them is an OVERLAY
+  // played in place at weight over the chain's idle, so every one of those is
+  // pinned to groundSpeed 0 — a mocap actor who drifts 20cm while clapping
+  // would otherwise be read as "this clip travels" and slow the whole chain.
+  strut: { anim: ['mx_Walking_With_A_Swagger', 'mx_Male_Strut_Walk', 'mx_Male_Standard_Walk'] },
+  happyWalk: { anim: ['mx_Happy_Walking_Forward', 'mx_Male_Happy_Walk'] },
+  happyRun: { anim: ['mx_Happy_Run_Forward', 'mx_Running_Forward'] },
+
+  // lineup idles: three of them, handed out round-robin and started at
+  // different phases, because eleven men fidgeting in unison is the single
+  // tell that gives a line-up away
+  standA: { anim: ['mx_Idle_Stand_Looking_Around', 'mx_Looking_Around'], groundSpeed: 0 },
+  standB: { anim: ['mx_Standing_Idle_Looking_Around', 'mx_Looking_Over_Both_Shoulders'], groundSpeed: 0 },
+  standC: { anim: ['mx_Weight_Shift_Idle', 'mx_Shifting_Weight_From_Side_To_Side'], groundSpeed: 0 },
+
+  clap: { anim: ['mx_Clap_While_Standing'], groundSpeed: 0 },
+  cheer: { anim: ['mx_Male_Cheering_With_Two_Fists_Pump', 'mx_High_Enthusiasm_Fist_Pump'], groundSpeed: 0 },
+  jumpCheer: { anim: ['mx_Ecstatic_Jumping_With_Both_Legs_And_Arms', 'mx_Cross_Jumps'], groundSpeed: 0 },
+
+  // scorer celebrations, picked per goal from a seed so the same man does not
+  // do the same thing twice ('celebrate' above is the fourth of the set)
+  celebB: { anim: ['mx_Super_Excited', 'mx_Angrily_Pumping_Fists_Forward'], groundSpeed: 0 },
+  celebC: { anim: ['mx_Male_Cheering_Head_Banging', 'mx_Pumping_A_Fist'], groundSpeed: 0 },
+  celebD: { anim: ['mx_Basic_Northern_Soul_Step', 'mx_Boogaloo'], groundSpeed: 0 },
+
+  victoryIdle: { anim: ['mx_Aj_Victory_Idle', 'mx_Big_Vegas_Victory_Idle'], groundSpeed: 0 },
+  sadIdle: { anim: ['mx_Sad_Idle_Variation_1', 'mx_Standing_In_A_Sad_Disposition'], groundSpeed: 0 },
+  frustrated: {
+    anim: ['mx_Showing_Frustration_After_A_Loss', 'mx_Disappointed_Awe_Shucks'],
+    groundSpeed: 0,
+  },
 };
 
 /**
@@ -211,6 +256,27 @@ export const GK_CHAIN: ClipId[] = ['gkIdle', 'walk', 'jog', 'run', 'sprint'];
 
 /** Lateral shuffle, picked by which way the sim is sliding him. */
 export const GK_SIDESTEP: { left: ClipId; right: ClipId } = { left: 'gkStepL', right: 'gkStepR' };
+
+/**
+ * Chains a CUTSCENE can swap in (SkinnedPlayerMesh.setLocoChain). A scripted
+ * actor still moves through the normal blend machinery — same bracketing pair,
+ * same speed ÷ natural-speed playback rate — so the only thing a cutscene
+ * changes is WHICH cycles the chain is made of. That is the whole reason a man
+ * can swagger out of the tunnel or sprint away in delight without his boots
+ * skating: the rate matching is untouched.
+ */
+//
+// Each of these keeps the ORDINARY cycles either side of its flavour clip on
+// purpose. Natural ground speed is MEASURED at load, and a retarget that
+// happened to arrive without root motion would measure zero — which in a chain
+// of [idle, strut, jog] leaves a 1.7 m/s walk with nothing below the jog to
+// blend against and the playback rate pinned at its floor. Keeping `walk` and
+// `jog` in the chain means the bracket is always sane whatever the flavour
+// clip turns out to be worth, and the flavour simply contributes where it can.
+export const WALKOUT_CHAIN: ClipId[] = ['idle', 'strut', 'walk', 'jog', 'run'];
+export const CELEBRATE_CHAIN: ClipId[] = ['idle', 'happyWalk', 'jog', 'happyRun', 'sprint'];
+/** Heads down, off the pitch: the sad walk is already in the default chain. */
+export const TRUDGE_CHAIN: ClipId[] = ['idle', 'trudge', 'walk', 'jog'];
 
 /** Meshes that are never visible at broadcast distance and cost a draw call
  *  each, times twenty-two, times every shadow cascade. The mouth interior is

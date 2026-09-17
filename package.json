@@ -9,8 +9,16 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "capture": "node tools/capture.mjs",
+    "capture-tv": "node tools/capture-broadcast.mjs",
     "shoot-player": "node tools/shoot-player.mjs",
-    "shoot-model": "node tools/shoot-model.mjs"
+    "shoot-menu": "node tools/shoot-menu.mjs",
+    "shoot-model": "node tools/shoot-model.mjs",
+    "app": "node electron/dev.mjs",
+    "app:pad": "SS26_PAGE=pad node electron/dev.mjs",
+    "app:prod": "npm run build && electron electron/main.cjs",
+    "app:build": "npm run build && node electron/package.mjs",
+    "app:smoke": "node electron/smoke.mjs",
+    "test:input": "tsx src/input/input.test.ts"
   },
   "repository": {
     "type": "git",
@@ -21,7 +29,9 @@
     "three": "^0.185.1"
   },
   "devDependencies": {
+    "@electron/packager": "^20.3.0",
     "@types/three": "^0.185.1",
+    "electron": "^44.4.1",
     "playwright": "^1.62.1",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",

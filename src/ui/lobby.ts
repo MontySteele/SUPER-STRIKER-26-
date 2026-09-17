@@ -3,14 +3,23 @@
 // live list of guests with their input type and connection pip — then seats
 // everyone and kicks off. Four slots, numbered the way the sim numbers them:
 // P1/P2 are the two sides' on-ball players, P3/P4 their partners. Fill two and
-// it's a 1v1; fill four and it's a 2v2. Navigated exactly like the rest of the
-// menus (WASD + J / K).
+// it's a 1v1; fill four and it's a 2v2.
+//
+// Front-end uplift: the four slots are now four seat cards side by side, the
+// way a console lobby lays them out, with controller glyphs, kit colours and a
+// live "PRESS ANY BUTTON TO JOIN" — an unseated pad that presses anything
+// takes the first free seat by itself. Navigation is pad-first (MenuNav), the
+// keyboard bindings still work, and the seating logic below is untouched.
 
+import './menu.css';
 import type { TeamData } from '../data/types';
 import type { GuestHost } from '../net/hostLink';
 import { slotRole, slotTeam } from '../sim/match';
 import { esc } from './escape';
 import { drawQr } from './qr';
+import { MenuNav, type NavDir } from './menuNav';
+import { promptBar } from './menuGlyphs';
+import { readableOn } from './menuKit';
 
 /** Who is driving a slot. 'guest' carries the InputHub remote index. */
 export type SlotDevice =
@@ -28,19 +37,24 @@ interface Candidate {
   warn: boolean;
 }
 
+/** Seat accent colours — the same P1..P4 order the sim uses. */
+const SEAT_ACCENT = ['#ffce4a', '#dde4f0', '#ff8c2e', '#5ec8ff'];
+
 export class Lobby {
   /** Clash-resolved shirts, set by main so the banner matches the pitch. */
   shirts: [string, string] = ['#ffffff', '#ffffff'];
 
   private root: HTMLElement;
-  /** The slot rows, then the START row at the end. */
+  /** The slot cards, then the START row at the end. */
   private readonly startRow: number;
   private focus: number;
   private slots: SlotAssignment;
-  private keyHandler: (e: KeyboardEvent) => void;
+  private nav: MenuNav;
   private padHandler: () => void;
   private pollId: number;
   private alive = true;
+  /** last-seen button state per pad, for "press any button to join" */
+  private padPrev = new Map<number, boolean>();
 
   constructor(
     private host: GuestHost,
@@ -53,13 +67,22 @@ export class Lobby {
     this.slots[0] = { kind: 'keyboard' };
     this.startRow = host.slotCount;
     this.focus = this.startRow; // the common case is "everyone's here, go"
-    this.keyHandler = (e) => this.onKey(e);
-    window.addEventListener('keydown', this.keyHandler);
+    this.nav = new MenuNav({
+      onDir: (d) => this.onDir(d),
+      onConfirm: () => this.onConfirm(),
+      onBack: () => this.cancel(),
+      onAlt: () => this.cycleFocused(-1),
+      onShoulder: (d) => this.cycleFocused(d),
+    });
     this.padHandler = () => this.refresh();
     window.addEventListener('gamepadconnected', this.padHandler);
     window.addEventListener('gamepaddisconnected', this.padHandler);
-    // pips are driven by packet age, which nothing else pokes us about
-    this.pollId = window.setInterval(() => this.refresh(), 500);
+    // pips are driven by packet age, which nothing else pokes us about; the
+    // same tick watches for an idle pad asking for a seat
+    this.pollId = window.setInterval(() => {
+      this.watchPads();
+      this.refresh();
+    }, 250);
     this.host.onChange = () => this.refresh();
     this.host.phase = 'lobby';
     this.host.describeSlot = (slot) => this.briefFor(slot);
@@ -69,7 +92,7 @@ export class Lobby {
   destroy(): void {
     this.alive = false;
     window.clearInterval(this.pollId);
-    window.removeEventListener('keydown', this.keyHandler);
+    this.nav.destroy();
     window.removeEventListener('gamepadconnected', this.padHandler);
     window.removeEventListener('gamepaddisconnected', this.padHandler);
     this.host.onChange = null;
@@ -112,13 +135,22 @@ export class Lobby {
 
   private labelFor(slot: number): string {
     const d = this.slots[slot];
-    if (!d) return '— EMPTY —';
+    if (!d) return 'OPEN';
     const found = this.candidates(slot).find((c) => sameDevice(c.device, d));
     if (found) return found.label;
     // the pad was unplugged / the guest vanished between renders
     return d.kind === 'guest'
       ? `${this.host.byId(d.id)?.name.toUpperCase() ?? 'GUEST'} — GONE`
       : d.kind === 'pad' ? `GAMEPAD ${d.index + 1} — GONE` : 'LOCAL — KEYBOARD';
+  }
+
+  /** The badge on a seat card. Letters, not emoji — see the CSS note. */
+  private iconFor(slot: number): string {
+    const d = this.slots[slot];
+    if (!d) return '+';
+    if (d.kind === 'pad') return `P${d.index + 1}`;
+    if (d.kind === 'guest') return 'NET';
+    return 'KEY';
   }
 
   private cycle(slot: number, dir: number): void {
@@ -155,6 +187,28 @@ export class Lobby {
     return changed;
   }
 
+  /**
+   * "PRESS ANY BUTTON TO JOIN": a connected pad that nobody has seated yet
+   * takes the first free seat the moment it is touched. This reads the pads
+   * directly — the InputHub's poller is a match-loop thing and is not running.
+   */
+  private watchPads(): void {
+    const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : [];
+    for (const gp of pads) {
+      if (!gp) continue;
+      const down = gp.buttons.some((b) => b.pressed);
+      const was = this.padPrev.get(gp.index) ?? false;
+      this.padPrev.set(gp.index, down);
+      if (!down || was) continue;
+      const seated = this.slots.some((d) => d?.kind === 'pad' && d.index === gp.index);
+      if (seated) continue;
+      const free = this.slots.findIndex((d) => d === null);
+      if (free < 0) continue;
+      this.slots[free] = { kind: 'pad', index: gp.index };
+      this.pushAssignments();
+    }
+  }
+
   /** One human a side is the minimum; the partner slots are optional. */
   private canStart(): boolean {
     return this.slots[0] !== null && this.slots[1] !== null;
@@ -168,28 +222,39 @@ export class Lobby {
 
   // ------------------------------------------------------------------ input
 
-  private onKey(e: KeyboardEvent): void {
-    const code = e.code;
-    const confirm = code === 'KeyJ' || code === 'Enter' || code === 'Space';
-    const back = code === 'KeyK' || code === 'Escape' || code === 'Backspace';
-    if (e.repeat && (confirm || back)) return;
-    const up = code === 'KeyW' || code === 'ArrowUp';
-    const down = code === 'KeyS' || code === 'ArrowDown';
-    const left = code === 'KeyA' || code === 'ArrowLeft';
-    const right = code === 'KeyD' || code === 'ArrowRight';
-
-    if (up) { this.focus = Math.max(0, this.focus - 1); this.render(); }
-    else if (down) { this.focus = Math.min(this.startRow, this.focus + 1); this.render(); }
-    else if ((left || right) && this.focus < this.startRow) {
-      this.cycle(this.focus, left ? -1 : 1);
+  private onDir(d: NavDir): void {
+    if (d === 'left' || d === 'right') {
+      if (this.focus >= this.startRow) return;
+      this.focus = Math.max(0, Math.min(this.startRow - 1, this.focus + (d === 'left' ? -1 : 1)));
       this.render();
-    } else if (confirm) {
-      if (this.focus < this.startRow) { this.cycle(this.focus, 1); this.render(); }
-      else this.start();
-    } else if (back) {
-      this.destroy();
-      this.onCancel();
+      return;
     }
+    if (d === 'down') {
+      this.focus = this.startRow;
+      this.render();
+      return;
+    }
+    // up out of the START row lands on the seat you were last on
+    if (this.focus === this.startRow) {
+      this.focus = 0;
+      this.render();
+    }
+  }
+
+  private onConfirm(): void {
+    if (this.focus < this.startRow) this.cycleFocused(1);
+    else this.start();
+  }
+
+  private cycleFocused(dir: number): void {
+    if (this.focus >= this.startRow) return;
+    this.cycle(this.focus, dir);
+    this.render();
+  }
+
+  private cancel(): void {
+    this.destroy();
+    this.onCancel();
   }
 
   private start(): void {
@@ -207,34 +272,83 @@ export class Lobby {
     this.render();
   }
 
-  private render(): void {
+  /**
+   * The chrome, painted once. Everything that ticks (pips, seats, the START
+   * row) is re-filled by paint() so the entry animation and the seat-card
+   * transitions are not restarted four times a second.
+   */
+  private mount(): void {
     const url = this.host.url();
+    this.root.innerHTML = `
+      <div class="fe fe-skin fe--solid">
+        <div class="fe-vignette"></div>
+        <div class="fe-layer">
+          <div class="fe-topbar">
+            <div class="fe-mark">SUPER<b>STRIKER</b></div>
+            <div class="fe-crumb"><span>MAIN MENU</span><i>›</i><span class="on">INVITE PLAYERS</span></div>
+            <div class="fe-topbar-rule"></div>
+          </div>
+          <div class="fe-body">
+            <div class="fe-anim">
+              <div class="fe-h1">THE <em>LOBBY</em></div>
+              <div class="fe-sub">SEND THE CODE · THEY PLAY FROM THEIR OWN LAPTOP · NO ACCOUNT</div>
+              <div id="fe-lobby-status"></div>
+              <div class="fe-invite">
+                <div class="fe-invite-wrap">
+                  <div class="fe-invite-k">ROOM CODE</div>
+                  <div class="fe-invite-code">${esc(this.host.code)}</div>
+                  <div class="fe-invite-url">${esc(url)}</div>
+                </div>
+                <canvas class="fe-qr"></canvas>
+              </div>
+              <div class="fe-guests" id="fe-lobby-guests"></div>
+              <div class="fe-seats" id="fe-lobby-seats"></div>
+              <div class="fe-go" id="fe-lobby-go"></div>
+            </div>
+          </div>
+          ${promptBar([
+            ['dpadLR', 'SEAT'], ['confirm', 'CHANGE'], ['l1', 'PREV'], ['r1', 'NEXT'],
+            ['dpadUD', 'KICK OFF'], ['back', 'CANCEL'],
+          ])}
+        </div>
+      </div>`;
+    const qr = this.root.querySelector<HTMLCanvasElement>('.fe-qr')!;
+    try {
+      drawQr(qr, url, 3);
+    } catch {
+      qr.style.display = 'none'; // URL too long for the mini encoder
+    }
+    this.root.querySelector<HTMLElement>('#fe-lobby-go')?.addEventListener('click', () => this.start());
+  }
+
+  private render(): void {
+    if (!this.root.querySelector('#fe-lobby-seats')) this.mount();
     const guests = this.host.list();
     const now = performance.now();
 
     const status = this.host.status === 'error'
-      ? `<div class="lobby-err">${esc(this.host.error ?? 'Signaling failed.')}</div>`
+      ? `<div class="fe-status">${esc(this.host.error ?? 'Signaling failed.')}</div>`
       : this.host.status !== 'ready'
-        ? '<div class="lobby-err warm">OPENING THE ROOM…</div>'
+        ? '<div class="fe-status warm">OPENING THE ROOM…</div>'
         : '';
 
     const guestRows = guests.length === 0
-      ? '<div class="guest-row empty">NOBODY YET — SEND THEM THE LINK</div>'
+      ? '<div class="fe-guest empty">NOBODY YET — SEND THEM THE LINK</div>'
       : guests.map((g) => {
         const health = g.connected ? this.host.health(g.id, now) : 'lost';
         const pip = health === 'ok' ? 'ok' : health === 'degraded' ? 'warn' : '';
         const rtt = g.rttMs >= 0 ? `${g.rttMs} MS` : '—';
         const seatTag = g.slot === null ? 'WATCHING' : `PLAYER ${g.slot + 1}`;
-        return `<div class="guest-row">
-            <span class="pip ${pip}"></span>
-            <span class="gname">${esc(g.name.toUpperCase())}</span>
-            <span class="gkind">${g.input === 'gamepad' ? 'GAMEPAD' : 'KEYBOARD'}</span>
-            <span class="grtt">${rtt}</span>
-            <span class="gseat">${seatTag}</span>
+        return `<div class="fe-guest">
+            <span class="fe-pip ${pip}"></span>
+            <span class="fe-gname">${esc(g.name.toUpperCase())}</span>
+            <span>${g.input === 'gamepad' ? 'GAMEPAD' : 'KEYBOARD'}</span>
+            <span>${rtt}</span>
+            <span class="fe-gseat">${seatTag}</span>
           </div>`;
       }).join('');
 
-    const slotRow = (i: number): string => {
+    const seatCard = (i: number): string => {
       const side = slotTeam(i);
       const team = this.teams[side];
       const picked = this.slots[i];
@@ -243,50 +357,46 @@ export class Lobby {
       const seated = !!picked
         && this.candidates(i).some((c) => sameDevice(c.device, picked) && !c.warn);
       const warn = slotRole(i) === 0 ? !seated : (!!picked && !seated);
-      const role = slotRole(i) === 0 ? '' : ' <small class="slot-role">2ND</small>';
-      return `<div class="setting-row${this.focus === i ? ' focus' : ''}" data-row="${i}">
-          <span>PLAYER ${i + 1}${role}
-            <small class="slot-sub"><span class="swatch-dot" style="background:${esc(this.shirts[side])}"></span>${esc(team.name)}</small>
-          </span>
-          <span class="value${warn ? ' warn' : ''}">◀ ${esc(this.labelFor(i))} ▶</span>
+      // NB: no focus class here — it is toggled below, so moving the cursor
+      // never rebuilds the cards and the lift transition actually plays
+      const cls = ['fe-seat', picked ? '' : 'open', warn ? 'warn' : ''].filter(Boolean).join(' ');
+      return `<div class="${cls}" data-row="${i}" style="--fe-accent:${SEAT_ACCENT[i] ?? '#55607a'}">
+          <div class="fe-seat-no">PLAYER ${i + 1}</div>
+          ${slotRole(i) === 0 ? '' : '<div class="fe-seat-role">2ND</div>'}
+          <div class="fe-seat-team">
+            <span class="fe-dot" style="background:${esc(this.shirts[side])}"></span>${esc(team.name)}
+          </div>
+          <div class="fe-seat-pad">${this.iconFor(i)}</div>
+          <div class="fe-seat-dev"><u>◀</u>${picked ? esc(this.labelFor(i)) : 'PRESS ANY BUTTON'}<u>▶</u></div>
         </div>`;
     };
 
-    this.root.innerHTML = `
-      <div class="menu-screen">
-        <div class="menu-h2">INVITE PLAYERS</div>
-        ${status}
-        <div class="lobby-invite">
-          <div class="lobby-code-wrap">
-            <div class="lobby-code-label">ROOM CODE</div>
-            <div class="lobby-code">${esc(this.host.code)}</div>
-            <div class="lobby-url">${esc(url)}</div>
-          </div>
-          <canvas class="lobby-qr"></canvas>
-        </div>
-        <div class="guest-list">${guestRows}</div>
-        <div class="settings-list">
-          ${this.slots.map((_, i) => slotRow(i)).join('')}
-          <div class="setting-row go${this.focus === this.startRow ? ' focus' : ''}${this.canStart() ? '' : ' disabled'}" data-row="${this.startRow}">
-            ${this.canStart() ? `KICK OFF! — ${this.lineup()}` : 'FILL PLAYER 1 AND PLAYER 2 TO KICK OFF'}
-          </div>
-        </div>
-        <div class="controls-card">W/S SELECT · A/D CHANGE · J CONFIRM · K CANCEL</div>
-      </div>`;
+    const statusEl = this.root.querySelector<HTMLElement>('#fe-lobby-status');
+    if (statusEl && statusEl.innerHTML !== status) statusEl.innerHTML = status;
+    const guestEl = this.root.querySelector<HTMLElement>('#fe-lobby-guests');
+    if (guestEl && guestEl.innerHTML !== guestRows) guestEl.innerHTML = guestRows;
 
-    const qr = this.root.querySelector<HTMLCanvasElement>('.lobby-qr')!;
-    try {
-      drawQr(qr, url, 3);
-    } catch {
-      qr.style.display = 'none'; // URL too long for the mini encoder
-    }
-    this.root.querySelectorAll('.setting-row').forEach((el) => {
-      el.addEventListener('click', () => {
-        const row = Number((el as HTMLElement).dataset.row);
-        if (row === this.startRow) this.start();
-        else { this.focus = row; this.cycle(row, 1); this.render(); }
+    const seatsEl = this.root.querySelector<HTMLElement>('#fe-lobby-seats')!;
+    const cards = this.slots.map((_, i) => seatCard(i)).join('');
+    if (seatsEl.innerHTML !== cards) {
+      seatsEl.innerHTML = cards;
+      seatsEl.querySelectorAll<HTMLElement>('.fe-seat').forEach((el) => {
+        el.addEventListener('click', () => {
+          this.focus = Number(el.dataset.row);
+          this.cycle(this.focus, 1);
+          this.render();
+        });
       });
+    }
+    seatsEl.querySelectorAll<HTMLElement>('.fe-seat').forEach((el, i) => {
+      el.classList.toggle('focus', i === this.focus);
     });
+
+    const goEl = this.root.querySelector<HTMLElement>('#fe-lobby-go')!;
+    const goText = this.canStart() ? `KICK OFF! — ${this.lineup()}` : 'FILL PLAYER 1 AND PLAYER 2 TO KICK OFF';
+    if (goEl.textContent?.trim() !== goText) goEl.textContent = goText;
+    goEl.classList.toggle('focus', this.focus === this.startRow);
+    goEl.classList.toggle('disabled', !this.canStart());
   }
 }
 
@@ -304,10 +414,5 @@ function connectedPadIndices(): number[] {
   return out;
 }
 
-/** Black or white, whichever survives on the given kit color. */
-export function readableOn(hex: string): string {
-  const n = parseInt(hex.replace('#', ''), 16);
-  if (!Number.isFinite(n)) return '#ffffff';
-  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
-  return 0.299 * r + 0.587 * g + 0.114 * b > 140 ? '#0a0d12' : '#ffffff';
-}
+/** Still exported from here: main.ts imports it from this module. */
+export { readableOn };

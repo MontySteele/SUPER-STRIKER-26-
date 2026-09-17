@@ -21,6 +21,83 @@ Or build a static bundle (~200 KB gzipped, no server needed):
 npm run build && npm run preview
 ```
 
+## Native app (macOS) + DualSense
+
+The game also runs as a real desktop app — fullscreen, GPU-accelerated, audio
+up from the first frame with no click to unlock it, and both PS5 pads live.
+
+```bash
+npm install            # pulls Electron + @electron/packager (dev deps)
+
+npm run app            # dev: starts Vite, then opens the native shell on it
+npm run app:pad        # same, but boots straight into the controller bench
+npm run app:prod       # build dist/ and run the shell against the build
+npm run app:build      # build dist/ and produce release/…/SUPER STRIKER '26.app
+npm run app:smoke      # boot the built app, log the renderer console, screenshot
+npm run test:input     # pad detection + deadzone + rumble unit checks (tsx)
+```
+
+`npm run dev` and the browser workflow are untouched — the shell is an extra
+front door, not a replacement.
+
+**The built app** lands in `release/SUPER STRIKER '26-darwin-arm64/` as a
+~420 MB arm64 `.app`. It is **unsigned and un-notarised**, so the first launch
+needs right-click → *Open* (or *System Settings → Privacy & Security → Open
+Anyway*); after that it opens normally.
+
+**In the shell:** Esc is the game's pause, **⌘Q** quits, ⌘R reloads,
+⌘⇧F toggles fullscreen, ⌘⌥I opens DevTools, and the *Game* menu has a
+**Controller Test** item that jumps to the pad bench and back. The build is
+served over a private `ss26://` scheme rather than `file://`, because ES module
+scripts are blocked by CORS on file:// origins.
+
+### DualSense / DualShock button map
+
+Standard mapping, so the same indices serve an Xbox pad — only the glyphs
+change. The map lives in `src/input/input.ts` as `PAD_BINDINGS`, with
+`padGlyph(action, style)` and `padStyle()` for the menus.
+
+| Action | DualSense | Xbox | Index |
+|---|---|---|---|
+| Move | Left stick **or** D-pad | Left stick / D-pad | axes 0–1, buttons 12–15 |
+| Short pass / Pressure | **✕ Cross** | A | 0 |
+| Lofted pass / Cross / Header | **○ Circle** | B | 1 |
+| Shoot (hold to power) / Slide | **□ Square** | X | 2 |
+| Through ball | **△ Triangle** | Y | 3 |
+| Switch player | **L1** | LB | 4 |
+| Tactics quick-menu (hold) | **L2** | LT | 6 |
+| Sprint (hold) | **R2** | RT | 7 |
+| Instant replay | **Create** | Back | 8 |
+| Pause | **Options** | Start | 9 |
+| Instant replay (alias, PC only) | **Touchpad click** | — | 17 |
+
+R1 (5), L3/R3 (10/11) and the **PS button (16) are deliberately unbound** — the
+PS button is reserved by macOS and never reaches the page.
+
+### Two pads, 1v1
+
+Plug in or pair both pads, press a button on each so Chromium admits them
+(a gamepad stays invisible until it has seen a press while the window has
+focus), then pick **VERSUS**: pad 1 takes **P1 / home**, pad 2 **P2 / away**.
+With a single pad, **KICK-OFF** is one pad vs the CPU; **INVITE PLAYERS** lets
+you assign either pad to either seat by hand. A pad unplugged mid-match pauses
+the game rather than freezing its player.
+
+### What the Gamepad API cannot reach
+
+Rumble is real (`vibrationActuator` / `dual-rumble`, a named cue vocabulary in
+`src/input/input.ts`, rate-limited per pad and aimed at the seat that earned
+it). **Adaptive trigger resistance and the light bar are not exposed by the
+Gamepad API at all** — they would need WebHID and a hand-rolled DualSense
+output report, which this build deliberately does not do.
+
+On macOS a DualSense is usually claimed by Apple's Game Controller framework,
+which reports **16 buttons and no vendor/product ids** — detection falls back
+to the name, and the touchpad/PS rows simply are not there. Over USB (IOHID)
+you get the full 18 buttons and the hex ids. Both report `mapping: "standard"`.
+`pad.html` (`npm run app:pad`, or `/pad.html` in the browser) shows exactly
+which road a given pad took, live.
+
 ## Host it for a friend (Cloudflare tunnel)
 
 The build is fully static and self-contained (relative asset paths, zero CDN
@@ -143,6 +220,8 @@ Gamepads are auto-detected (standard mapping: LS move, A pass, B loft, X shoot,
 Y through, RT sprint, LB switch, Back replay, Start pause) — with **rumble**:
 kicks, tackles, the post, and goals all speak through the pad. Menus: WASD + J
 confirm, K back. On the full-time card, **L** replays the last goal.
+PS5/PS4 pads get Sony glyphs and their own table — see
+[Native app (macOS) + DualSense](#native-app-macos--dualsense).
 
 **Defending:** when the other side wins the ball you're automatically handed
 the best-placed defender (FIFA-style auto-switch — **Space** re-switches

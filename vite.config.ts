@@ -17,6 +17,9 @@ export default defineConfig({
         modellab: resolve(__dirname, 'modellab.html'),
         // guest controller page (§5.4.2) — inputs only, renders no gameplay
         join: resolve(__dirname, 'join.html'),
+        // controller bench (§5.4) — every connected pad, live, plus rumble
+        // tests; shipped in dist/ so it works inside the native shell too
+        pad: resolve(__dirname, 'pad.html'),
       },
     },
   },

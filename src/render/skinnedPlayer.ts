@@ -173,6 +173,32 @@ const ACTIONS: Partial<Record<ActionAnim, ActionDef>> = {
 
 const EMPTY: Pose = {};
 
+/**
+ * What a scripted scene asks of an actor for one frame (SkinnedPlayerMesh.cutscene).
+ *
+ * `clip` is a CLIP_TABLE row id. It must not name a clip that is also in the
+ * chain `chain` selects — three hands back ONE AnimationAction per clip, so an
+ * overlay and a chain entry sharing a row would be the same action fighting
+ * itself. In practice the presentation rows are overlays and the chain rows are
+ * cycles, and the two sets are disjoint by design.
+ */
+export interface ActorPose {
+  /** overlay clip id, or null to leave the body to the locomotion chain */
+  clip?: string | null;
+  /** crossfade seconds in and out (0.25–0.4 reads as a broadcast blend) */
+  fade?: number;
+  /** loop the overlay (default) or play it once and clamp */
+  loop?: boolean;
+  /** overlay playback rate */
+  rate?: number;
+  /** 0..1 start offset into the overlay's cycle, applied when it is entered */
+  phase?: number;
+  /** 0..1 how much of the body the overlay takes from the chain (default 1) */
+  weight?: number;
+  /** locomotion chain to move on (WALKOUT_CHAIN &c); null = the sim's own */
+  chain?: ClipId[] | null;
+}
+
 /** One locomotion clip, ready to be weighted into a blend chain. */
 interface LocoEntry {
   id: ClipId;
@@ -228,6 +254,23 @@ export class SkinnedPlayerMesh {
   private curAnim: ActionAnim = 'none';
   private curDef: ActionDef | null = null;
 
+  // ---- cutscene layer (§7 presentation). Two slots, not one, so swapping a
+  // scripted actor from `clap` to `cheer` is a CROSSFADE and not a cut: the
+  // outgoing action keeps its own weight and rides down while the new one
+  // comes up. The locomotion chain is weighted by (1 - the pair's total), so
+  // an overlay at full weight hides the idle completely and one at 0.6 leaves
+  // the man's stance showing through.
+  private cue: THREE.AnimationAction | null = null;
+  private cueId: string | null = null;
+  private cueW = 0;
+  private cueTarget = 0;
+  private cueFade = 0.3;
+  private cuePrev: THREE.AnimationAction | null = null;
+  private cuePrevW = 0;
+  /** chain a cutscene swapped in (WALKOUT_CHAIN &c); null = the sim's own */
+  private chainOverride: LocoEntry[] | null = null;
+  private chainKey: string | null = null;
+
   /** damped procedural state, so an overlay eases in instead of popping */
   private lean = 0;
   private roll = 0;
@@ -238,6 +281,8 @@ export class SkinnedPlayerMesh {
   private breathe: number;
 
   private starGlow: THREE.Mesh | null = null;
+  /** true on frames a cutscene is driving this mesh — see finish() */
+  private scripted = false;
   private tier = -1;
   /** near enough for a mixer tick every frame (SKINNED_NEAR_M) */
   private fullRate = true;
@@ -364,6 +409,7 @@ export class SkinnedPlayerMesh {
 
   update(dt: number, x: number, y: number, z: number, facing: number, speed: number,
     anim: ActionAnim, animT: number): void {
+    this.scripted = false;
     this.root.position.set(x, z, y);
     this.root.rotation.y = Math.PI / 2 - facing;
 
@@ -404,14 +450,30 @@ export class SkinnedPlayerMesh {
       this.act.setEffectiveWeight(this.actWeight);
     }
 
+    // A cutscene that has just handed back still owes a fade: the overlay clip
+    // it was holding rides out UNDER the sim's own animation rather than
+    // vanishing on the frame control changed hands (releaseCutscene).
+    this.fadeCue(dt);
+
     // ---- locomotion layer: find the pair of clips that brackets this speed,
     // crossfade between them, and play both at speed ÷ their blended natural
     // ground speed so the planted foot stays planted
     const locoSpeed = pose.loco ?? speed;
-    const locoW = 1 - this.actWeight;
+    const locoW = (1 - this.actWeight) * (1 - this.cueTotal());
     this.loco = this.pickChain(locoSpeed);
     if (this.loco.length >= 2) this.blendLoco(locoSpeed, locoW);
 
+    this.finish(dt, pose);
+  }
+
+  /**
+   * The bottom half of a frame, shared by the sim-driven path and the cutscene
+   * path: tick the mixer (at half rate for a distant player), ease the
+   * procedural trim toward whatever the pose asked for, and write the pivot.
+   * Split out so an actor being driven by a script gets exactly the same
+   * breathing, damping and bone overlay as one being driven by the match.
+   */
+  private finish(dt: number, pose: Pose): void {
     // ---- tick
     let ticked = true;
     if (this.fullRate) {
@@ -462,7 +524,13 @@ export class SkinnedPlayerMesh {
       }
     }
 
+    // The star ring is a GAMEPLAY AFFORDANCE — "this one is special" — in the
+    // same family as the switch arrow and the control ring the renderer hides
+    // while a scene is running. A gold halo pulsing under one man in a
+    // line-up, or under the scorer at the corner flag, reads as a HUD element
+    // that escaped onto the pitch, so it goes with them.
     if (this.starGlow) {
+      this.starGlow.visible = !this.scripted;
       const m = this.starGlow.material as THREE.MeshBasicMaterial;
       m.opacity = 0.35 + Math.abs(Math.sin(performance.now() * 0.004)) * 0.3;
       this.starGlow.rotation.z += dt * 0.8;
@@ -486,6 +554,9 @@ export class SkinnedPlayerMesh {
    * not by a guess about where the ball is.
    */
   private pickChain(locoSpeed: number): LocoEntry[] {
+    // a cutscene's chain outranks everything: on a walkout the keeper is a man
+    // in a line, not a goalkeeper
+    if (this.chainOverride) return this.chainOverride;
     if (!this.gkState) return this.chainOutfield;
     if (this.gkState === 'hold') {
       const hold = this.locoById.get('gkHold');
@@ -557,6 +628,157 @@ export class SkinnedPlayerMesh {
       e.action.setEffectiveWeight(w);
       e.action.setEffectiveTimeScale(i === 0 ? 1 : rate);
     }
+  }
+
+  // ------------------------------------------------------ cutscene actor API
+  //
+  // What a scripted scene (src/present) is allowed to do to a player, and
+  // nothing more: put him somewhere, point him somewhere, tell him how fast he
+  // is travelling, and lay a clip over the top. Position and facing are taken
+  // RAW — the script owns the easing, because a walk-to that damps its own
+  // heading and a camera keyframe that eases in time are the same kind of
+  // decision and belong in one place.
+  //
+  // Movement still goes through the ordinary blend chain, so `speed` has to be
+  // the real metres-per-second the actor covers this frame. That is the whole
+  // contract: hand it the truth and the feet plant themselves.
+
+  /**
+   * Drive this mesh from a script for one frame.
+   *
+   * `pose.clip` names a row in CLIP_TABLE (a ClipId; an unknown name is
+   * ignored rather than throwing, so a scene outlives a table edit). Passing
+   * null lets the locomotion chain have the body back.
+   */
+  cutscene(dt: number, x: number, y: number, facing: number, speed: number,
+    pose: ActorPose = {}): void {
+    this.scripted = true;
+    this.root.position.set(x, 0, y);
+    this.root.rotation.y = Math.PI / 2 - facing;
+
+    // the sim's one-shot layer is not in charge here; drop whatever it held
+    if (this.act) {
+      this.act.setEffectiveWeight(0);
+      this.act.stop();
+      this.act = null;
+      this.actClip = null;
+    }
+    this.curAnim = 'none';
+    this.curDef = null;
+    this.actWeight = 0;
+
+    this.setLocoChain(pose.chain ?? null);
+    this.setCue(pose.clip ?? null, pose.loop ?? true, pose.phase ?? 0);
+    this.cueFade = Math.max(pose.fade ?? 0.3, 1e-3);
+    this.cueTarget = this.cue ? THREE.MathUtils.clamp(pose.weight ?? 1, 0, 1) : 0;
+    this.fadeCue(dt);
+    if (this.cue) this.cue.setEffectiveTimeScale(pose.rate ?? 1);
+
+    this.loco = this.pickChain(speed);
+    if (this.loco.length >= 2) this.blendLoco(speed, 1 - this.cueTotal());
+
+    this.finish(dt, EMPTY);
+  }
+
+  /**
+   * Hand the mesh back to the sim. The overlay clip is NOT cut — it is left
+   * fading over `fade` seconds while update() drives the body again, which is
+   * what stops a released actor from snapping into a locomotion pose on the
+   * frame the scene ended.
+   */
+  releaseCutscene(fade = 0.35): void {
+    this.cueTarget = 0;
+    this.cueFade = Math.max(fade, 1e-3);
+    this.cueId = null;
+    this.setLocoChain(null);
+  }
+
+  /** How much of the body the cutscene layer owns right now, 0..1. */
+  private cueTotal(): number {
+    return THREE.MathUtils.clamp(this.cueW + this.cuePrevW, 0, 1);
+  }
+
+  /**
+   * Swap the locomotion chain for a cutscene (WALKOUT_CHAIN &c). Entries are
+   * minted lazily and cached, so the second walkout costs nothing, and the
+   * chain is re-sorted by MEASURED speed exactly like the sim's own — a strut
+   * that turns out to be slower than the walk cannot break the bracketing.
+   */
+  setLocoChain(ids: ClipId[] | null): void {
+    const key = ids ? ids.join(',') : null;
+    if (key === this.chainKey) return;
+    this.chainKey = key;
+    if (!ids) { this.chainOverride = null; return; }
+    const chain = ids
+      .map((id) => this.entry(id))
+      .filter((e): e is LocoEntry => e !== null)
+      .sort((a, b) => a.speed - b.speed);
+    // a chain of one cannot be blended against anything — keep the sim's
+    this.chainOverride = chain.length >= 2 ? chain : null;
+  }
+
+  /** Bring the cutscene overlay's weights to where they are heading. Linear
+   *  over `cueFade` seconds, because a crossfade you can time is worth more
+   *  than one that is asymptotically almost finished. */
+  private fadeCue(dt: number): void {
+    const step = dt / this.cueFade;
+    if (this.cueW < this.cueTarget) this.cueW = Math.min(this.cueTarget, this.cueW + step);
+    else if (this.cueW > this.cueTarget) this.cueW = Math.max(this.cueTarget, this.cueW - step);
+    if (this.cuePrev) {
+      this.cuePrevW = Math.max(0, this.cuePrevW - step);
+      if (this.cuePrevW <= 1e-3) {
+        this.cuePrev.setEffectiveWeight(0);
+        this.cuePrev.stop();
+        this.cuePrev = null;
+        this.cuePrevW = 0;
+      } else {
+        this.cuePrev.setEffectiveWeight(this.cuePrevW);
+      }
+    }
+    if (this.cue) {
+      if (this.cueW <= 1e-3 && this.cueTarget <= 0) {
+        this.cue.setEffectiveWeight(0);
+        this.cue.stop();
+        this.cue = null;
+        this.cueId = null;
+        this.cueW = 0;
+      } else {
+        this.cue.enabled = true;
+        this.cue.setEffectiveWeight(this.cueW);
+      }
+    }
+  }
+
+  /**
+   * Point the overlay slot at a clip. A change pushes the outgoing action into
+   * the second slot at its current weight so the two genuinely cross, and
+   * `phase` starts the new one part-way through its cycle — which is how
+   * eleven men clapping stop looking like one man copied eleven times.
+   */
+  private setCue(id: string | null, loop: boolean, phase: number): void {
+    if (id === this.cueId) return;
+    if (this.cue) {
+      // only one outgoing slot: a third clip inside one fade drops the oldest
+      this.cuePrev?.stop();
+      this.cuePrev = this.cue;
+      this.cuePrevW = this.cueW;
+    }
+    this.cue = null;
+    this.cueW = 0;
+    this.cueId = id;
+    if (!id) return;
+    const pc = this.rig.clip(id as ClipId);
+    if (!pc) { this.cueId = null; return; }
+    const a = this.mixer.clipAction(pc.clip);
+    a.reset();
+    a.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
+    a.clampWhenFinished = !loop;
+    a.enabled = true;
+    a.paused = false;
+    a.time = (phase % 1) * pc.clip.duration;
+    a.setEffectiveWeight(0);
+    a.play();
+    this.cue = a;
   }
 
   /** Swap the one-shot clip the action layer is holding. */

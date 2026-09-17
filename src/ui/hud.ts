@@ -1,15 +1,19 @@
-// Match HUD: score bug, clock, ticker (the always-correct commentator, §7.3),
-// power bars (one per seat), penalty reticle + shootout board, card banners,
-// replay dressing, goal banner, break/fulltime cards.
+// Match HUD: the gameplay furniture (ticker, power bars, nameplates, penalty
+// reticle + shootout board, card flash, break/full-time stats card) plus the
+// wiring that hands the television — score bug, lower thirds, wipes, replay
+// frame, line-ups — to the broadcast package in ./broadcast.ts.
+//
+// Split of responsibilities: anything a viewer at home would see on TV lives in
+// Broadcast; anything that exists because somebody is holding a controller
+// (power bars, nameplates, control hints, reticle) lives here.
 
 import { SEAT_SLOTS, slotTeam, type Match } from '../sim/match';
 import type { MatchEvent } from '../sim/matchEvents';
 import { GOAL_HALF_W, HALF_L, SHOT_MAX_HOLD } from '../sim/constants';
-import { overall } from '../data/loader';
 import { esc } from './escape';
 import { resolvedShirts } from '../render/playerMesh';
 import { controlsSetting, type ControlsSetting } from './prefs';
-import type { TeamData } from '../data/types';
+import { Broadcast, type CutKind } from './broadcast';
 
 /** One line of the match story shown on break/full-time cards. */
 interface StoryEntry {
@@ -21,24 +25,20 @@ interface StoryEntry {
 
 export class HUD {
   private root: HTMLElement;
-  private bugScore!: HTMLElement;
-  private bugClock!: HTMLElement;
+  /** The TV package: score bug, lower thirds, wipes, replay frame, line-ups. */
+  bc!: Broadcast;
   private ticker!: HTMLElement;
   private tickerQueue: string[] = [];
   private tickerBusy = false;
   private powerWraps: HTMLElement[] = [];
   private powerFills: HTMLElement[] = [];
   private nameplates: HTMLElement[] = [];
-  private goalBanner!: HTMLElement;
   private cardFlash!: HTMLElement;
   private card!: HTMLElement;
-  private wipe!: HTMLElement;
   private controlsCard!: HTMLElement;
   private reticle!: HTMLElement;
   private penBoard!: HTMLElement;
   private penHint!: HTMLElement;
-  private replayBug!: HTMLElement;
-  private prematch!: HTMLElement;
   private netToast!: HTMLElement;
   /** Persistent reconnect banner; outranks any transient flash. */
   private netHold: string | null = null;
@@ -53,7 +53,6 @@ export class HUD {
   private controlsBright = 0;
   /** The lone human's TEAM for context-aware hints; -1 when more than one. */
   private soloSeat = -1;
-  private prematchTimer = 8;
   /** Overrides the full-time prompt (tournament mode: J and K both continue). */
   fulltimeHint: string | null = null;
   /** Set by main: whether a goal clip exists for the L-to-rewatch FT prompt. */
@@ -73,7 +72,6 @@ export class HUD {
   }
 
   private build(): void {
-    const [home, away] = this.match.teams;
     const seats = this.match.seats;
     const filled: number[] = [];
     for (let s = 0; s < SEAT_SLOTS; s++) if (seats[s]) filled.push(s);
@@ -83,17 +81,6 @@ export class HUD {
       return kind === 'pad' ? 'GAMEPAD' : kind === 'remote' ? 'REMOTE' : 'KEYBOARD';
     };
     this.root.innerHTML = `
-      <div class="letterbox-top"></div>
-      <div class="letterbox-bot"></div>
-      <div class="replay-bug">REPLAY</div>
-      <div class="score-bug">
-        <div class="chip" style="background:${this.shirts[0]}"></div>
-        <div class="team">${home.data.code}</div>
-        <div class="score">0 - 0</div>
-        <div class="team">${away.data.code}</div>
-        <div class="chip" style="background:${this.shirts[1]}"></div>
-        <div class="clock">0'</div>
-      </div>
       <div class="ticker"></div>
       <div class="power-wrap p1"><div class="power-fill"></div></div>
       <div class="power-wrap p2"><div class="power-fill"></div></div>
@@ -103,17 +90,17 @@ export class HUD {
       <div class="nameplate np2"></div>
       <div class="nameplate np3"></div>
       <div class="nameplate np4"></div>
-      <div class="goal-banner">GOAL!</div>
       <div class="card-flash"></div>
       <div class="reticle"></div>
       <div class="pen-board"></div>
       <div class="pen-hint"></div>
       <div class="match-card"></div>
-      <div class="prematch">${this.prematchHtml()}</div>
       <div class="controls-card"></div>
       <div class="net-toast"></div>
-      <div class="wipe"></div>
     `;
+    // the TV package appends itself; it must outlive nothing above, so it is
+    // built AFTER the innerHTML assignment that would otherwise wipe it
+    this.bc = new Broadcast(this.root, this.match, this.shirts);
     this.controlsAttack = twoP
       ? `${filled.map((i) => `P${i + 1} ${dev(i)}`).join(' · ')} — PASS J/A · LOFT K/B · SHOOT L/X (hold) · THROUGH I/Y · SPRINT SHIFT/RT · REPLAY R/BACK · PAUSE ESC/START`
       : 'MOVE WASD · PASS J · LOFT K · SHOOT L (hold) · THROUGH I · SPRINT SHIFT · SWITCH SPACE · REPLAY R · PAUSE ESC';
@@ -122,46 +109,31 @@ export class HUD {
     this.controlsDefense = twoP
       ? '' : 'DEFENDING — SWITCH SPACE · CHASE hold J · SLIDE L · SPRINT SHIFT · REPLAY R · PAUSE ESC';
     if (!twoP) this.soloSeat = filled.length ? slotTeam(filled[0]) : -1;
-    this.bugScore = this.root.querySelector('.score')!;
-    this.bugClock = this.root.querySelector('.clock')!;
     this.ticker = this.root.querySelector('.ticker')!;
     this.powerWraps = [...this.root.querySelectorAll<HTMLElement>('.power-wrap')];
     this.powerFills = [...this.root.querySelectorAll<HTMLElement>('.power-fill')];
     this.nameplates = [...this.root.querySelectorAll<HTMLElement>('.nameplate')];
-    this.goalBanner = this.root.querySelector('.goal-banner')!;
     this.cardFlash = this.root.querySelector('.card-flash')!;
     this.card = this.root.querySelector('.match-card')!;
-    this.wipe = this.root.querySelector('.wipe')!;
     this.controlsCard = this.root.querySelector('.controls-card')!;
     this.controlsCard.textContent = this.controlsAttack;
     if (this.controlsMode === 'off') this.controlsCard.style.display = 'none';
     this.reticle = this.root.querySelector('.reticle')!;
     this.penBoard = this.root.querySelector('.pen-board')!;
     this.penHint = this.root.querySelector('.pen-hint')!;
-    this.replayBug = this.root.querySelector('.replay-bug')!;
-    this.prematch = this.root.querySelector('.prematch')!;
     this.netToast = this.root.querySelector('.net-toast')!;
-    if (this.match.mode === 'shootout') this.prematchTimer = 0;
-    this.prematch.classList.toggle('show', this.prematchTimer > 0);
   }
 
-  /** Pre-match tactics strip: styles + star men, the data made visible. */
-  private prematchHtml(): string {
-    const side = (t: TeamData): string => {
-      const idx = t === this.match.teams[0].data ? 0 : 1;
-      const star = this.match.teams[idx].players
-        .map((p) => p.data)
-        .reduce((a, b) => (b.star || (!a.star && overall(b) > overall(a)) ? b : a));
-      return `<div class="pm-side">
-        <div class="pm-team" style="border-color:${this.shirts[idx]}">${t.name.toUpperCase()}</div>
-        <div class="pm-info">${t.style.toUpperCase()} · ${t.formation} · ★ ${esc(star.name.split(' ').pop()?.toUpperCase() ?? '')}</div>
-      </div>`;
-    };
-    const mid = this.match.mode === 'golden'
-      ? '<div class="pm-vs golden">NEXT GOAL WINS</div>'
-      : '<div class="pm-vs">TACTICS</div>';
-    return side(this.match.teams[0].data) + mid + side(this.match.teams[1].data);
-  }
+  // ---------------------------------------------------- broadcast passthrough
+  // Thin wrappers so main.ts (and the cutscene agent) talk to one object.
+
+  /** Pre-match starting XI. `hold` 0 holds it until `hideLineups()`. */
+  showLineups(hold = 5): void { this.bc.showLineups(hold); }
+
+  hideLineups(): void { this.bc.hideLineups(); }
+
+  /** Every hard camera cut gets a broadcast wipe (camera agent's `onCut`). */
+  onCameraCut(kind: CutKind): void { this.bc.onCameraCut(kind); }
 
   // ------------------------------------------------- remote seat health (§5.4.5)
 
@@ -189,15 +161,13 @@ export class HUD {
     this.netToast.classList.toggle('show', text !== '');
   }
 
+  /** Letterbox + REPLAY corner bug, with a wipe on the way in and out. */
   setReplay(on: boolean, label = 'REPLAY'): void {
-    this.root.classList.toggle('replay-on', on);
-    if (on) this.replayBug.textContent = label;
+    this.bc.setReplay(on, label);
   }
 
   playWipe(): void {
-    this.wipe.classList.remove('go');
-    void this.wipe.offsetWidth;
-    this.wipe.classList.add('go');
+    this.bc.playWipe();
   }
 
   pushTicker(msg: string): void {
@@ -220,11 +190,11 @@ export class HUD {
   onEvent(e: MatchEvent): void {
     const m = this.match;
     const teamName = (idx: number): string => m.teams[idx].data.name.toUpperCase();
+    // the TV package takes every event first: it owns the bug, the lower
+    // thirds and every wipe that isn't the camera's
+    this.bc.onEvent(e);
     switch (e.type) {
       case 'goal': {
-        this.goalBanner.classList.remove('show');
-        void this.goalBanner.offsetWidth;
-        this.goalBanner.classList.add('show');
         this.pushTicker(e.ownGoal
           ? `${e.minute}' — OWN GOAL! ${e.scorerName} turns it into his own net!`
           : `${e.minute}' — GOOOAL! ${e.scorerName} scores for ${teamName(e.teamIdx)}!`);
@@ -251,17 +221,14 @@ export class HUD {
         this.pushTicker(`OFF THE WOODWORK! The frame says no.`);
         break;
       case 'corner':
+        // the wipe on this (and every other dead ball) belongs to the
+        // broadcast package now: it suppresses its own once the camera
+        // director starts announcing cuts, so nothing ever wipes twice
         this.corners[e.teamIdx]++;
         this.pushTicker(`${e.minute}' — Corner to ${teamName(e.teamIdx)}.`);
-        this.playWipe();
-        break;
-      case 'throwIn':
-      case 'goalKick':
-        this.playWipe();
         break;
       case 'offside':
         this.pushTicker(`${e.minute}' — Flag's up! ${e.playerName} strayed offside.`);
-        this.playWipe();
         break;
       case 'foul':
         this.fouls[e.teamIdx]++;
@@ -277,7 +244,6 @@ export class HUD {
       }
       case 'penaltyAwarded':
         this.pushTicker(`${e.minute}' — PENALTY to ${teamName(e.teamIdx)}!`);
-        this.playWipe();
         break;
       case 'penKick': {
         const msg = e.result === 'goal' ? `${e.takerName} buries it!`
@@ -325,7 +291,9 @@ export class HUD {
     if (!best || best.score < 3) return ''; // a goal or two big saves, minimum
     const surname = esc(best.name.split(' ').pop()?.toUpperCase() ?? '');
     const code = this.match.teams[best.teamIdx].data.code;
-    return `<div class="motm">★ MAN OF THE MATCH — <span style="color:${this.shirts[best.teamIdx]}">■</span> ${surname} (${code})</div>`;
+    return `<div class="motm">★ MAN OF THE MATCH`
+      + `<i class="mc-chip" style="background:${this.shirts[best.teamIdx]}"></i>${surname} `
+      + `<small>${esc(code)}</small></div>`;
   }
 
   private flashCard(color: 'yellow' | 'red'): void {
@@ -333,11 +301,55 @@ export class HUD {
     setTimeout(() => this.cardFlash.classList.remove('show'), 1600);
   }
 
+  /** The scoreline block both the stats card and the pause card wear. */
+  private scorelineHtml(): string {
+    const [h, a] = this.match.teams;
+    const side = (i: number, cls: string): string =>
+      `<div class="mc-side ${cls}" style="--tv-accent:${this.shirts[i]}">
+        <i></i><span>${esc(this.match.teams[i].data.name.toUpperCase())}</span>
+      </div>`;
+    return `<div class="scoreline">${side(0, 'home')}
+      <div class="mc-score">${h.score}<em>-</em>${a.score}</div>
+      ${side(1, 'away')}</div>`;
+  }
+
+  /** One stat row: value, label over a proportional two-tone bar, value. */
+  private statRow(label: string, hv: number, av: number, suffix = ''): string {
+    const total = hv + av;
+    const hpct = total > 0 ? (hv / total) * 100 : 50;
+    return `<div class="mc-row">
+      <b>${hv}${suffix}</b>
+      <div class="mc-mid"><span>${label}</span><div class="mc-bar">
+        <i style="width:${hpct.toFixed(1)}%;background:${this.shirts[0]}"></i>
+        <i style="width:${(100 - hpct).toFixed(1)}%;background:${this.shirts[1]}"></i>
+      </div></div>
+      <b>${av}${suffix}</b>
+    </div>`;
+  }
+
+  /** Cards row: the actual little rectangles, not a bar. */
+  private cardsRow(): string {
+    const pips = (i: number, right: boolean): string => {
+      const mine = this.story.filter((s) => s.teamIdx === i && s.icon !== 'goal' && s.icon !== 'og');
+      const y = mine.filter((s) => s.icon === 'yellow').length;
+      const r = mine.filter((s) => s.icon === 'red').length;
+      const body = '<u class="y"></u>'.repeat(y) + '<u class="r"></u>'.repeat(r);
+      return `<div class="mc-cards${right ? ' right' : ''}">${body}</div>`;
+    };
+    const count = (i: number): number =>
+      this.story.filter((s) => s.teamIdx === i && (s.icon === 'yellow' || s.icon === 'red')).length;
+    return `<div class="mc-row">
+      <b>${count(0)}</b>
+      <div class="mc-mid"><span>CARDS</span>
+        <div style="display:flex;gap:12px">${pips(0, false)}<div style="flex:1"></div>${pips(1, true)}</div>
+      </div>
+      <b>${count(1)}</b>
+    </div>`;
+  }
+
   private showCard(title: string): void {
     const [h, a] = this.match.teams;
     const total = h.possessionTicks + a.possessionTicks;
-    // no open play at all (shootout mode) reads 50/50, not 0%–100%
-    const hp = total ? Math.round((h.possessionTicks / total) * 100) : 50;
     const isFT = title === 'FULL-TIME';
     let hint = isFT
       ? (this.fulltimeHint ?? 'PRESS J FOR REMATCH · K FOR MENU')
@@ -345,28 +357,35 @@ export class HUD {
     if (isFT && this.canReplayGoal?.()) hint += ' · L WATCH THE GOAL';
     const board = this.match.penalty?.board;
     const pens = board && this.match.shootoutWinner !== null
-      ? `<div style="font-size:16px;color:#ffce4a;font-weight:800;margin-top:-8px;margin-bottom:10px">
-          ${this.match.teams[this.match.shootoutWinner].data.name.toUpperCase()} WIN ${board.scores[0]}–${board.scores[1]} ON PENALTIES</div>`
+      ? `<div class="mc-pens">${esc(this.match.teams[this.match.shootoutWinner].data.name.toUpperCase())}`
+        + ` WIN ${board.scores[0]}–${board.scores[1]} ON PENALTIES</div>`
       : '';
-    this.prematchTimer = 0;
-    this.prematch.classList.remove('show');
+    // possession is a real number the sim keeps (Team.possessionTicks); with no
+    // open play at all (a straight shootout) there is nothing to report, so the
+    // row is omitted rather than invented
+    const poss = total > 0
+      ? this.statRow('POSSESSION', Math.round((h.possessionTicks / total) * 100),
+          100 - Math.round((h.possessionTicks / total) * 100), '%')
+      : '';
+    this.bc.clearBands();
+    this.bc.hideLineups();
+    const heading = isFT
+      ? (this.match.mode === 'golden' ? 'GOLDEN GOAL' : 'FULL TIME')
+      : title === 'HALF-TIME' ? 'HALF TIME' : title;
     this.card.innerHTML = `
-      <h1>${isFT && this.match.mode === 'golden' ? 'GOLDEN GOAL!' : title}</h1>
-      <div class="scoreline">
-        <span style="color:${this.shirts[0]}">■</span> ${h.data.name}
-        ${h.score} - ${a.score}
-        ${a.data.name} <span style="color:${this.shirts[1]}">■</span>
-      </div>
+      <h1>${esc(heading)}</h1>
+      ${this.scorelineHtml()}
       ${pens}
       ${isFT ? this.motmHtml() : ''}
       ${this.storyHtml()}
-      <table>
-        <tr><td class="val">${hp}%</td><td class="stat">POSSESSION</td><td class="val">${100 - hp}%</td></tr>
-        <tr><td class="val">${h.shots}</td><td class="stat">SHOTS</td><td class="val">${a.shots}</td></tr>
-        <tr><td class="val">${h.shotsOnTarget}</td><td class="stat">ON TARGET</td><td class="val">${a.shotsOnTarget}</td></tr>
-        <tr><td class="val">${this.corners[0]}</td><td class="stat">CORNERS</td><td class="val">${this.corners[1]}</td></tr>
-        <tr><td class="val">${this.fouls[0]}</td><td class="stat">FOULS</td><td class="val">${this.fouls[1]}</td></tr>
-      </table>
+      <div class="mc-rows">
+        ${poss}
+        ${this.statRow('SHOTS', h.shots, a.shots)}
+        ${this.statRow('ON TARGET', h.shotsOnTarget, a.shotsOnTarget)}
+        ${this.statRow('CORNERS', this.corners[0], this.corners[1])}
+        ${this.statRow('FOULS', this.fouls[0], this.fouls[1])}
+        ${this.cardsRow()}
+      </div>
       <div class="hint">${hint}</div>
     `;
     this.card.classList.add('show');
@@ -400,14 +419,9 @@ export class HUD {
   }
 
   showPauseCard(): void {
-    const [h, a] = this.match.teams;
     this.card.innerHTML = `
       <h1>PAUSED</h1>
-      <div class="scoreline">
-        <span style="color:${this.shirts[0]}">■</span> ${h.data.name}
-        ${h.score} - ${a.score}
-        ${a.data.name} <span style="color:${this.shirts[1]}">■</span>
-      </div>
+      ${this.scorelineHtml()}
       <div class="hint">PRESS J TO RESUME · K TO QUIT</div>
     `;
     this.card.classList.add('show');
@@ -416,9 +430,9 @@ export class HUD {
   /** Per-frame HUD refresh. screenPos comes from the renderer. */
   update(dt: number, screenPos: (x: number, y: number, z: number) => { x: number; y: number; visible: boolean }): void {
     const m = this.match;
-    this.bugScore.textContent = `${m.teams[0].score} - ${m.teams[1].score}`;
+    // the score bug, the lower-third queue and the line-up hold all tick here
+    this.bc.update(dt);
     const inPens = m.phase === 'shootout' || m.phase === 'penalty';
-    this.bugClock.textContent = m.phase === 'shootout' ? 'PENS' : `${m.displayMinute()}'`;
 
     // shot power bars, one per seat slot (penalties charge through the same bar)
     for (let i = 0; i < SEAT_SLOTS; i++) {
@@ -492,10 +506,6 @@ export class HUD {
           this.controlsTimer <= 0 && this.controlsBright <= 0);
       }
     }
-    if (this.prematchTimer > 0) {
-      this.prematchTimer -= dt;
-      if (this.prematchTimer <= 0) this.prematch.classList.remove('show');
-    }
     // the reconnect banner ticks on real time: dt is 0 while the match is held
     if (this.netFlashTimer > 0) {
       this.netFlashTimer -= dt;
@@ -561,9 +571,11 @@ export class HUD {
   }
 
   destroy(): void {
+    // the package first: it clears the root classes it owns, then the HUD's own
+    // markup goes. Quitting mid-replay used to leave `replay-on` stuck on the
+    // shared root and the next match played letterboxed with a blinking bug.
+    this.bc.destroy();
     this.root.innerHTML = '';
-    // quitting mid-replay left this stuck on the shared root: the next match
-    // played letterboxed with a blinking REPLAY bug and no nameplates
     this.root.classList.remove('replay-on');
   }
 }

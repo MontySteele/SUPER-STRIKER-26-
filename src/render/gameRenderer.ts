@@ -1,6 +1,8 @@
 // Renderer orchestrator: syncs meshes from sim snapshots (interpolated),
-// records a replay ring buffer, runs the goal sequence (slow-mo celebration →
-// replay → back), confetti, switch indicator.
+// records a replay ring buffer, runs the live camera package (tele cam / set
+// pieces / cards) and the goal presentation (slow-mo of the line → tracking
+// celebration → crowd cutaway → three moving replay angles), confetti,
+// switch indicator.
 
 import * as THREE from 'three';
 import type { Match } from '../sim/match';
@@ -14,7 +16,7 @@ import { CharacterRig, charactersReady } from './characterAssets';
 import { SkinnedPlayerMesh, actionClipReport } from './skinnedPlayer';
 import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
-import { CameraDirector, type CamMode } from './camera';
+import { CameraDirector, type CamMode, type ModeOptions } from './camera';
 import { HALF_L } from '../sim/constants';
 
 interface Snap {
@@ -70,14 +72,43 @@ interface ReplayPass {
   mode: CamMode;
   rate: number;   // playback speed (1 = real time)
   from: number;   // start point as a fraction of the clip
+  /** end point as a fraction of the clip (default 1 = play it out) */
+  to?: number;
+  /** corner bug text; defaults to REPLAY / REPLAY · ANGLE n */
+  label?: string;
 }
 
-// The goal recap: full build-up from behind the goal, then the strike again
-// from pitch level in heavy slow-mo.
-const GOAL_PASSES: ReplayPass[] = [
-  { mode: 'replay', rate: 0.6, from: 0.2 },
-  { mode: 'replayLow', rate: 0.35, from: 0.62 },
+/**
+ * The goal recap, three MOVING rigs over the frozen clip (§7.2). Durations
+ * below are for the full 4s clip: 2.0s + 2.0s + 1.9s ≈ 5.9s, which is what
+ * the goalseq timeline budgets for it.
+ */
+const GOAL_REPLAY_PASSES: ReplayPass[] = [
+  { mode: 'goalCrane', rate: 1.00, from: 0.18, to: 0.68 }, // high crane, drifting
+  { mode: 'goalDolly', rate: 0.85, from: 0.52, to: 0.95 }, // low sideline dolly
+  { mode: 'ballCam', rate: 0.55, from: 0.74, to: 1.00 },   // chase the ball in
 ];
+
+/** On-demand replay of the last few seconds of open play. */
+const LIVE_PASSES: ReplayPass[] = [
+  { mode: 'cine', rate: 0.75, from: 0, to: 0.55 },
+  { mode: 'ballCam', rate: 0.55, from: 0.50, to: 1.0 },
+];
+
+// ----------------------------------------------------------- goal timeline
+// Seconds from the goal event. The sim gives us a 12.5s goalseq window
+// (updateGoalSeq) and any button skips, so everything has to land inside it
+// with a beat to spare.
+const GOAL_SLOWMO_END = 2.30;  // ball crossing the line, ~0.85s of clip at 0.38x
+const GOAL_CELEB_END = 5.00;   // tracking celebration cam with a push-in
+const GOAL_CROWD_END = 6.20;   // 1.2s crowd cutaway
+// 6.20 → ~12.1: the three moving replay angles, then hold on the celebration.
+
+/** Where the goal presentation is up to. Public so the cutscene layer can
+ *  tell when the camera is its to drive (only during 'celebration'). */
+export type GoalStage = 'slowmo' | 'celebration' | 'crowd' | 'replay' | 'hold';
+
+const clampUnit = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 export class GameRenderer {
   sceneMgr: SceneManager;
@@ -88,6 +119,15 @@ export class GameRenderer {
   charRig: CharacterRig | null = null;
   cam: CameraDirector;
   playerMeshes: PlayerView[] = [];
+  /**
+   * §7 presentation hook. Set by the cutscene layer (src/present), which owns
+   * everything behind it. Called once a frame with the render dt and whether a
+   * replay is rewinding time; returning true means "I have posed the player
+   * meshes and, if I brought a camera track, taken the rig" and this file
+   * leaves both alone for that frame. Deliberately a bare function so the
+   * renderer never learns what a cutscene is.
+   */
+  cutscene: ((dt: number, replaying: boolean) => boolean) | null = null;
   ballMesh: BallMesh;
   switchArrows: THREE.Mesh[];
   controlRings: THREE.Mesh[];
@@ -103,14 +143,34 @@ export class GameRenderer {
   private replayBuf: ReplayFrame[] = [];
   private replayAccum = 0;
   private goalSeqT = -1; // >= 0 while running the goal presentation
-  private goalReplayPending = false;
+  private goalStage: GoalStage | null = null;
   private passes: ReplayPass[] = [];
   private passIdx = 0;
   private passFrames: ReplayFrame[] = [];
   private replayIdx = 0;
+  private passFrom = 0;
+  private passTo = 1;
   private manualReplay = false; // user-triggered; main freezes the sim for us
   private lastGoalClip: { frames: ReplayFrame[]; side: number } | null = null;
   onReplayStateChange: ((on: boolean, label?: string) => void) | null = null;
+  /** Fires whenever the director hard-cuts, with a kind ('corner', 'replay',
+   *  'beauty', …). The broadcast package hangs its 0.6s wipe off this. */
+  get onCut(): ((kind: string) => void) | null { return this.cam.onCut; }
+  set onCut(fn: ((kind: string) => void) | null) { this.cam.onCut = fn; }
+  /** Fires on every goal-presentation stage change. */
+  onGoalStage: ((stage: GoalStage) => void) | null = null;
+
+  /**
+   * What the director WANTS to be in, as opposed to what mode the camera is
+   * actually in. The two differ whenever something outside (a cutscene) has
+   * taken the camera with setMode('external'); by only acting when our own
+   * intent changes we hand it back at the next real beat instead of fighting
+   * for the camera every frame.
+   */
+  private camIntent: CamMode | null = null;
+  private restartKey = '';
+  /** seconds of pre-match beauty crane still owed before the live package starts */
+  private beautyHold = 0;
 
   private confetti: THREE.Points | null = null;
   private confettiVel: Float32Array | null = null;
@@ -136,8 +196,13 @@ export class GameRenderer {
 
     buildPitch(this.sceneMgr.scene, this.lab, this.sceneMgr.profile);
     this.stadium = new Stadium(this.sceneMgr.scene, this.lab, timeOfDay, stadiumSize,
-      !this.sceneMgr.profile.retro, this.sceneMgr.profile, homeKit.shirt);
+      !this.sceneMgr.profile.retro, this.sceneMgr.profile, homeKit.shirt, awayKit.shirt);
     this.cam = new CameraDirector(this.sceneMgr.camera);
+    // the beauty crane has to clear the bowl it is orbiting, and a Mega Bowl
+    // is 50m deeper than a municipal one
+    const bowl = { municipal: [96, 40], national: [122, 58], mega: [150, 84] }[stadiumSize];
+    this.cam.beautyRadius = bowl[0];
+    this.cam.beautyHeight = bowl[1];
     this.ballMesh = new BallMesh(this.sceneMgr.scene);
 
     // §7A.2 players. The skinned path needs its GLBs in hand — it is built
@@ -309,8 +374,14 @@ export class GameRenderer {
       this.ringPulse[e.slot] = 0.3;
       return;
     }
+    // §7A.5: the crowd is a second commentator. Everything it needs is in the
+    // event feed already, so this is the whole wiring — the stands react to
+    // exactly what the ticker and the audio conductor react to, which is why
+    // they can never drift out of sync with the match.
+    this.stadium.crowdEvent(e);
     if (e.type === 'goal') {
       this.goalSeqT = 0;
+      this.goalStage = null;
       // celebration subject: the scorer's mesh — matched by shirt number,
       // since display names can be duplicated (roster editor, factory dupe)
       const scorer = e.ownGoal ? undefined : this.match.allPlayers.find(
@@ -321,15 +392,15 @@ export class GameRenderer {
       if (scorer) this.cam.subject.set(scorer.pos.x, 0, scorer.pos.y);
       else this.cam.subject.set(this.match.ball.pos.x, 0, this.match.ball.pos.y);
       this.cam.replayGoalSide = Math.sign(this.match.ball.pos.x) || 1;
-      this.cam.setMode('celebration');
       // freeze the clip now — the goal sequence recaps it, and the full-time
       // card can bring it back
       this.lastGoalClip = {
         frames: this.replayBuf.slice(Math.max(0, this.replayBuf.length - 4 * REPLAY_FPS)),
         side: this.cam.replayGoalSide,
       };
-      this.goalReplayPending = true;
       this.spawnConfetti(e.teamIdx);
+      // the timeline itself is driven from update(); entering stage 0 here
+      // would run a frame of slow-mo before the sim has even flagged goalseq
     }
   }
 
@@ -344,15 +415,36 @@ export class GameRenderer {
   private startPass(i: number): void {
     this.passIdx = i;
     const p = this.passes[i];
-    this.replayIdx = Math.floor(this.passFrames.length * p.from);
+    const last = Math.max(this.passFrames.length - 1, 1);
+    this.passFrom = clampUnit(p.from) * last;
+    this.passTo = Math.max(clampUnit(p.to ?? 1) * last, this.passFrom + 1);
+    this.replayIdx = this.passFrom;
+    this.cam.passT = 0;
     this.clearTrail(); // the angle cut rewinds time — no stale streak
-    this.cam.setMode(p.mode);
-    this.onReplayStateChange?.(true, i === 0 ? 'REPLAY' : `REPLAY · ANGLE ${i + 1}`);
+    // an angle change IS a cut, and a legal one: the ball is dead
+    this.camIntent = p.mode;
+    this.cam.setMode(p.mode, { cut: 'replay' });
+    this.onReplayStateChange?.(true,
+      p.label ?? (i === 0 ? 'REPLAY' : `REPLAY · ANGLE ${i + 1}`));
   }
 
   private clearPasses(): void {
     this.passes = [];
     this.passFrames = [];
+  }
+
+  /**
+   * The first pass of the goal package: the last ~0.85s before the ball
+   * crossed the line, at 0.38x, from behind the net. Built at runtime because
+   * how much footage exists depends on how early in the half the goal came.
+   */
+  private goalLinePass(frames: ReplayFrame[]): ReplayPass[] {
+    const last = Math.max(frames.length - 1, 1);
+    const pre = Math.min(0.85 * REPLAY_FPS, last - 1);
+    return [{
+      mode: 'goalLine', rate: 0.38, from: (last - pre) / last, to: 1,
+      label: 'SLOW MOTION',
+    }];
   }
 
   /** True while a user-triggered replay is playing (main freezes the sim). */
@@ -373,16 +465,17 @@ export class GameRenderer {
     if (this.manualReplay || this.passes.length > 0) return false;
     if (source === 'goal') {
       if (!this.lastGoalClip || this.lastGoalClip.frames.length < 20) return false;
+      const frames = this.lastGoalClip.frames;
       this.cam.replayGoalSide = this.lastGoalClip.side;
       this.manualReplay = true;
-      this.beginPasses(this.lastGoalClip.frames, GOAL_PASSES);
+      // the strike in slow-mo, then the three moving angles — ~8s, skippable
+      this.beginPasses(frames, [...this.goalLinePass(frames), ...GOAL_REPLAY_PASSES]);
     } else {
       if (this.replayBuf.length < 1.5 * REPLAY_FPS) return false;
       this.manualReplay = true;
-      // last ~4.5s at 0.6x ≈ 7.5s of wall clock — long enough to relive the
-      // moment, short enough that a frozen match doesn't feel hung
-      this.beginPasses(this.replayBuf.slice(-Math.floor(4.5 * REPLAY_FPS)),
-        [{ mode: 'cine', rate: 0.6, from: 0 }]);
+      // last ~3.6s over two moving angles ≈ 6s of wall clock — long enough to
+      // relive the moment, short enough that a frozen match doesn't feel hung
+      this.beginPasses(this.replayBuf.slice(-Math.floor(3.6 * REPLAY_FPS)), LIVE_PASSES);
     }
     return true;
   }
@@ -392,7 +485,8 @@ export class GameRenderer {
     if (!this.manualReplay) return;
     this.manualReplay = false;
     this.clearPasses();
-    this.cam.setMode('broadcast');
+    // let the phase machine re-pick the mode on the next frame
+    this.camIntent = null;
     this.onReplayStateChange?.(false);
   }
 
@@ -474,23 +568,196 @@ export class GameRenderer {
     this.sceneMgr.scene.add(this.confetti);
   }
 
+  // -------------------------------------------------------- live camera
+
+  /**
+   * What the tele cam needs that the ball position alone can't tell it: which
+   * way the play is travelling (so the frame can lead it) and how stretched
+   * it is (so the rig can back off a counter-attack and tighten on a scrap in
+   * the corner). Keepers are excluded — a keeper on his line 60m away would
+   * peg the spread at maximum for the whole match.
+   */
+  private feedPlayContext(ballX: number, ballY: number): void {
+    const v = this.match.ball.vel;
+    this.cam.play.vx = v.x;
+    this.cam.play.vy = v.y;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let n = 0;
+    for (const p of this.match.allPlayers) {
+      if (p.sentOff || p.isGK) continue;
+      const dx = p.pos.x - ballX;
+      const dy = p.pos.y - ballY;
+      if (dx * dx + dy * dy > 32 * 32) continue;
+      n++;
+      if (p.pos.x < minX) minX = p.pos.x;
+      if (p.pos.x > maxX) maxX = p.pos.x;
+      if (p.pos.y < minY) minY = p.pos.y;
+      if (p.pos.y > maxY) maxY = p.pos.y;
+    }
+    this.cam.play.spreadX = n >= 3 ? maxX - minX : 18;
+    this.cam.play.spreadY = n >= 3 ? maxY - minY : 14;
+  }
+
+  /**
+   * Ask for a camera mode, but only when OUR intent actually changes. That is
+   * what lets a cutscene hold the rig with setMode('external') without the
+   * phase machine snatching it back sixty times a second — it gets handed
+   * over again at the next real beat instead.
+   */
+  private want(m: CamMode, opt?: ModeOptions): void {
+    if (this.camIntent === m) return;
+    this.camIntent = m;
+    this.cam.setMode(m, opt);
+  }
+
+  /**
+   * The live shot list (§7.2). Dead balls are allowed a hard cut — which the
+   * broadcast package covers with a 0.6s wipe via onCut — and the way back
+   * into open play is always a long damped blend, never a cut.
+   */
+  private pickLiveCamera(dt: number): void {
+    if (this.beautyHold > 0) {
+      this.beautyHold -= dt;
+      return;
+    }
+    const ph = this.match.phase;
+    if (ph === 'penalty' || ph === 'shootout') {
+      this.cam.penaltySide = this.match.penalty?.goalSide ?? 1;
+      this.restartKey = '';
+      this.want('penalty', { cut: 'penalty' });
+      return;
+    }
+    if (ph === 'break' || ph === 'fulltime') {
+      this.restartKey = '';
+      this.want('beauty', { cut: 'beauty' });
+      return;
+    }
+    if (ph === 'kickoff') {
+      this.cam.setPiece = {
+        kind: 'kickoff', x: 0, y: 0,
+        attackDir: this.match.teams[this.match.kickoffTeam].attackDir,
+      };
+      if (this.restartKey !== 'kickoff') {
+        this.restartKey = 'kickoff';
+        this.camIntent = 'setpiece';
+        this.cam.setMode('setpiece', { cut: 'kickoff' });
+      }
+      return;
+    }
+    const r = ph === 'restart' ? this.match.restart : null;
+    if (r) {
+      // a fresh restart re-cuts even if the last one was also a corner; the
+      // key is the spot, so a second corner from the other flag gets its own
+      const key = `${r.kind}@${r.pos.x.toFixed(1)},${r.pos.y.toFixed(1)}`;
+      this.cam.setPiece = {
+        kind: r.kind, x: r.pos.x, y: r.pos.y,
+        attackDir: this.match.teams[r.teamIdx].attackDir,
+      };
+      if (key !== this.restartKey) {
+        this.restartKey = key;
+        this.camIntent = 'setpiece';
+        this.cam.setMode('setpiece', { cut: r.kind });
+      }
+      return;
+    }
+    this.restartKey = '';
+    this.want('broadcast', { blendIn: 1.2 });
+  }
+
+  /**
+   * Open on the stadium beauty crane and hold it for `seconds` before the
+   * live package takes the rig — the pre-match establishing shot, and what
+   * the attract match behind the menu runs on.
+   */
+  openOnBeauty(seconds = 6): void {
+    this.beautyHold = seconds;
+    this.camIntent = 'beauty';
+    this.cam.setMode('beauty', { cut: 'beauty' });
+  }
+
+  // ---------------------------------------------------- goal presentation
+
+  /**
+   * The goal package, on a fixed clock inside the sim's 12.5s goalseq window:
+   *
+   *   0.00 – 2.30  the ball crossing the line, 0.38x, from behind the net
+   *   2.30 – 5.00  celebration rig tracking cam.subject, low, pushing in
+   *   5.00 – 6.20  crowd cutaway into the near rake behind the scoring end
+   *   6.20 – ~12.1 three moving replay angles (crane → dolly → ball cam)
+   *   ~12.1 –      hold on the celebration until the sim kicks off again
+   *
+   * Every stage boundary is a cut, announced through onCut, and every stage
+   * is entered once — which is also what makes it safe for a cutscene to take
+   * the camera during 'celebration' and give it back at the next boundary.
+   */
+  private runGoalTimeline(): void {
+    if (this.goalStage === 'hold') return;
+    const t = this.goalSeqT;
+    const clip = this.lastGoalClip;
+    const haveClip = !!clip && clip.frames.length >= 8;
+    let want: GoalStage;
+    if (t < GOAL_SLOWMO_END) want = haveClip ? 'slowmo' : 'celebration';
+    else if (t < GOAL_CELEB_END) want = 'celebration';
+    else if (t < GOAL_CROWD_END) want = 'crowd';
+    else want = haveClip ? 'replay' : 'celebration';
+    if (want !== this.goalStage) this.enterGoalStage(want);
+  }
+
+  private enterGoalStage(stage: GoalStage): void {
+    this.goalStage = stage;
+    const clip = this.lastGoalClip;
+    switch (stage) {
+      case 'slowmo':
+        if (clip) {
+          this.cam.replayGoalSide = clip.side;
+          this.beginPasses(clip.frames, this.goalLinePass(clip.frames));
+        }
+        break;
+      case 'celebration':
+        this.clearPasses();
+        this.onReplayStateChange?.(false);
+        this.camIntent = 'celebration';
+        this.cam.setMode('celebration', { cut: 'celebration' });
+        break;
+      case 'crowd':
+        this.clearPasses();
+        this.onReplayStateChange?.(false);
+        this.camIntent = 'crowd';
+        this.cam.setMode('crowd', { cut: 'crowd' });
+        break;
+      case 'replay':
+        if (clip) {
+          this.cam.replayGoalSide = clip.side;
+          this.beginPasses(clip.frames, GOAL_REPLAY_PASSES);
+        }
+        break;
+      case 'hold':
+        this.clearPasses();
+        this.onReplayStateChange?.(false);
+        this.camIntent = 'celebration';
+        this.cam.setMode('celebration', { cut: 'celebration' });
+        break;
+    }
+    this.onGoalStage?.(stage);
+  }
+
   /** dtReal = wall-clock frame dt; alpha = interpolation between sim ticks. */
   update(dtReal: number, alpha: number): void {
     const inGoalSeq = this.match.phase === 'goalseq';
     if (inGoalSeq && this.goalSeqT >= 0) {
       this.goalSeqT += dtReal;
-      // 0–2.2s celebration orbit → multi-angle recap
-      if (this.goalSeqT > 2.2 && this.goalReplayPending && this.lastGoalClip) {
-        this.goalReplayPending = false;
-        this.beginPasses(this.lastGoalClip.frames, GOAL_PASSES);
-      }
+      this.runGoalTimeline();
     } else if (this.goalSeqT >= 0 && !inGoalSeq) {
-      // sequence over (or skipped) — back to broadcast (UI wipe covers the cut)
+      // sequence over (or skipped) — back to the live package (the phase
+      // machine below picks the mode; the UI wipe covers the cut)
       this.goalSeqT = -1;
-      this.goalReplayPending = false;
+      this.goalStage = null;
       if (!this.manualReplay) {
         this.clearPasses();
-        this.cam.setMode('broadcast');
+        this.camIntent = null;
         this.onReplayStateChange?.(false);
       }
     }
@@ -498,14 +765,17 @@ export class GameRenderer {
     this.feedKeeperState();
 
     const replaying = this.passes.length > 0;
+    const scripted = this.cutscene?.(dtReal, replaying) === true;
     let ballX: number, ballY: number, ballZ: number;
 
     if (replaying) {
       const pass = this.passes[this.passIdx];
-      this.replayIdx = Math.min(
-        this.replayIdx + dtReal * REPLAY_FPS * pass.rate,
-        this.passFrames.length - 1,
-      );
+      this.replayIdx = Math.min(this.replayIdx + dtReal * REPLAY_FPS * pass.rate, this.passTo);
+      // the moving rigs ride this: every canned move is expressed as a
+      // function of how far through its own pass it is, so a pass that is
+      // cut short still lands on a pose it was heading for
+      this.cam.passT = clampUnit((this.replayIdx - this.passFrom)
+        / Math.max(this.passTo - this.passFrom, 1e-6));
       // interpolate between the 30fps recorded frames — nearest-frame
       // stepping stutters badly at slow-mo rates
       const i0 = Math.floor(this.replayIdx);
@@ -516,6 +786,10 @@ export class GameRenderer {
       ballX = f0.ball[0] + (f1.ball[0] - f0.ball[0]) * frac;
       ballY = f0.ball[1] + (f1.ball[1] - f0.ball[1]) * frac;
       ballZ = f0.ball[2] + (f1.ball[2] - f0.ball[2]) * frac;
+      // the chase rig needs a heading, and the recorded clip is the only
+      // place the ball has one while the sim is frozen
+      this.cam.play.vx = (f1.ball[0] - f0.ball[0]) * REPLAY_FPS;
+      this.cam.play.vy = (f1.ball[1] - f0.ball[1]) * REPLAY_FPS;
       this.ballMesh.update(ballX, ballY, ballZ);
       // paused frames (dt 0) must not stack identical points into one
       // over-bright additive dot
@@ -532,7 +806,7 @@ export class GameRenderer {
         this.playerMeshes[i].update(dtReal * pass.rate, x, y, 0, s.facing + df * frac,
           s.speed + (s1.speed - s.speed) * frac, anim, animT);
       });
-      if (this.replayIdx >= this.passFrames.length - 1) {
+      if (this.replayIdx >= this.passTo - 1e-6) {
         if (this.passIdx < this.passes.length - 1) {
           this.startPass(this.passIdx + 1);
         } else {
@@ -540,17 +814,19 @@ export class GameRenderer {
           this.onReplayStateChange?.(false);
           if (this.manualReplay) {
             this.manualReplay = false;
-            this.cam.setMode('broadcast');
-          } else {
+            this.camIntent = null; // the phase machine takes it back
+          } else if (this.goalStage === 'replay') {
             // goal sequence: hold on the celebration until the sim moves on
-            this.cam.setMode('celebration');
+            this.enterGoalStage('hold');
+          } else {
+            this.camIntent = null;
           }
         }
       }
     } else {
-      // interpolated live rendering
+      // interpolated live rendering (a cutscene has already posed the meshes)
       const players = this.match.allPlayers;
-      for (let i = 0; i < players.length; i++) {
+      for (let i = 0; !scripted && i < players.length; i++) {
         const a = this.prevSnaps[i] ?? this.currSnaps[i];
         const b = this.currSnaps[i];
         const x = a.x + (b.x - a.x) * alpha;
@@ -569,6 +845,7 @@ export class GameRenderer {
       ballZ = this.prevBall[2] + (this.currBall[2] - this.prevBall[2]) * alpha;
       this.ballMesh.update(ballX, ballY, ballZ);
       if (this.trailPts.length) this.clearTrail();
+      this.feedPlayContext(ballX, ballY);
     }
 
     // switch indicators hover over each seat's controlled player (live play
@@ -580,7 +857,7 @@ export class GameRenderer {
       const arrow = this.switchArrows[i];
       const ring = this.controlRings[i];
       this.ringPulse[i] = Math.max(0, this.ringPulse[i] - dtReal);
-      if (ctrl && this.match.seats[i] && !replaying && inAction && !ctrl.sentOff) {
+      if (ctrl && this.match.seats[i] && !replaying && !scripted && inAction && !ctrl.sentOff) {
         arrow.visible = true;
         ring.visible = true;
         const bob = Math.sin(performance.now() * 0.006 + i * 2) * 0.08;
@@ -603,14 +880,9 @@ export class GameRenderer {
       this.playerMeshes[i].root.visible = !all[i].sentOff;
     }
 
-    // penalty / shootout camera
-    const penPhase = this.match.phase === 'penalty' || this.match.phase === 'shootout';
-    if (penPhase && this.cam.mode !== 'penalty') {
-      this.cam.penaltySide = this.match.penalty?.goalSide ?? 1;
-      this.cam.setMode('penalty');
-    } else if (!penPhase && this.cam.mode === 'penalty') {
-      this.cam.setMode('broadcast');
-    }
+    // the live camera package — skipped while a replay owns the rig, and
+    // while the goal timeline is running its own shot list
+    if (!replaying && this.goalSeqT < 0) this.pickLiveCamera(dtReal);
 
     // confetti physics (hidden while a replay rewinds time — celebration
     // confetti raining through the pre-goal build-up is anachronistic)
@@ -685,6 +957,25 @@ export class GameRenderer {
 
     // one composer.render() is many gl draws — autoReset would leave us
     // reading only the last pass
+    const info = this.sceneMgr.renderer.info;
+    const prevAutoReset = info.autoReset;
+    info.autoReset = false;
+    info.reset();
+    this.sceneMgr.render();
+    const stats = { drawCalls: info.render.calls, triangles: info.render.triangles };
+    info.autoReset = prevAutoReset;
+    return stats;
+  }
+
+  /**
+   * Draw one frame from wherever the DIRECTOR has the camera, rather than a
+   * pinned pose. This is how the shot list exercises the camera work itself
+   * (`"cam": "director"`): the pose is whatever the tele cam, the set-piece
+   * rig or the goal timeline chose after N deterministic sim frames, so the
+   * PNG is a test of the camera and not of a hand-typed vector.
+   */
+  renderStillLive(): { drawCalls: number; triangles: number } {
+    this.updateLOD();
     const info = this.sceneMgr.renderer.info;
     const prevAutoReset = info.autoReset;
     info.autoReset = false;
