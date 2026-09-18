@@ -10,6 +10,7 @@ import type { MatchEvent } from '../sim/matchEvents';
 import type { PlayerEntity, ActionAnim } from '../sim/player';
 import { SceneManager, type TimeOfDay } from './scene';
 import { buildPitch } from './pitch';
+import { Divots } from './divots';
 import { Stadium, type StadiumSize } from './stadium';
 import { PlayerMesh, PlayerRig, resolveKits } from './playerMesh';
 import { CharacterRig, charactersReady } from './characterAssets';
@@ -192,6 +193,9 @@ export class GameRenderer {
   private trailPts: [number, number, number][] = [];
   /** capture harness (§7A.9): when set, update() drives state but skips the draw */
   private skipDraw = false;
+  /** §7A.3c: the marks slide tackles leave on the turf. Null at RETRO, which
+   *  is the v1.1 pitch and did not have them. */
+  private divots: Divots | null = null;
 
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
@@ -205,6 +209,13 @@ export class GameRenderer {
     this.shirts = [homeKit.shirt, awayKit.shirt];
 
     buildPitch(this.sceneMgr.scene, this.lab, this.sceneMgr.profile);
+    // §7A.3c: the divot store has to exist before atmos.register() below — its
+    // material is Lambert, and a lit material that misses registration takes
+    // the non-CSM branch (and never gets its per-instance fade patch applied).
+    // RETRO is excluded for the same reason it has no shell turf.
+    if (!this.sceneMgr.profile.retro && this.sceneMgr.profile.divots > 0) {
+      this.divots = new Divots(this.sceneMgr.scene, this.lab, this.sceneMgr.profile);
+    }
     this.stadium = new Stadium(this.sceneMgr.scene, this.lab, timeOfDay, stadiumSize,
       !this.sceneMgr.profile.retro, this.sceneMgr.profile, homeKit.shirt, awayKit.shirt);
     this.cam = new CameraDirector(this.sceneMgr.camera);
@@ -419,6 +430,7 @@ export class GameRenderer {
     // exactly what the ticker and the audio conductor react to, which is why
     // they can never drift out of sync with the match.
     this.stadium.crowdEvent(e);
+    if (e.type === 'tackle') this.markTackle();
     if (e.type === 'goal') {
       this.goalSeqT = 0;
       this.goalStage = null;
@@ -442,6 +454,41 @@ export class GameRenderer {
       // the timeline itself is driven from update(); entering stage 0 here
       // would run a frame of slow-mo before the sim has even flagged goalseq
     }
+  }
+
+  /**
+   * §7A.3c: leave a scuff where a slide tackle happened.
+   *
+   * `{ type: 'tackle' }` carries NO payload — it is fired for a won slide, for
+   * a standing dispossession and for a defender's block, and the sim is not
+   * ours to change for a decal. So the renderer reads the position back out of
+   * the live match state: a divot is owed only if someone is actually in a
+   * slide animation at the moment the event lands, and the tackler is the
+   * sliding player nearest the ball (two men can be down at once in a box).
+   * Standing tackles and blocks find nobody sliding and leave no mark, which is
+   * the correct outcome rather than a missed one.
+   */
+  private markTackle(): void {
+    if (!this.divots) return;
+    const b = this.match.ball.pos;
+    let tackler: PlayerEntity | null = null;
+    let bestD = Infinity;
+    for (const p of this.match.allPlayers) {
+      if (p.actionAnim !== 'slide') continue;
+      const dx = p.pos.x - b.x, dy = p.pos.y - b.y;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; tackler = p; }
+    }
+    if (!tackler) return;
+    // the slide direction is the velocity while he is still travelling; once
+    // he has been pulled up by the friction in PlayerEntity.update, facing is
+    // the only record of the way he went in
+    let dx = tackler.vel.x, dy = tackler.vel.y;
+    if (Math.hypot(dx, dy) < 0.5) {
+      dx = Math.cos(tackler.facing);
+      dy = Math.sin(tackler.facing);
+    }
+    this.divots.add(tackler.pos.x, tackler.pos.y, dx, dy);
   }
 
   // ------------------------------------------------------------- replay passes
@@ -942,6 +989,11 @@ export class GameRenderer {
       if (this.confettiT > 6) this.removeConfetti();
     }
 
+    // §7A.3c: divots age on the WALL clock, not on the replay's clock — a mark
+    // laid down ninety seconds ago is ninety seconds old however many times the
+    // camera has rewound to look at it since
+    this.divots?.update(dtReal);
+
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
     if (!this.skipDraw) {
@@ -1030,6 +1082,8 @@ export class GameRenderer {
   dispose(): void {
     this.removeConfetti();
     this.clearTrail();
+    this.divots?.dispose();
+    this.divots = null;
     // the scene traversal in SceneManager frees whatever is attached to the
     // scene; the rig's shared geometries and the lab's texture caches are held
     // outside it and have to be freed by hand or a tournament strands them

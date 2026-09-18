@@ -422,6 +422,36 @@
       "cam": { "pos": [10, 22, 40], "look": [0, 1.0, -20], "fov": 34 },
       "cutscene": "break",
       "cutsceneSeconds": 6
+    },
+    {
+      "name": "shield_closeup",
+      "note": "BODY PLAY. Seed 99's first shield (§6.1) that has lasted 0.3s: the carrier has had a defender on his back the whole time and collision.ts has kept the pose-only 'shield' anim armed, so the damped torso/twist on Spine+Spine1 (skinnedPlayer.finish) has settled. Camera 3 m in front of the carrier and a little to his right at hip height, so the leaned-back trunk and turned shoulders read against the man behind him.",
+      "seed": 99,
+      "home": "cze",
+      "away": "ger",
+      "frames": 0,
+      "seek": { "playerAnim": "shield", "playerAnimT": 0.3 },
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": "keeper",
+      "camFacing": true,
+      "camOffset": [3.0, 1.1, 1.0],
+      "camAim": 1.0
+    },
+    {
+      "name": "tackle_divot",
+      "note": "TURF. Seed 99's first slide tackle 0.6s in: the sim's deferred 'tackle' event has fired (0.22s after the slide starts) and Divots (src/render/divots.ts) has put a scuff on the pitch along the slide direction, fully faded in by 0.25s. Camera behind and beside the slider, low, looking along the slide so the mark and the man are in one frame.",
+      "seed": 99,
+      "home": "cze",
+      "away": "ger",
+      "frames": 0,
+      "seek": { "playerAnim": "slide", "playerAnimT": 0.6 },
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": "keeper",
+      "camFacing": true,
+      "camOffset": [-7.0, 3.2, 3.5],
+      "camAim": 0.4
     }
   ]
 }

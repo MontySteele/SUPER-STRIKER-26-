@@ -96,6 +96,7 @@ try {
         const t = duration === null ? 0 : (duration * i) / frames;
         const q = new URLSearchParams({ angle: stripAngle, clip, capture: '1', t: String(t) });
         if (!args.label) q.set('label', '0');
+        if (model) q.set('model', model);
         await page.goto(`${base}/modellab.html?${q}`, { waitUntil: 'load' });
         await page.waitForFunction(() => window.__ss26ModelLab?.ready === true,
           null, { timeout: TIMEOUT_MS });

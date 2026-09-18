@@ -320,16 +320,6 @@ export class Atmosphere {
     });
   }
 
-  /**
-   * Every light in the rig that owns a shadow map, for SceneManager's explicit
-   * shadow pass (see SceneManager.drawShadows — three's automatic one cannot
-   * see the shadow-proxy layer).
-   */
-  shadowLights(): THREE.Light[] {
-    if (this.csm) return this.csm.lights as unknown as THREE.Light[];
-    return this.legacyKey ? [this.legacyKey] : [];
-  }
-
   /** Called once per drawn frame, before the composer runs. */
   update(): void {
     if (this.sky) this.sky.follow(this.camera);

@@ -41,6 +41,11 @@ export interface QualityProfile {
   grassShells: number;
   /** metres from the lens at which the shells have faded back into the plane */
   grassRadius: number;
+  /** slide-tackle scuffs kept on the pitch at once (§7A.3c, render/divots.ts);
+   *  0 = no divots. This is a RING BUFFER SIZE, not a spawn rate: the cost is
+   *  one instanced draw either way, so the number only decides how far back the
+   *  pitch remembers. */
+  divots: number;
 }
 
 const PROFILES: Record<QualityLevel, QualityProfile> = {
@@ -61,6 +66,9 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
     // one: doubling the radius roughly doubles the cost, while the eighth
     // layer costs a tenth of what the first one does.
     grassShells: 7, grassRadius: 30,
+    // 24 marks at ~90s each is roughly four minutes of tackling held on the
+    // pitch, which is longer than any passage of play a camera revisits.
+    divots: 24,
   },
   // the sensible step down: half the shadow resolution, one fewer cascade,
   // bloom at half res, FXAA. MEDIUM is what a machine that cannot hold HIGH
@@ -69,12 +77,15 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
     level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024,
     samples: 0, bloomScale: 0.5, aa: 'fxaa', grade: false, env: true,
     grassShells: 5, grassRadius: 18,
+    divots: 16,
   },
   retro: {
     level: 'retro', retro: true, cascades: 0, shadowMapSize: 2048,
     samples: 0, bloomScale: 1, aa: 'none', grade: true, env: false,
     // RETRO is the v1.1 renderer on purpose; it had a flat pitch and keeps one
     grassShells: 0, grassRadius: 0,
+    // ...and a pitch that never remembers a tackle, for the same reason
+    divots: 0,
   },
 };
 

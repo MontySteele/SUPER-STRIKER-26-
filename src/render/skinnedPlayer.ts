@@ -217,11 +217,13 @@ const ACTIONS: Partial<Record<ActionAnim, ActionDef>> = {
   // running, the sim gives it no action lock, and any one-shot would take the
   // body off the locomotion layer and cost him the step the shield exists to
   // protect. So it is pose-only: the torso turns and leans back into the man
-  // behind while the legs keep the ball moving. `dur` mirrors the sim's 0.42s
-  // default; collision.ts re-arms it every time it lapses.
+  // behind while the legs keep the ball moving. `dur` mirrors the sim's 0.5s
+  // shield window (PlayerEntity.update); collision.ts re-arms it every tick the
+  // defender is still on his back, and SHIELD_HOLD below bridges the frames
+  // where he is not so the torso does not saw back and forth.
   shield: {
-    dur: 0.42,
-    pose: () => ({ torso: -0.2, twist: 0.42, arms: 0.16 }),
+    dur: 0.5,
+    pose: () => ({ torso: 0.22, twist: 0.42, arms: 0.16 }),
   },
 
   // stand-in: crouch over the ball
@@ -249,6 +251,13 @@ const ACTIONS: Partial<Record<ActionAnim, ActionDef>> = {
 };
 
 const EMPTY: Pose = {};
+/**
+ * Seconds the shield posture outlives the sim's 'shield' anim. The sim re-arms
+ * the anim every tick the defender is genuinely in the way and drops it the
+ * tick he is not, and a presser leaning off and back on again would otherwise
+ * have the carrier's torso snapping upright and back down with him.
+ */
+const SHIELD_HOLD = 0.3;
 
 /**
  * What a scripted scene asks of an actor for one frame (SkinnedPlayerMesh.cutscene).
@@ -354,6 +363,10 @@ export class SkinnedPlayerMesh {
   private lift = 0;
   private arms = 0;
   private headPitch = 0;
+  private torso = 0;
+  private twist = 0;
+  /** seconds of shield posture still owed after the sim's anim lapsed */
+  private shieldHold = 0;
   private actYaw = 0;
   private breathe: number;
 
@@ -524,7 +537,19 @@ export class SkinnedPlayerMesh {
     const u = def ? Math.min(animT / def.dur, 1) : 0;
     // the procedural pose is the STAND-IN: if the clip resolved, it is what
     // plays, and nothing bends the root on top of it
-    const pose = def?.pose && !this.act ? def.pose(u) : EMPTY;
+    let pose = def?.pose && !this.act ? def.pose(u) : EMPTY;
+    // the shield posture is held past the anim so a defender bouncing on and
+    // off the carrier's back reads as one sustained hold-off, not a twitch
+    if (anim === 'shield') {
+      this.shieldHold = SHIELD_HOLD;
+    } else if (this.shieldHold > 0 && anim === 'none') {
+      this.shieldHold = Math.max(this.shieldHold - dt, 0);
+      const w = this.shieldHold / SHIELD_HOLD;
+      const held = ACTIONS.shield?.pose?.(1) ?? EMPTY;
+      pose = { torso: (held.torso ?? 0) * w, twist: (held.twist ?? 0) * w, arms: (held.arms ?? 0) * w };
+    } else {
+      this.shieldHold = 0;
+    }
 
     // Weight the one-shot clip in fast and out slow. The two ends are
     // symmetric in seconds, not in fractions, so a 3s celebration and a 0.42s
@@ -591,6 +616,8 @@ export class SkinnedPlayerMesh {
     this.lift += ((pose.lift ?? 0) - this.lift) * k;
     this.arms += ((pose.arms ?? 0) - this.arms) * k;
     this.headPitch += ((pose.head ?? 0) - this.headPitch) * k;
+    this.torso += ((pose.torso ?? 0) - this.torso) * k;
+    this.twist += ((pose.twist ?? 0) - this.twist) * k;
     // the mocap actor is turned this far off his run-up on the contact frame;
     // take it back out, weighted with the clip, so the strike points where the
     // sim aimed
@@ -621,6 +648,22 @@ export class SkinnedPlayerMesh {
       if (Math.abs(this.headPitch) > 0.01 && b.head) {
         const side = new THREE.Vector3(1, 0, 0).applyQuaternion(this.root.quaternion);
         rotateBoneWorld(b.head, side, this.headPitch);
+      }
+      // Torso and twist go on the spine, not the root: the legs underneath
+      // keep their locomotion cycle and only the trunk bends. Split across
+      // Spine and Spine1 when both exist so the bend reads as a curve rather
+      // than a hinge at the belt. The character faces its local +Z, so its
+      // right-hand side is -X and a turn "toward his right" is a negative
+      // rotation about up.
+      if ((Math.abs(this.torso) > 0.01 || Math.abs(this.twist) > 0.01) && b.spine) {
+        const side = new THREE.Vector3(1, 0, 0).applyQuaternion(this.root.quaternion);
+        const up = new THREE.Vector3(0, 1, 0);
+        const bones = b.spine1 ? [b.spine, b.spine1] : [b.spine];
+        const share = 1 / bones.length;
+        for (const bone of bones) {
+          rotateBoneWorld(bone, side, -this.torso * share);
+          rotateBoneWorld(bone, up, -this.twist * share);
+        }
       }
     }
 

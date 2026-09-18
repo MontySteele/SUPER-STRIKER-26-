@@ -58,6 +58,19 @@ export interface ShotSeek {
   keeperClip?: string;
   /** a keeper playing this ActionAnim */
   keeperAnim?: string;
+  /**
+   * ANY player playing this ActionAnim — the outfield counterpart of
+   * keeperAnim, for the body-play poses ('shield', 'trap') that have no
+   * keeper and no fixed frame. The man matched becomes the subject.
+   */
+  playerAnim?: string;
+  /**
+   * ...and has been playing it for at least this long (seconds). A shield is
+   * re-armed every tick the defender is still on the carrier's back, so this
+   * is "a hold-off that has lasted", which is what a still of one needs —
+   * rolling on with `after` instead lands on the pass that ended it.
+   */
+  playerAnimT?: number;
   /** seconds to roll on after the moment is first seen */
   after?: number;
   /** give up (and fail the shot) after this many ticks */
@@ -91,6 +104,13 @@ export interface ShotSpec {
   camOffset?: [number, number, number];
   /** `cam: "keeper"` only: height on the keeper the camera looks at (default 1). */
   camAim?: number;
+  /**
+   * `cam: "keeper"` only. Express camOffset in the SUBJECT'S facing frame
+   * instead of by pitch end: inward = metres in front of him, across = to his
+   * right. What a body-play shot wants — the carrier's face and the defender
+   * on his back are in frame no matter which way the move happens to point.
+   */
+  camFacing?: boolean;
   /** roll to a described moment instead of a tick count (see ShotSeek) */
   seek?: ShotSeek;
   /** director shots only: force a mode (e.g. 'beauty') before the extra roll */
@@ -161,6 +181,14 @@ function seekHit(match: Match, s: ShotSeek): PlayerEntity | boolean {
       && (s.keeperAnim === undefined || b.keeper.actionAnim === s.keeperAnim));
     return brain ? brain.keeper : false;
   }
+  if (s.playerAnim !== undefined) {
+    for (const t of match.teams) {
+      const p = t.players.find((q) => q.actionAnim === s.playerAnim
+        && q.actionAnimT >= (s.playerAnimT ?? 0));
+      if (p) return p;
+    }
+    return false;
+  }
   return pen ? pen.keeper : true;
 }
 
@@ -175,6 +203,14 @@ function nearestKeeper(match: Match): PlayerEntity {
 /** A camera parked at a fixed offset off one keeper, mirrored by his end. */
 function keeperPose(shot: ShotSpec, k: PlayerEntity): CamPose {
   const [inward, up, across] = shot.camOffset ?? [6, 1.7, 6];
+  if (shot.camFacing) {
+    const fx = Math.cos(k.facing), fy = Math.sin(k.facing);
+    return {
+      pos: [k.pos.x + fx * inward - fy * across, up, k.pos.y + fy * inward + fx * across],
+      look: [k.pos.x, shot.camAim ?? 1.0, k.pos.y],
+      fov: 36,
+    };
+  }
   const side = Math.sign(k.pos.x) || 1;
   return {
     pos: [k.pos.x - side * inward, up, k.pos.y + across],

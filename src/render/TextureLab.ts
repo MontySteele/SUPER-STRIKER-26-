@@ -912,6 +912,130 @@ export class TextureLab {
   }
 
   /**
+   * The slide-tackle scuff (§7A.3c, render/divots.ts): one gouge, drawn along
+   * +U, worn by every divot instance on the pitch.
+   *
+   * SHAPE. A slide does not leave a stripe of even width. The boot digs in at
+   * the heel, the studs peel the mat back over the next half-metre, and the
+   * mark thins to nothing as the player's weight comes off it — so the width
+   * profile ramps hard over the first fifth of the texture and then decays,
+   * which is what makes an instance read as "something moved through here"
+   * rather than as a rectangle someone painted on the grass.
+   *
+   * COLOUR AND ALPHA CARRY DIFFERENT THINGS. Alpha is coverage: how much turf
+   * is actually gone. Colour is what is underneath, and it is not one colour —
+   * the middle is wet soil and the rim is TORN TURF, the pale straw-green of
+   * roots and stalk pulled sideways and left lying. That rim is a couple of
+   * centimetres wide in the world and it is the whole difference between a
+   * divot and a dirty smudge, so it gets its own colour ramp keyed off the
+   * same coverage that fades the alpha out.
+   *
+   * The noise is a LOCAL hash, not the lab's dressing stream: consuming
+   * `dressRng` here would reshuffle every kit and every crowd in the game to
+   * pay for one 256x64 map.
+   */
+  scuffTexture(): THREE.CanvasTexture {
+    return this.cached('scuff', 'tackle scuff', () => {
+      // 4:1, which is the aspect the quad is drawn at (~2.0m x 0.45m). The map
+      // is never seen closer than a boot away and is stretched along its
+      // length by the instance, so 256 across the long axis is already finer
+      // than the pitch's own macro albedo under it.
+      const W = 256, H = 64;
+      const [c, ctx] = canvas2d(W, H);
+      const img = ctx.createImageData(W, H);
+      const px = img.data;
+
+      const hash = (i: number, j: number): number => {
+        const s = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
+        return s - Math.floor(s);
+      };
+      const noise = (x: number, y: number): number => {
+        const i = Math.floor(x), j = Math.floor(y);
+        const fx = x - i, fy = y - j;
+        const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+        const a = hash(i, j) + (hash(i + 1, j) - hash(i, j)) * sx;
+        const b = hash(i, j + 1) + (hash(i + 1, j + 1) - hash(i, j + 1)) * sx;
+        return a + (b - a) * sy;
+      };
+
+      // Three materials, inside out: a NARROW soil gouge where the hip and
+      // the trailing boot actually cut the mat, a halo of dry flattened grass
+      // around it (paler and yellower than the turf, broken up so the pitch
+      // shows through), and a few stud-drag streaks. The first cut of this
+      // map was one soft dark ellipse, and from any broadcast camera it read
+      // as a shadow that had lost its owner.
+      const SOIL = [0.30, 0.215, 0.135];
+      const DRY = [0.62, 0.60, 0.33];
+
+      const smooth = (e0: number, e1: number, x: number): number => {
+        const t = clamp01((x - e0) / (e1 - e0));
+        return t * t * (3 - 2 * t);
+      };
+
+      for (let y = 0; y < H; y++) {
+        // -1 .. 1 across the mark
+        const v = ((y + 0.5) / H) * 2 - 1;
+        for (let x = 0; x < W; x++) {
+          const u = (x + 0.5) / W; // 0 at the heel, 1 at the toe
+          // ramp in over the first fifth, then decay: the heel is the deepest
+          // part of a slide and the tail is where the weight came off
+          const along = Math.min(1, u / 0.17) * (1 - u) ** 0.6;
+          // Ragged edges as TWO wanders that are functions of u alone, one per
+          // side, so the mark stays centred and inside the map (see the git
+          // history of this bake for why a noise sampled at (u, v) does not).
+          const eA = 0.34 + 0.30 * noise(u * 8.5, 3.7);
+          const eB = 0.34 + 0.30 * noise(u * 8.5, 9.1);
+          const haloHalf = along * (v < 0 ? eA : eB);          // ≤ 0.64
+          const coreHalf = along * (0.075 + 0.05 * noise(u * 14, 5.5));
+          const a = Math.abs(v);
+
+          // the gouge: hard-edged, wobbling along its length
+          const wob = 0.06 * (noise(u * 6, 17.2) - 0.5);
+          const core = smooth(coreHalf + 0.02, coreHalf - 0.02, a - wob);
+          // the halo: crisp outline, then streaky along u so blades show
+          // through — a flattened patch is not a solid stain
+          let halo = smooth(haloHalf + 0.03, haloHalf - 0.03, a);
+          const streak = noise(u * 30, v * 7 + 11.3) * 0.6 + noise(u * 90, v * 3 + 41.7) * 0.4;
+          halo *= smooth(0.34, 0.70, streak);
+          // stud drags: three thin dark lines wandering along the mark
+          let drag = 0;
+          for (let k = 0; k < 3; k++) {
+            const off = (k - 1) * 0.22 + 0.10 * (noise(u * 5, 23.1 + k * 7.7) - 0.5);
+            const w = 0.028;
+            drag = Math.max(drag, smooth(w, w * 0.4, Math.abs(v - off)) * smooth(0.25, 0.55, noise(u * 20, 61 + k * 3)));
+          }
+          drag *= along * smooth(0.02, 0.2, a - coreHalf);   // only outside the gouge
+
+          // composite: soil over dry grass, drags on top of the halo
+          const soilW = Math.max(core, drag * 0.7);
+          const cov = Math.max(soilW * 0.95, halo * 0.55);
+          const mix = cov > 1e-4 ? (soilW * 0.95) / cov : 0;
+          const r = DRY[0] + (SOIL[0] - DRY[0]) * mix;
+          const g = DRY[1] + (SOIL[1] - DRY[1]) * mix;
+          const b = DRY[2] + (SOIL[2] - DRY[2]) * mix;
+
+          const i = (y * W + x) * 4;
+          px[i] = Math.round(clamp01(r) * 255);
+          px[i + 1] = Math.round(clamp01(g) * 255);
+          px[i + 2] = Math.round(clamp01(b) * 255);
+          px[i + 3] = Math.round(clamp01(cov) * 255);
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      // the mark is seen edge-on from every broadcast camera there is
+      tex.anisotropy = maxAnisotropy();
+      // CLAMP, both axes: a decal that wraps tiles its own torn edge back onto
+      // itself at the seam, which reads as two divots end to end
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    });
+  }
+
+  /**
    * One LED board: the message repeated end to end so the texture can be
    * scrolled on wrapS without the text ever tearing at the seam.
    */
