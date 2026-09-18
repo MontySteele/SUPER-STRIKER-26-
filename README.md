@@ -410,7 +410,15 @@ npm run shoot-player -- --team arg   # four studio angles of one player model
 ```
 
 The shot contract lives in `src/tools/shots.json`; editing a seed, a frame
-count or a pose invalidates every baseline taken before it. The game itself
+count or a pose invalidates every baseline taken before it. Prefer a `seek`
+over a hand-typed `frames` count for anything that depends on what the sim
+does: a seek says what the shot is OF (`keeperState`/`keeperClip`/`keeperAnim`
+for a keeper, `playerAnim` + `playerAnimT` for any man holding an anim for at
+least that long, `nearGoal` and `crowd`/`crowdRadius` for a goalmouth moment,
+`penKick`/`penPhase` for a shootout) and the roll finds it, so the shot
+survives the sim being worked on. `cam: "keeper"` then frames the man the seek
+matched, with `camOffset` mirrored by his end of the pitch or, with
+`camFacing: true`, expressed in front of / to the right of his facing. The game itself
 enters capture mode via `index.html?capture=<shot>` (menus, attract mode and
 audio are bypassed), and `viewer.html?team=bra&angle=side` is the standalone
 character viewer — open it with no `angle` for a live turntable.

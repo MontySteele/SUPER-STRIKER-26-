@@ -9,6 +9,7 @@
 // the frame count, the camera pose, and — via installDeterministicEnv — the
 // render layer's Math.random and wall clock.
 
+import { HALF_L } from '../sim/constants';
 import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import type { CamMode } from '../render/camera';
@@ -71,6 +72,19 @@ export interface ShotSeek {
    * rolling on with `after` instead lands on the pass that ended it.
    */
   playerAnimT?: number;
+  /**
+   * ...and is within this many metres of either goal line (|x| >= HALF_L -
+   * nearGoal). 'shoot' fires from forty metres out as well as from the six;
+   * a goalmouth shot wants the six.
+   */
+  nearGoal?: number;
+  /**
+   * ...and has at least this many players (both sides, keepers included)
+   * within `crowdRadius` metres of the ball — the "bodies in the box" a
+   * scramble is made of.
+   */
+  crowd?: number;
+  crowdRadius?: number;
   /** seconds to roll on after the moment is first seen */
   after?: number;
   /** give up (and fail the shot) after this many ticks */
@@ -184,8 +198,16 @@ function seekHit(match: Match, s: ShotSeek): PlayerEntity | boolean {
   if (s.playerAnim !== undefined) {
     for (const t of match.teams) {
       const p = t.players.find((q) => q.actionAnim === s.playerAnim
-        && q.actionAnimT >= (s.playerAnimT ?? 0));
-      if (p) return p;
+        && q.actionAnimT >= (s.playerAnimT ?? 0)
+        && (s.nearGoal === undefined || Math.abs(q.pos.x) >= HALF_L - s.nearGoal));
+      if (!p) continue;
+      if (s.crowd !== undefined) {
+        const r = s.crowdRadius ?? 14;
+        const b = match.ball.pos;
+        const n = match.allPlayers.filter((q) => Math.hypot(q.pos.x - b.x, q.pos.y - b.y) <= r).length;
+        if (n < s.crowd) continue;
+      }
+      return p;
     }
     return false;
   }

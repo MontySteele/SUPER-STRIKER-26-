@@ -15,25 +15,32 @@
     },
     {
       "name": "goalmouth_scramble",
-      "note": "Frame 986 of seed 8230: a German shot being struck on the edge of the six with a Czech defender sliding in and the keeper set — 9 bodies inside 14m of the ball. Camera behind the west goal, shooting through the net past the keeper.",
+      "note": "Seed 8230's first shot struck inside 16m of a goal line with at least 8 bodies inside 14m of the ball (t≈32.5s: a German shot from the edge of the box, 9 men in frame). Was frame 986 hand-typed; the sim moved and left the camera looking at an empty box, so it is a seek now. Camera 22m beyond the shooter toward the goal end he is attacking (mirrored by end, not by his facing: a man turning onto a shot faces anywhere), 6m up, shooting back through the net past the keeper.",
       "seed": 8230,
       "home": "cze",
       "away": "ger",
-      "frames": 986,
+      "frames": 0,
+      "seek": { "playerAnim": "shoot", "nearGoal": 16, "crowd": 8, "crowdRadius": 14 },
       "timeOfDay": "day",
       "stadium": "national",
-      "cam": { "pos": [-63, 6, 1], "look": [-44, 1.5, 3.6], "fov": 36 }
+      "cam": "keeper",
+      "camOffset": [-22, 6, 2],
+      "camAim": 1.5
     },
     {
       "name": "celebration_closeup",
-      "note": "Seed 22343 scores at frame 1706 (Goretzka, 1'). 54 frames later he is mid-celebrate at (-46.1, 6.2) under falling confetti — a real goal celebration, not a posed close-up.",
+      "note": "Seed 22343's first goal (t≈73s, Havertz), 2.6s into the scorer's celebrate anim — past the goal package's 2.3s replay, which owns the frame until then — a real goal celebration, not a posed close-up. Was frame 1760 hand-typed against a goal at frame 1706; the sim moved the goal and the shot framed grass, so it is a seek now, with the camera 3.8m in front of the scorer along his facing at head height.",
       "seed": 22343,
       "home": "cze",
       "away": "ger",
-      "frames": 1760,
+      "frames": 0,
+      "seek": { "playerAnim": "celebrate", "playerAnimT": 2.6 },
       "timeOfDay": "night",
       "stadium": "mega",
-      "cam": { "pos": [-43, 1.95, 8.4], "look": [-46.1, 1.35, 6.2], "fov": 36 }
+      "cam": "keeper",
+      "camFacing": true,
+      "camOffset": [3.8, 1.95, 1.0],
+      "camAim": 1.35
     },
     {
       "name": "stadium_establishing",
