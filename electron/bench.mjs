@@ -42,8 +42,13 @@ const label = arg('label', 'bench');
 const situations = arg('situations', '1');
 const secs = arg('secs');
 const quality = arg('quality');
+// `--burst 16x12` — more, longer burst chunks, so the MIN column has something
+// clean to find on a machine that is busy with something else
+const burst = arg('burst');
 // 'fixed' (default): the comparable 1920x1080@2 frame. 'window': whatever this
-// machine's window really draws, for a sanity check against the panel.
+// machine's window really draws, for a sanity check against the panel. 'off':
+// do not pin at all — the adaptive-resolution valve stays live, which is the
+// only mode that measures the frame a PLAYER gets.
 const pin = arg('pin');
 // one-setting A/B against the real GPU, e.g. --profile samples:0
 const profile = arg('profile');
@@ -52,12 +57,24 @@ const profile = arg('profile');
 // the presented-fps column has to be checkable against a focused window
 const focus = argv.includes('--focus');
 const outDir = path.resolve(ROOT, arg('out', 'captures/bench'));
+// window geometry: the bench normally forces 1920x1080 so a frame time means
+// the same thing everywhere. `--panel` takes the machine's whole work area
+// instead, which is what `--pin off` wants (the point there is the real frame).
+const panel = argv.includes('--panel');
+const width = arg('width');
+const height = arg('height');
+// extra query params, e.g. `--query gfx=log` for the resolution trace
+const extra = arg('query');
+// `--eval <js>` prints a renderer-side expression once a second (see main.cjs)
+const evalExpr = arg('eval');
 
 const query = `?bench=${encodeURIComponent(situations)}&label=${encodeURIComponent(label)}`
   + (secs ? `&secs=${encodeURIComponent(secs)}` : '')
   + (quality ? `&quality=${encodeURIComponent(quality)}` : '')
+  + (burst ? `&burst=${encodeURIComponent(burst)}` : '')
   + (pin ? `&pin=${encodeURIComponent(pin)}` : '')
-  + (profile ? `&profile=${encodeURIComponent(profile)}` : '');
+  + (profile ? `&profile=${encodeURIComponent(profile)}` : '')
+  + (extra ? `&${extra}` : '');
 
 // ------------------------------------------------------------- dev server
 
@@ -128,9 +145,11 @@ electron = spawn(electronBin, [path.join(HERE, 'main.cjs')], {
     SS26_DEV_SERVER: URL_BASE,
     SS26_QUERY: query,
     SS26_WINDOWED: '1',
-    SS26_WIDTH: '1920',
-    SS26_HEIGHT: '1080',
+    SS26_MAXIMIZE: panel ? '1' : '',
+    SS26_WIDTH: panel ? '' : String(width || 1920),
+    SS26_HEIGHT: panel ? '' : String(height || 1080),
     SS26_NO_FOCUS: focus ? '0' : '1',
+    SS26_EVAL: evalExpr || '',
   },
 });
 

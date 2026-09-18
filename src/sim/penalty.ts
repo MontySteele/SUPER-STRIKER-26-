@@ -6,8 +6,29 @@
 import { clamp, v2, type V2 } from '../core/math';
 import { effectiveRating } from '../data/loader';
 import { GOAL_HALF_W, GOAL_HEIGHT, HALF_L, PENALTY_SPOT } from './constants';
+import type { KeeperBrain, KState } from './ai/keeper';
 import type { PlayerEntity } from './player';
 import type { Match } from './match';
+
+/**
+ * How fast the keeper shuffles along his line while the taker is settling, as
+ * a fraction of his top speed.
+ *
+ * It is a SPEED CAP, not a style choice: above ~2.4 m/s the renderer stops
+ * covering lateral movement with the sidestep clips and breaks him into a walk
+ * that is facing the wrong way (skinnedPlayer's SIDESTEP_MAX_SPEED). 0.22 of a
+ * 7–8 m/s top speed lands comfortably inside that, and PlayerEntity.moveToward
+ * eases the last 1.2m anyway, so he arrives rather than snapping to a stop.
+ */
+const SHUFFLE_SPEED_MULT = 0.22;
+/** Metres either side of centre he drifts while the kick is being set. */
+const SHUFFLE_AMPLITUDE = 0.75;
+/** Radians a second of the shuffle. Slow: this is a man on his toes, not a
+ *  metronome, and it has to stay under the sidestep's rate-match window. */
+const SHUFFLE_RATE = 1.35;
+/** Seconds flat on the grass after a dive, matching the renderer's 1.0s
+ *  dive-bucket window (PlayerEntity.update) so the get-up clip plays whole. */
+const GETUP_SECONDS = 1.0;
 
 export type PenPhase = 'setup' | 'aim' | 'strike' | 'resolve' | 'done';
 export type PenResult = 'goal' | 'saved' | 'missed';
@@ -40,6 +61,18 @@ export class PenaltyController {
   private keeperGuess = 0; // -1 | 0 | 1 (pitch-y sign)
   private resolveResult: PenResult | null = null;
   private keeperTouched = false;
+  /** he went to ground on this kick and owes a get-up before he walks back */
+  private keeperDove = false;
+  /** which dive he played, so the get-up is on the right shoulder */
+  private keeperDiveAnim: 'diveL' | 'diveR' = 'diveL';
+  /** seconds left of the get-up animation (0 = upright) */
+  private keeperGetUp = 0;
+  /** a save was made while he was going to ground; celebrate once he is up */
+  private keeperCelebrate = false;
+  /** where on his line he is trying to be: set once per kick, walked to */
+  private keeperHome: V2 = v2();
+  /** radians of phase offset on this kick's shuffle — deterministic, per man */
+  private shufflePhase = 0;
 
   // shootout state (unused for single in-match kicks)
   board: ShootoutBoard | null = null;
@@ -95,10 +128,30 @@ export class PenaltyController {
     this.taker.facing = this.goalSide > 0 ? 0 : Math.PI;
     this.taker.vel = v2();
     this.keeper.pos = { x: gx - 0.5 * this.goalSide, y: 0 };
-    this.keeper.facing = this.goalSide > 0 ? Math.PI : 0;
+    this.keeper.facing = this.keeperFacing();
     this.keeper.vel = v2();
     this.keeper.diving = false;
+    this.keeper.diveVel = v2();
     this.keeper.actionAnim = 'none';
+    this.keeper.actionAnimT = 0;
+    this.keeper.actionLock = 0;
+    // `desired` is NOT cleared by zeroing vel, and this phase calls
+    // keeper.update() every tick: a leftover open-play movement target used to
+    // accelerate him off his line the moment the ball was struck.
+    this.keeper.stop();
+    this.keeperHome = { x: gx - 0.5 * this.goalSide, y: 0 };
+    this.shufflePhase = ((this.keeper.data.num * 7 + kickNum * 3) % 12) / 12 * Math.PI * 2;
+    this.keeperDove = false;
+    this.keeperGetUp = 0;
+    this.keeperCelebrate = false;
+    // BOTH keepers: in a shootout the man who dove at the last kick is now
+    // stood in the arc, and leaving him in 'getup' with a get-up clip armed
+    // would have him rising off the grass in the middle of the line-up.
+    for (const b of m.keepers) {
+      b.setScriptedState('position', null);
+      b.keeper.diving = false;
+      b.keeper.diveVel = v2();
+    }
     // everyone else waits around the arc
     let i = 0;
     for (const t of m.teams) {
@@ -130,6 +183,93 @@ export class PenaltyController {
     return this.match.primarySeat(1 - this.kickingTeam);
   }
 
+  /** The defending keeper's brain. It is not being TICKED during a penalty
+   *  (Match only runs KeeperBrain in 'play'), but the renderer reads its state
+   *  and its animClip every frame, so this phase has to keep both honest. */
+  private keeperBrain(): KeeperBrain | undefined {
+    return this.match.keepers[1 - this.kickingTeam];
+  }
+
+  /** Square to the ball, down the pitch. Re-pinned every tick he moves,
+   *  because PlayerEntity.update turns a player to face his velocity and a
+   *  keeper shuffling along his line must not end up facing the post. */
+  private keeperFacing(): number {
+    return this.goalSide > 0 ? Math.PI : 0;
+  }
+
+  /**
+   * One tick of the keeper, for every phase that has one.
+   *
+   * THE WHOLE POINT: he is moved by giving PlayerEntity a target and letting
+   * it integrate, never by writing `pos` — because the renderer rate-matches
+   * his stepping animation against the ground he covers, and ground covered
+   * without a velocity behind it is a man skating (§7A). The one exception is
+   * the dive itself, which PlayerEntity integrates off `diveVel` while the
+   * dive one-shot owns the body.
+   *
+   * `shuffle` is where on his line he wants to be this tick.
+   */
+  private keeperTick(dt: number, shuffle: V2 | null, standing: KState = 'position'): void {
+    const k = this.keeper;
+    const brain = this.keeperBrain();
+
+    if (k.diving) {
+      // the arc is the sim's; the clip was armed on the frame it started
+      k.update(dt);
+      k.facing = this.keeperFacing();
+      brain?.setScriptedState('dive', brain.animClip);
+      return;
+    }
+
+    if (this.keeperDove && this.keeperGetUp > 0) {
+      // flat on the grass: he gets up before he goes anywhere
+      this.keeperGetUp -= dt;
+      k.stop();
+      k.update(dt);
+      k.facing = this.keeperFacing();
+      if (this.keeperGetUp <= 0) {
+        this.keeperDove = false;
+        brain?.setScriptedState('position', null);
+        // a save he made while going to ground gets its celebration now
+        if (this.keeperCelebrate) {
+          this.keeperCelebrate = false;
+          k.playAnim('celebrate', 2);
+        }
+      }
+      return;
+    }
+
+    // A long one-shot (the 3s celebration) takes the body off the locomotion
+    // layer entirely — its weight goes to 1 and the chain is weighted by
+    // 1 - that. So he celebrates where he is and walks home afterwards; the
+    // alternative is a man punching the air while gliding backwards, which is
+    // the same defect as the sway this pass came to fix.
+    if (shuffle && k.actionAnim !== 'celebrate' && k.actionAnim !== 'dejected') {
+      // WALK, at a speed the sidestep clips can cover (SIDESTEP_MAX_SPEED in
+      // skinnedPlayer is 2.4 m/s; 0.22 of a 7-8 m/s top speed lands ~1.7)
+      k.moveToward(shuffle, SHUFFLE_SPEED_MULT, false);
+    } else {
+      k.stop();
+    }
+    k.update(dt);
+    k.facing = this.keeperFacing();
+    // a variant row never outlives its one-shot, or the next thing he plays
+    // comes out as whatever the last save was
+    brain?.setScriptedState(standing,
+      k.actionAnim === 'none' ? null : brain.animClip);
+  }
+
+  /** The dive is over: arm the get-up and let him walk back after it. */
+  private keeperLanded(): void {
+    if (!this.keeperDove || this.keeperGetUp > 0) return;
+    this.keeperGetUp = GETUP_SECONDS;
+    const brain = this.keeperBrain();
+    // the same get-up the open-play brain uses; the dive bucket's 1.0s window
+    // is what keeps the clip and the state machine in step
+    this.keeper.playAnim(this.keeperDiveAnim, GETUP_SECONDS);
+    brain?.setScriptedState('getup', 'gkGetUp');
+  }
+
   update(dt: number): void {
     const m = this.match;
     this.timer += dt;
@@ -137,6 +277,8 @@ export class PenaltyController {
 
     switch (this.phase) {
       case 'setup': {
+        // he walks the last metre onto his line rather than standing on it
+        this.keeperTick(dt, this.keeperHome);
         if (this.timer > 1.3) {
           this.phase = 'aim';
           this.timer = 0;
@@ -178,8 +320,23 @@ export class PenaltyController {
             this.strike();
           }
         }
-        // keeper sways on the line
-        this.keeper.pos.y = Math.sin(this.timer * 2.2) * 0.35;
+        // The keeper works his line.
+        //
+        // This used to be `this.keeper.pos.y = Math.sin(...) * 0.35` — a
+        // direct write to the position with nothing behind it. PlayerEntity.vel
+        // stayed at zero, the renderer takes its locomotion speed from vel, and
+        // so the mesh was handed "standing still" while the body translated 70cm
+        // back and forth across the six-yard box. That is the slide the user
+        // saw through an entire shootout, and it is why this now goes through
+        // moveToward: the target moves, the entity integrates toward it, and
+        // the sidestep clips are rate-matched to the ground he actually covers.
+        this.keeperTick(dt, {
+          x: this.keeperHome.x,
+          // phase offset by the keeper's number: an aim phase is a second or
+          // two, which is under half a cycle, so without this every kick in
+          // the shootout is the same shuffle in the same direction
+          y: Math.sin(this.timer * SHUFFLE_RATE + this.shufflePhase) * SHUFFLE_AMPLITUDE,
+        });
         break;
       }
 
@@ -187,7 +344,13 @@ export class PenaltyController {
         // ball is in flight; keeper dive already committed
         m.ball.update(dt);
         this.containBall();
-        this.keeper.update(dt);
+        const wasDiving = this.keeper.diving;
+        // no shuffle target: he is committed. keeperTick runs the dive arc and,
+        // once it decays, hands over to the get-up instead of standing him up.
+        // 'set' while the ball is in flight: §6.3's ready crouch, which is the
+        // outfield idle in the renderer's chain, not the standing gk idle
+        this.keeperTick(dt, null, 'set');
+        if (wasDiving && !this.keeper.diving) this.keeperLanded();
         this.taker.update(dt); // follow-through — don't freeze mid wind-up
         this.checkKeeperHands();
         const b = m.ball.pos;
@@ -202,7 +365,13 @@ export class PenaltyController {
       case 'resolve': {
         m.ball.update(dt);
         this.containBall();
-        this.keeper.update(dt);
+        const wasDiving = this.keeper.diving;
+        // get up, then WALK back to the middle of the goal. The old code left
+        // him wherever the dive ended until beginKick teleported him, so the
+        // one thing the eye was given between kicks was a man sliding home.
+        const home = this.keeperDove && this.keeperGetUp > 0 ? null : this.keeperHome;
+        this.keeperTick(dt, home);
+        if (wasDiving && !this.keeper.diving) this.keeperLanded();
         for (const p of [this.taker]) p.update(dt);
         if (this.timer > 2.4) this.advance();
         break;
@@ -264,10 +433,28 @@ export class PenaltyController {
     const diveSpeed = (6.5 + keeping * 3.5) * (this.keeperGuess === 0 ? 0 : 1);
     this.keeper.diving = this.keeperGuess !== 0;
     this.keeper.diveVel = v2(0, this.keeperGuess * diveSpeed);
+    const brain = this.keeperBrain();
     if (this.keeperGuess !== 0) {
-      this.keeper.playAnim(
-        (this.keeperGuess > 0) === (this.goalSide > 0) ? 'diveL' : 'diveR', 1.0,
-      );
+      // WHICH dive, by where the ball will be when it reaches his line — the
+      // sim already solved for that above (`height`, `aimY`). A penalty is
+      // always struck from the spot, so `range` is PENALTY_SPOT and the
+      // close-range body block never applies.
+      const side: 'L' | 'R' = (this.keeperGuess > 0) === (this.goalSide > 0) ? 'L' : 'R';
+      const anim = side === 'L' ? 'diveL' : 'diveR';
+      this.keeperDiveAnim = anim;
+      this.keeperDove = true;
+      this.keeperGetUp = 0;
+      const clip = brain?.saveClip(side, height, aimY - this.keeper.pos.y, PENALTY_SPOT)
+        ?? anim;
+      brain?.setScriptedState('dive', clip);
+      this.keeper.playAnim(anim, 1.0);
+    } else {
+      // he stood it up: still an action, still not a statue — a high ball
+      // straight at him is a catch, one at his feet is a block
+      this.keeperDove = false;
+      const clip = height > 2.15 ? 'catchHigh' : height < 0.9 ? 'collectLow' : null;
+      brain?.setScriptedState('set', clip);
+      if (clip) this.keeper.playAnim(clip === 'catchHigh' ? 'diveL' : 'collect', 0.5);
     }
     this.phase = 'strike';
     this.timer = 0;
@@ -308,7 +495,14 @@ export class PenaltyController {
 
     if (result === 'goal') this.taker.playAnim('celebrate', 2);
     else this.taker.playAnim('dejected', 2);
-    if (result === 'saved') this.keeper.playAnim('celebrate', 2);
+    // A keeper who is still on the grass does not leap about: the celebration
+    // is deferred to the frame he is back on his feet (keeperTick), otherwise
+    // it cuts the get-up in half and snaps him upright from a full-stretch
+    // dive — the exact pop this pass exists to remove.
+    if (result === 'saved') {
+      if (this.keeperDove) this.keeperCelebrate = true;
+      else this.keeper.playAnim('celebrate', 2);
+    }
 
     if (this.board) {
       this.board.kicks[this.kickingTeam].push(result);

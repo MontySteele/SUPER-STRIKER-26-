@@ -57,16 +57,28 @@ const FRAG = /* glsl */ `
     vec3 d = normalize(vDir);
     float h = d.y;
 
-    // gradient: horizon -> zenith above, horizon -> ground haze below. The
-    // 0.42 power keeps the interesting colour low in the frame, where a
-    // broadcast camera actually points.
-    vec3 sky = mix(horizon, zenith, pow(clamp(h, 0.0, 1.0), 0.42));
+    // Gradient: horizon -> zenith above, horizon -> ground haze below.
+    //
+    // Two curves, not one. The old single pow(h, 0.42) is a soft ramp that
+    // spends most of its range on the boring middle of the sky, and at DPR 2
+    // on a Retina panel that reads as a flat wash with a band in it. The
+    // smoothstep is a CONTRAST curve laid over the same ramp: it steepens the
+    // transition where the eye is looking (the first 25° above the roof line)
+    // and flattens the top, which is what a real late-afternoon sky does and
+    // what makes the horizon read as an edge instead of a fade.
+    float hh = clamp(h, 0.0, 1.0);
+    float ramp = pow(hh, 0.42);
+    ramp = mix(ramp, smoothstep(0.0, 0.62, ramp), 0.55);
+    vec3 sky = mix(horizon, zenith, ramp);
     vec3 below = mix(horizon, ground, clamp(-h * 2.6, 0.0, 1.0));
     vec3 c = h > 0.0 ? sky : below;
 
     // haze band hugging the horizon line — this is what the scene fog reads
-    // as, so the two stay coherent
+    // as, so the two stay coherent. Two widths: a tight bright lip right on
+    // the line and the broad wash above it, because one exponential cannot be
+    // both a horizon and a glow.
     c = mix(c, horizon * 1.25, exp(-abs(h) * 12.0) * haze);
+    c = mix(c, horizon * 1.42, exp(-abs(h) * 46.0) * haze * 0.65);
     c *= gain;
 
     // sun: a hot core plus two glow lobes (tight bloom seed, wide sky wash)
@@ -140,7 +152,11 @@ export class Sky {
 
   constructor(renderer: THREE.WebGLRenderer, preset: SkyPreset) {
     this.domeMat = makeSkyMaterial(preset);
-    this.dome = new THREE.Mesh(new THREE.SphereGeometry(600, 32, 16), this.domeMat);
+    // 64x32, not 32x16. The fragment shader works from normalize(position),
+    // and on a 32x16 sphere that direction is linearly interpolated across 11°
+    // of arc — enough that the gradient shows faint facet seams on a Retina
+    // panel. 2k extra triangles on a mesh that writes no depth is free.
+    this.dome = new THREE.Mesh(new THREE.SphereGeometry(600, 64, 32), this.domeMat);
     this.dome.frustumCulled = false;
     // drawn first, writes no depth: the rest of the scene paints straight over
     this.dome.renderOrder = -1000;

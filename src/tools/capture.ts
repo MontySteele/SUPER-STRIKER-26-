@@ -18,6 +18,7 @@ import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { SIM_DT } from '../sim/constants';
 import { Match } from '../sim/match';
+import type { PlayerEntity } from '../sim/player';
 import { findTeam } from '../data/loader';
 import { installDeterministicEnv } from './determinism';
 import shotsJson from './shots.json';
@@ -27,6 +28,40 @@ export interface CamPose {
   pos: [number, number, number];
   look: [number, number, number];
   fov?: number;
+}
+
+/**
+ * Roll until the match reaches a described MOMENT, instead of a tick count.
+ *
+ * A pinned frame number is the right contract for a shot of the pitch, the
+ * stands or a camera rig: the sim is a pure function of the seed, so frame 986
+ * is always the same instant. It is the WRONG contract for a shot of one
+ * animation. Retuning anything in the sim — a first touch, a tackle window,
+ * how long a keeper holds the ball — moves every subsequent event by a few
+ * ticks, and a shot that was a keeper at full stretch quietly becomes a keeper
+ * standing on his line. That is not a regression the PNG shows; it is a
+ * regression the PNG hides.
+ *
+ * So a keeper shot says what it is a shot OF, and the roll finds it. Still
+ * deterministic, still "same commit + same seed => the same pixels" — the
+ * predicate is a pure function of the sim state — but it survives the sim
+ * being worked on, which these shots have to.
+ */
+export interface ShotSeek {
+  /** the shootout kick being taken, 1-based */
+  penKick?: number;
+  /** ...in this phase of it */
+  penPhase?: 'setup' | 'aim' | 'strike' | 'resolve';
+  /** a keeper whose KeeperBrain is in this state (§6.3) */
+  keeperState?: string;
+  /** a keeper whose armed CLIP_TABLE row is this */
+  keeperClip?: string;
+  /** a keeper playing this ActionAnim */
+  keeperAnim?: string;
+  /** seconds to roll on after the moment is first seen */
+  after?: number;
+  /** give up (and fail the shot) after this many ticks */
+  maxTicks?: number;
 }
 
 export interface ShotSpec {
@@ -46,7 +81,18 @@ export interface ShotSpec {
    * pure function of the sim — but it tests the camera work rather than a
    * hand-typed vector, which is the only way a framing regression is visible.
    */
-  cam: CamPose | 'director';
+  cam: CamPose | 'director' | 'keeper';
+  /**
+   * `cam: "keeper"` only. Where to stand relative to the keeper the shot found,
+   * in metres: [toward the halfway line, up, across the pitch]. Mirrored by
+   * which goal he is at, so one offset frames either end the same way — which
+   * matters, because which end a shootout is taken at is the seed's business.
+   */
+  camOffset?: [number, number, number];
+  /** `cam: "keeper"` only: height on the keeper the camera looks at (default 1). */
+  camAim?: number;
+  /** roll to a described moment instead of a tick count (see ShotSeek) */
+  seek?: ShotSeek;
   /** director shots only: force a mode (e.g. 'beauty') before the extra roll */
   camMode?: CamMode;
   /** director shots only: seconds of camera-only time after the sim frames,
@@ -67,6 +113,18 @@ export interface ShotSpec {
   /** §7A.7 level to draw at. Omitted = HIGH: a baseline must never silently
    *  inherit whatever graphics setting the browser profile happens to hold. */
   quality?: QualityLevel;
+  /**
+   * Knockout rules, with a short period length. Together these are how a shot
+   * photographs a SHOOTOUT (§6.5): a knockout tie that is level after four
+   * short periods enters 'break' with label PENALTIES, and the roll below
+   * already answers every break, so the shootout starts on its own and the
+   * shot's `frames` counts on into it. There is no other entry — Match.
+   * beginShootout is private, and a capture that reached in and called it
+   * would be photographing a state the game cannot actually be in.
+   */
+  knockout?: boolean;
+  /** seconds per period; omitted = HALF_LENGTH_SEC (no shot reaches half time) */
+  halfLengthSec?: number;
 }
 
 export const SHOTS: ShotSpec[] = (shotsJson as unknown as { shots: ShotSpec[] }).shots;
@@ -79,6 +137,51 @@ export interface CaptureStats {
 
 /** Frames drawn back-to-back after the still to measure throughput. */
 const FPS_FRAMES = 60;
+
+/**
+ * Has the match reached the moment this shot is of? Returns the keeper it
+ * matched on (so `cam: "keeper"` frames the right man), or plain true for a
+ * penalty-phase match with no particular keeper named.
+ */
+function seekHit(match: Match, s: ShotSeek): PlayerEntity | boolean {
+  const pen = match.penalty;
+  if (s.penPhase !== undefined || s.penKick !== undefined) {
+    if (!pen) return false;
+    if (s.penPhase && pen.phase !== s.penPhase) return false;
+    if (s.penKick !== undefined) {
+      const taken = pen.board
+        ? pen.board.kicks[0].length + pen.board.kicks[1].length : 0;
+      if (taken !== s.penKick - 1) return false;
+    }
+  }
+  if (s.keeperState !== undefined || s.keeperClip !== undefined || s.keeperAnim !== undefined) {
+    const brain = match.keepers.find((b) =>
+      (s.keeperState === undefined || b.state === s.keeperState)
+      && (s.keeperClip === undefined || b.animClip === s.keeperClip)
+      && (s.keeperAnim === undefined || b.keeper.actionAnim === s.keeperAnim));
+    return brain ? brain.keeper : false;
+  }
+  return pen ? pen.keeper : true;
+}
+
+/** Whichever keeper the ball is nearer — the fallback subject. */
+function nearestKeeper(match: Match): PlayerEntity {
+  const b = match.ball.pos;
+  const [a, c] = match.keepers.map((k) => k.keeper);
+  return Math.hypot(a.pos.x - b.x, a.pos.y - b.y)
+    <= Math.hypot(c.pos.x - b.x, c.pos.y - b.y) ? a : c;
+}
+
+/** A camera parked at a fixed offset off one keeper, mirrored by his end. */
+function keeperPose(shot: ShotSpec, k: PlayerEntity): CamPose {
+  const [inward, up, across] = shot.camOffset ?? [6, 1.7, 6];
+  const side = Math.sign(k.pos.x) || 1;
+  return {
+    pos: [k.pos.x - side * inward, up, k.pos.y + across],
+    look: [k.pos.x, shot.camAim ?? 1.0, k.pos.y],
+    fov: 36,
+  };
+}
 
 /** Long enough that no shot ever reaches half time mid-capture. */
 const HALF_LENGTH_SEC = 600;
@@ -120,9 +223,9 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
       home: findTeam(shot.home),
       away: findTeam(shot.away),
       seats: [null, null],
-      halfLengthSec: HALF_LENGTH_SEC,
+      halfLengthSec: shot.halfLengthSec ?? HALF_LENGTH_SEC,
       difficulty: 'pro',
-      knockout: false,
+      knockout: shot.knockout ?? false,
       mode: 'match',
       seed: shot.seed,
     });
@@ -142,7 +245,12 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
 
     // step the sim synchronously; the visual state advances with it (limb
     // damping, confetti, celebration timers) but nothing is drawn until the end
-    for (let i = 0; i < shot.frames; i++) {
+    const seek = shot.seek;
+    const cap = seek ? seek.maxTicks ?? 20000 : shot.frames;
+    let found = seek ? -1 : 0;
+    let subject: PlayerEntity | null = null;
+    const after = Math.round((seek?.after ?? 0) * 60);
+    for (let i = 0; i < cap; i++) {
       // a walkout holds the tick exactly as the game loop does, so `frames`
       // for that kind of shot counts the SCENE's clock, not the match's
       if (!present?.frame()) {
@@ -152,6 +260,17 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
       }
       renderer.advanceNoDraw(SIM_DT, 1);
       env.advanceClock(SIM_DT * 1000);
+      if (!seek) continue;
+      if (found < 0) {
+        const hit = seekHit(match, seek);
+        if (hit) { found = i; subject = hit === true ? null : hit; }
+      }
+      if (found >= 0 && i - found >= after) break;
+    }
+    if (seek) {
+      if (found < 0) throw new Error(`seek never matched in ${cap} ticks`);
+      console.info(`capture: ${shot.name} found its moment at frame ${found + 1}`
+        + ` (+${after} → ${found + 1 + after}), t=${match.simTime.toFixed(2)}s`);
     }
 
     // the card scenes have no phase to wait for out here: force one and let it
@@ -178,8 +297,11 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
       }
     }
 
+    const pose = shot.cam === 'keeper'
+      ? keeperPose(shot, subject ?? nearestKeeper(match))
+      : shot.cam;
     const draw = (): { drawCalls: number; triangles: number } => (
-      shot.cam === 'director' ? renderer.renderStillLive() : renderer.renderStill(shot.cam)
+      pose === 'director' ? renderer.renderStillLive() : renderer.renderStill(pose)
     );
 
     const still = draw();

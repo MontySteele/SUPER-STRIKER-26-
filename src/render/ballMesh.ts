@@ -30,8 +30,12 @@ export class BallMesh {
   private sphere: THREE.Mesh;
   private blob: THREE.Mesh;
   private prev = new THREE.Vector3();
+  /** the scene, kept so the ball can publish its ground state for the shell
+   *  turf (render/grass.ts) without the turf having to know about the match */
+  private scene: THREE.Scene;
 
   constructor(scene: THREE.Scene) {
+    this.scene = scene;
     const { map, normalMap, roughnessMap } = makeBallMaps();
     this.sphere = new THREE.Mesh(
       new THREE.SphereGeometry(BALL_RADIUS * VISUAL_SCALE, 32, 24),
@@ -88,6 +92,15 @@ export class BallMesh {
     const s = Math.max(1 - h / 8, 0.25);
     this.blob.scale.setScalar(s);
     (this.blob.material as THREE.MeshBasicMaterial).opacity = 0.4 * Math.max(1 - h / 10, 0.15);
+
+    // ...and publish where the ball is for the shell turf's wake. delta is one
+    // RENDER frame of travel, so the speed is per-frame, not per-second —
+    // scaled here rather than in the shader so the shader's radius term stays
+    // a plain "metres per second".
+    const speed = Math.hypot(delta.x, delta.z) * 60;
+    const state = (this.scene.userData.ss26Ball ??= { x: 0, y: 0, z: 0, speed: 0 }) as
+      { x: number; y: number; z: number; speed: number };
+    state.x = x; state.y = h; state.z = y; state.speed = speed;
   }
 }
 

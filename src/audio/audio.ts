@@ -14,16 +14,23 @@
 // is still synthesized: they need to be tight, varied and sample-accurate, and
 // synthesis gives all three for nothing.
 //
-// Mix topology:
+// Mix topology (§7.3 volume faders in brackets):
 //     crowd layers -> crowdBus -> crowdDuck -> duck ---\
-//     sfx / stingers ------------------------> master --> limiter -> out
-//     commentary voice ---------------------> voiceBus /
+//     sfx / stingers ------------------------> sfxBus [CROWD & SFX] --\
+//     commentary voice ---------------------> voice  [COMMENTARY] ----+-> master [MASTER] -> limiter -> out
+//     music (src/audio/music.ts) -----------> music  [MUSIC] --------/
 //
 // crowdDuck is pulled down while the commentator speaks (src/audio/commentary.ts
 // drives it through duckCrowd). duck is the whole-mix hold-your-breath used at
 // penalties. Speech is deliberately outside both.
+//
+// The four fader nodes are the ONLY place a user setting touches the mix, they
+// all move with a 50 ms setTargetAtTime ramp (a stepped gain clicks), and their
+// base gains are picked so the DEFAULT fader positions reproduce the balance
+// the game shipped with before the faders existed.
 
 import type { MatchEvent } from '../sim/matchEvents';
+import { VOLUME_BUSES, VOLUME_DEFAULT, volumeGain, volumeSetting, type VolumeBus } from './volume';
 
 /** Stingers other systems (HUD wipes, banners, replays) can fire. */
 export type StingerName =
@@ -65,12 +72,36 @@ function assetBase(): string {
   return (import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? '/';
 }
 
+/** Fader ramp: long enough never to click, short enough to feel instant. */
+const VOL_RAMP = 0.05;
+
+/**
+ * Per-bus gain at the top of its fader, chosen so `base * volumeGain(default)`
+ * equals the level that bus ran at before there were faders:
+ *   master 1/g(80)  — master sat at unity, so 80 must come out at 1.0
+ *   sfx    0.7      — the old master node's 0.7 headroom, now on this bus
+ *   voice  0.7      — voice was 1.0 into that same 0.7
+ *   music  1/g(60)  — music went straight to the destination at track volume
+ */
+const VOL_BASE: Record<VolumeBus, number> = {
+  master: 1 / volumeGain(VOLUME_DEFAULT.master),
+  sfx: 0.7 / volumeGain(VOLUME_DEFAULT.sfx),
+  voice: 0.7 / volumeGain(VOLUME_DEFAULT.voice),
+  music: 1 / volumeGain(VOLUME_DEFAULT.music),
+};
+
 export class AudioEngine {
   private ctx: AudioContext | null = null;
+  /** MASTER fader — the last node before the limiter. */
   private master!: GainNode;
+  /** CROWD & SFX fader: the crowd chain and every synthesized effect. */
+  private sfxBus!: GainNode;
+  /** MUSIC fader (src/audio/music.ts plays into it). */
+  private music!: GainNode;
   private duck!: GainNode;
   private crowdBus!: GainNode;
   private crowdDuck!: GainNode;
+  /** COMMENTARY fader — also the speech destination, outside both ducks. */
   private voice!: GainNode;
 
   // synthesized bed (always built; faded out once samples arrive)
@@ -112,6 +143,77 @@ export class AudioEngine {
     return this.ctx ? this.voice : null;
   }
 
+  /** Destination for the music player (null until unlocked). */
+  musicBus(): GainNode | null {
+    return this.ctx ? this.music : null;
+  }
+
+  // ---------------------------------------------------------------- volume
+
+  private busNode(bus: VolumeBus): GainNode | null {
+    if (!this.ctx) return null;
+    switch (bus) {
+      case 'master': return this.master;
+      case 'sfx': return this.sfxBus;
+      case 'voice': return this.voice;
+      case 'music': return this.music;
+    }
+  }
+
+  /**
+   * Set one fader, 0..1 (the UI stores 0..100, so it passes pct/100). The
+   * perceptual square-law taper and the bus's base gain are applied here, and
+   * the move is a 50 ms ramp — never a step, which would click.
+   */
+  setVolume(bus: VolumeBus, v: number, ramp = VOL_RAMP): void {
+    const node = this.busNode(bus);
+    if (!node || !this.ctx) return;
+    const g = VOL_BASE[bus] * volumeGain(Math.max(0, Math.min(1, v)) * 100);
+    if (ramp <= 0) {
+      // .value, not setValueAtTime: this is the boot path, and the readback
+      // (volumeGainOf, which tools/volume-smoke.mjs asserts on) has to be exact
+      node.gain.value = g;
+      return;
+    }
+    // cancel first: a held d-pad fires every ~110ms and stacked targets crawl
+    node.gain.cancelScheduledValues(this.ctx.currentTime);
+    node.gain.setTargetAtTime(g, this.ctx.currentTime, ramp);
+  }
+
+  /** Push every persisted `ss26.vol.*` value into the graph. */
+  applyVolumes(ramp = VOL_RAMP): void {
+    if (!this.ctx) return;
+    for (const bus of VOLUME_BUSES) this.setVolume(bus, volumeSetting(bus) / 100, ramp);
+  }
+
+  /** The gain actually on a fader node — the smoke check reads this. */
+  volumeGainOf(bus: VolumeBus): number | null {
+    return this.busNode(bus)?.gain.value ?? null;
+  }
+
+  /**
+   * A short confirm tick played INTO the fader being moved, so dragging the
+   * music slider is audible at the music level and not the SFX one.
+   */
+  volumeTick(bus: VolumeBus): void {
+    const ctx = this.ctx;
+    const dest = this.busNode(bus);
+    if (!ctx || !dest) return;
+    const t = ctx.currentTime;
+    for (const [f, at, amp] of [[880, 0, 0.09], [1320, 0.055, 0.07]] as [number, number, number][]) {
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.value = f;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t + at);
+      g.gain.exponentialRampToValueAtTime(amp, t + at + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + at + 0.05);
+      osc.connect(g).connect(dest);
+      osc.start(t + at);
+      osc.stop(t + at + 0.06);
+    }
+  }
+
   /**
    * Safe to call from anywhere, any number of times: builds the graph once,
    * and resumes a context the browser created in the suspended state.
@@ -124,8 +226,6 @@ export class AudioEngine {
     this.ctx = new AudioContext();
     const ctx = this.ctx;
     if (ctx.state === 'suspended') void ctx.resume();
-    this.master = ctx.createGain();
-    this.master.gain.value = 0.7;
     // brick-wall-ish limiter so stacked roars/whistles don't crackle
     const limiter = ctx.createDynamicsCompressor();
     limiter.threshold.value = -8;
@@ -133,13 +233,22 @@ export class AudioEngine {
     limiter.ratio.value = 16;
     limiter.attack.value = 0.002;
     limiter.release.value = 0.12;
-    this.duck = ctx.createGain();
-    this.duck.connect(this.master);
+    // MASTER sits before the limiter: turning the game down turns the limiter's
+    // input down with it, so a quiet mix stays a clean one.
+    this.master = ctx.createGain();
     this.master.connect(limiter);
     limiter.connect(ctx.destination);
+
+    this.sfxBus = ctx.createGain();
+    this.sfxBus.connect(this.master);
+    this.music = ctx.createGain();
+    this.music.connect(this.master);
     this.voice = ctx.createGain();
-    this.voice.gain.value = 1.0;
     this.voice.connect(this.master);
+
+    this.duck = ctx.createGain();
+    this.duck.connect(this.sfxBus);
+    this.applyVolumes(0);
     this.crowdDuck = ctx.createGain();
     this.crowdDuck.connect(this.duck);
     this.crowdBus = ctx.createGain();
@@ -506,7 +615,7 @@ export class AudioEngine {
         g.gain.setValueAtTime(0.0001, t);
         g.gain.exponentialRampToValueAtTime(0.28 * gain, t + 0.02);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.62);
-        lp.connect(g).connect(this.master);
+        lp.connect(g).connect(this.sfxBus);
         for (const f of [174.6, 233.1, 349.2, 466.2]) {  // F–A#, a fanfare fifth
           for (const d of [-3, 3]) {
             const osc = ctx.createOscillator();
@@ -525,7 +634,7 @@ export class AudioEngine {
         g.gain.setValueAtTime(0.0001, t);
         g.gain.exponentialRampToValueAtTime(0.16 * gain, t + 0.012);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
-        g.connect(this.master);
+        g.connect(this.sfxBus);
         for (const [f, at] of [[523.3, 0], [784, 0.055], [1046.5, 0.11]] as [number, number][]) {
           const osc = ctx.createOscillator();
           osc.type = 'triangle';
@@ -544,7 +653,7 @@ export class AudioEngine {
         const g = ctx.createGain();
         g.gain.setValueAtTime(0.42 * gain, t);
         g.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
-        osc.connect(g).connect(this.master);
+        osc.connect(g).connect(this.sfxBus);
         osc.start(t);
         osc.stop(t + 0.3);
         this.noiseSweep(t, 0.2, 3000, 800, 0.14 * gain);
@@ -579,7 +688,7 @@ export class AudioEngine {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.35);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    src.connect(bp).connect(g).connect(this.master);
+    src.connect(bp).connect(g).connect(this.sfxBus);
     src.start(t);
     src.stop(t + dur + 0.1);
   }
@@ -593,7 +702,7 @@ export class AudioEngine {
     const g = ctx.createGain();
     g.gain.setValueAtTime(vol, t);
     g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    osc.connect(g).connect(this.master);
+    osc.connect(g).connect(this.sfxBus);
     osc.start(t);
     osc.stop(t + dur + 0.01);
   }
@@ -672,7 +781,7 @@ export class AudioEngine {
     const g = ctx.createGain();
     g.gain.setValueAtTime(thumpV, t);
     g.gain.exponentialRampToValueAtTime(0.001, t + decay + 0.02);
-    osc.connect(g).connect(this.master);
+    osc.connect(g).connect(this.sfxBus);
     osc.start(t);
     osc.stop(t + decay + 0.05);
 
@@ -684,7 +793,7 @@ export class AudioEngine {
     const g2 = ctx.createGain();
     g2.gain.setValueAtTime(snapV, t);
     g2.gain.exponentialRampToValueAtTime(0.001, t + 0.05 + weight * 0.015);
-    src.connect(hp).connect(g2).connect(this.master);
+    src.connect(hp).connect(g2).connect(this.sfxBus);
     src.start(t);
   }
 
@@ -703,7 +812,7 @@ export class AudioEngine {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.22, t + 0.035);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
-    src.connect(bp).connect(g).connect(this.master);
+    src.connect(bp).connect(g).connect(this.sfxBus);
     src.start(t);
     src.stop(t + 0.45);
   }
@@ -718,7 +827,7 @@ export class AudioEngine {
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.36, t);
     g.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
-    osc.connect(g).connect(this.master);
+    osc.connect(g).connect(this.sfxBus);
     osc.start(t);
     osc.stop(t + 0.16);
     // turf scuff
@@ -731,7 +840,7 @@ export class AudioEngine {
     const g2 = ctx.createGain();
     g2.gain.setValueAtTime(0.14, t);
     g2.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-    src.connect(bp).connect(g2).connect(this.master);
+    src.connect(bp).connect(g2).connect(this.sfxBus);
     src.start(t);
     src.stop(t + 0.22);
   }
@@ -749,7 +858,7 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(0.2, t + 0.05);
     g.gain.setValueAtTime(0.2, t + 0.75);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 1.15);
-    lp.connect(g).connect(this.master);
+    lp.connect(g).connect(this.sfxBus);
     for (const f of [233, 236.5, 116.5, 351]) {
       const osc = ctx.createOscillator();
       osc.type = 'sawtooth';
@@ -773,7 +882,7 @@ export class AudioEngine {
       const g = ctx.createGain();
       g.gain.setValueAtTime(v, t);
       g.gain.exponentialRampToValueAtTime(0.001, t + d);
-      osc.connect(g).connect(this.master);
+      osc.connect(g).connect(this.sfxBus);
       osc.start(t);
       osc.stop(t + d + 0.05);
     }
@@ -803,7 +912,7 @@ export class AudioEngine {
       g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
       g.gain.setValueAtTime(0.12, t + dur - 0.08);
       g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-      osc.connect(g).connect(this.master);
+      osc.connect(g).connect(this.sfxBus);
       osc.start(t);
       osc.stop(t + dur + 0.05);
       warble.start(t);

@@ -186,6 +186,26 @@ const MACRO_PX = 256;
 // 4096 puts it in four and costs 42MB for a map that is baked once.
 const PITCH_TEX_W = 4096;
 
+// ------------------------------------------------------------- shell turf
+//
+// The density map for the shell-textured grass (see render/grass.ts). This is
+// NOT a picture of grass — it is the field "how tall is the blade standing at
+// this square millimetre", which is the only thing a shell renderer needs:
+// shell number k keeps the texels whose blade is at least k/N tall, so one
+// texture makes every layer and the blades taper on their own.
+//
+// 0.5m across 512px is 0.98mm a texel, which is finally finer than the ~3mm
+// width of a real blade, so a blade is three texels wide instead of one and
+// survives the first mip instead of dissolving into a grey wash.
+const SHELL_PX = 512;
+/** metres one tile of the shell map covers */
+export const SHELL_TILE_M = 0.5;
+// Coverage, not botany. A real pitch is ~15k blades/m², but what matters here
+// is the TOP-DOWN footprint: a 3mm blade leaning over covers ~0.9cm², and the
+// number below puts the lowest shell at ~80% coverage and the top shell at
+// ~13%, which is the density that reads as turf rather than as a hairbrush.
+const SHELL_BLADES = 6000;
+
 export class TextureLab {
   private field: NoiseField;
   /** kit / crowd bakes draw from their own stream, so adding a pitch octave
@@ -280,6 +300,97 @@ export class TextureLab {
       ),
     };
     return this.pitch;
+  }
+
+  /**
+   * The shell-turf density map (§7A.3, render/grass.ts).
+   *
+   *   R — blade height at this texel, 0..1. Shell k keeps texels with R ≥ k/N.
+   *   G — per-blade random, 0..1. Drives the tip tint so a hundred blades in a
+   *       pixel are not a hundred copies of one blade.
+   *   B — "tipness": 0 at the root end of the blade's footprint, 1 at the tip.
+   *   A — 255 (a canvas texture has no way to say "three channels").
+   *
+   * Seeded from its own stream, appended after the dressing stream, so adding
+   * the grass cannot reshuffle a single shirt in the game.
+   *
+   * SEAMLESS: every blade is stamped with wrapping coordinates, so the tile
+   * repeats across 105m of pitch without a grid of visible edges.
+   */
+  grassShell(): THREE.CanvasTexture {
+    return this.cached('shell', 'grass shells', () => {
+      const N = SHELL_PX;
+      const h = new Float32Array(N * N);
+      const g = new Float32Array(N * N);
+      const b = new Float32Array(N * N);
+      const rng = new RNG(this.seed ^ 0x51ed270b);
+
+      for (let i = 0; i < SHELL_BLADES; i++) {
+        const x0 = rng.next() * N;
+        const y0 = rng.next() * N;
+        // Lean direction: mostly along the mowing axis (world x, which is the
+        // texture's u), because that is what a gang mower leaves, with enough
+        // spread that the turf is not a combed carpet.
+        const along = rng.next() < 0.5 ? 0 : Math.PI;
+        const ang = along + rng.noise() * 0.85;
+        // 10-26 texels = 1-2.5cm of top-down footprint, i.e. a 4cm blade
+        // leaning between 15° and 40° off vertical
+        const len = rng.range(10, 26);
+        const dx = Math.cos(ang) * len, dy = Math.sin(ang) * len;
+        // per-blade height, modulated by a clump field so the turf has denser
+        // and thinner patches instead of one uniform pile depth
+        const clump = this.field.octave(2, x0 / N, y0 / N) * 0.5 + 0.5;
+        const hb = Math.min(1, rng.range(0.58, 1.0) * (0.86 + clump * 0.24));
+        const rnd = rng.next();
+        const wRoot = 1.5, wTip = 0.5;
+
+        // walk the blade, stamping a round cap of the right width at each step
+        const steps = Math.ceil(len) + 1;
+        for (let s = 0; s <= steps; s++) {
+          const t = s / steps;
+          const cx = x0 + dx * t, cy = y0 + dy * t;
+          const w = wRoot + (wTip - wRoot) * t;
+          const hv = hb * (0.18 + 0.82 * t);
+          const r = Math.ceil(w);
+          for (let oy = -r; oy <= r; oy++) {
+            for (let ox = -r; ox <= r; ox++) {
+              const px = Math.round(cx) + ox, py = Math.round(cy) + oy;
+              const d = Math.hypot(px - cx, py - cy);
+              if (d > w) continue;
+              // wrap: the tile is a torus, same rule as the noise field
+              const idx = (((py % N) + N) % N) * N + (((px % N) + N) % N);
+              if (hv <= h[idx]) continue;
+              h[idx] = hv;
+              g[idx] = rnd;
+              b[idx] = t;
+            }
+          }
+        }
+      }
+
+      const [c, ctx] = canvas2d(N, N);
+      const img = ctx.createImageData(N, N);
+      const px = img.data;
+      for (let i = 0; i < h.length; i++) {
+        px[i * 4] = Math.round(clamp01(h[i]) * 255);
+        px[i * 4 + 1] = Math.round(clamp01(g[i]) * 255);
+        px[i * 4 + 2] = Math.round(clamp01(b[i]) * 255);
+        px[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      const tex = new THREE.CanvasTexture(c);
+      // DATA, not a picture: an sRGB decode here would bend every shell
+      // threshold in the game and the turf would go bald at the top.
+      tex.colorSpace = THREE.LinearSRGBColorSpace;
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      // 4x, NOT the 16x every other grazing texture in the game gets. This map
+      // is read once per shell — seven times a pixel — and the cost of an
+      // anisotropic fetch is multiplied by that. Its own content is blade
+      // noise at the resolution limit, so the angular refinement buys almost
+      // nothing here and costs more than anywhere else in the frame.
+      tex.anisotropy = Math.min(4, maxAnisotropy());
+      return tex;
+    });
   }
 
   /**
@@ -711,7 +822,10 @@ export class TextureLab {
   /** Radial falloff for the additive floodlight flares (§7A.5, night only). */
   flareTexture(): THREE.CanvasTexture {
     return this.cached('flare', 'lens flare', () => {
-      const N = 128;
+      // 256, not 128: this sprite is drawn 22 metres wide and a night goal
+      // package puts it a few metres from the lens, where a 128px radial ramp
+      // is a visibly stepped disc.
+      const N = 256;
       const [c, ctx] = canvas2d(N, N);
       const g = ctx.createRadialGradient(N / 2, N / 2, 0, N / 2, N / 2, N / 2);
       g.addColorStop(0, 'rgba(255,252,240,1)');
@@ -720,6 +834,77 @@ export class TextureLab {
       g.addColorStop(1, 'rgba(140,180,255,0)');
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, N, N);
+
+      // The STARBURST. A floodlight through a real broadcast lens does not
+      // make a disc: the iris blades diffract it into an even number of
+      // spokes, and that shape is most of what says "this is a photograph of a
+      // very bright light" rather than "this is a white circle". Six blades,
+      // so twelve spokes, at two lengths so the pattern is not a snowflake.
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.translate(N / 2, N / 2);
+      const SPOKES = 12;
+      for (let i = 0; i < SPOKES; i++) {
+        const long = i % 2 === 0;
+        const len = (N / 2) * (long ? 0.98 : 0.54);
+        const halfWidth = long ? 0.020 : 0.013;
+        ctx.save();
+        ctx.rotate((i / SPOKES) * Math.PI * 2 + 0.13);
+        // a spike is a triangle with a gradient along it, not a stroked line:
+        // it has to be wide and bright at the core and vanish to nothing
+        const sg = ctx.createLinearGradient(0, 0, len, 0);
+        sg.addColorStop(0, 'rgba(255,250,235,0.85)');
+        sg.addColorStop(0.22, 'rgba(255,246,220,0.22)');
+        sg.addColorStop(1, 'rgba(200,220,255,0)');
+        ctx.fillStyle = sg;
+        ctx.beginPath();
+        ctx.moveTo(0, -N * halfWidth);
+        ctx.lineTo(len, 0);
+        ctx.lineTo(0, N * halfWidth);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    });
+  }
+
+  /**
+   * The anamorphic streak: the long horizontal smear a broadcast lens lays
+   * across a floodlight. Separate from the flare because it is drawn on a
+   * sprite with a 15:1 aspect — one texture cannot be both, and stretching the
+   * radial one sideways gives an obvious ellipse instead of a streak.
+   */
+  streakTexture(): THREE.CanvasTexture {
+    return this.cached('streak', 'lens streak', () => {
+      const W = 512, H = 64;
+      const [c, ctx] = canvas2d(W, H);
+      const img = ctx.createImageData(W, H);
+      const px = img.data;
+      for (let y = 0; y < H; y++) {
+        // across the streak: a tight core that stays a couple of pixels wide
+        const dy = Math.abs(y - (H - 1) / 2) / (H / 2);
+        const across = Math.exp(-dy * dy * 26);
+        for (let x = 0; x < W; x++) {
+          const dx = Math.abs(x - (W - 1) / 2) / (W / 2);
+          // along it: a fast core falloff plus a long low tail, which is what
+          // makes a streak read as long rather than as a fat ellipse
+          const along = Math.exp(-dx * 7.5) * 0.85 + (1 - dx) ** 3 * 0.15;
+          const a = clamp01(across * along);
+          const i = (y * W + x) * 4;
+          // cool at the tips, neutral at the core: real anamorphic flare is
+          // famously blue, and a pure white smear looks like a smudge
+          px[i] = 255;
+          px[i + 1] = Math.round(246 - dx * 30);
+          px[i + 2] = Math.round(226 + dx * 29);
+          px[i + 3] = Math.round(a * 255);
+        }
+      }
+      ctx.putImageData(img, 0, 0);
       const tex = new THREE.CanvasTexture(c);
       tex.colorSpace = THREE.SRGBColorSpace;
       return tex;

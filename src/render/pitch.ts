@@ -17,16 +17,17 @@ import {
   GOAL_DEPTH, GOAL_HALF_W, GOAL_HEIGHT, HALF_L, PITCH_LENGTH, PITCH_WIDTH,
 } from '../sim/constants';
 import { PITCH_MARGIN, TextureLab, paintMarkings } from './TextureLab';
+import { GrassField, grassPlaneAo } from './grass';
 import { queueShaderPatch } from './materials';
 import type { QualityProfile } from './quality';
 
 /** Mowing bands across the pitch length. 16 bands over 105m ≈ 6.5m each,
  *  which is what a real gang mower leaves. */
 const STRIPES = 16;
-const STRIPE_PERIOD = PITCH_LENGTH / STRIPES;
+export const STRIPE_PERIOD = PITCH_LENGTH / STRIPES;
 
 export function buildPitch(scene: THREE.Scene, lab: TextureLab, profile: QualityProfile): void {
-  const mat = profile.retro ? retroPitchMaterial(lab) : bakedPitchMaterial(lab);
+  const mat = profile.retro ? retroPitchMaterial(lab) : bakedPitchMaterial(lab, profile);
 
   const geo = new THREE.PlaneGeometry(PITCH_LENGTH + PITCH_MARGIN * 2,
     PITCH_WIDTH + PITCH_MARGIN * 2);
@@ -45,6 +46,13 @@ export function buildPitch(scene: THREE.Scene, lab: TextureLab, profile: Quality
   surround.receiveShadow = true;
   scene.add(surround);
 
+  // §7A.3b: the shell turf sits ON this plane, within ~30m of wherever the
+  // camera is looking, and is built from the same maps so the two are the same
+  // pitch. RETRO does not get it — that level is the v1.1 renderer on purpose.
+  if (!profile.retro && profile.grassShells > 0) {
+    new GrassField(scene, lab, profile, STRIPE_PERIOD);
+  }
+
   buildGoal(scene, 1);
   buildGoal(scene, -1);
 }
@@ -56,7 +64,8 @@ export function buildPitch(scene: THREE.Scene, lab: TextureLab, profile: Quality
  * The tiling albedo that agrees with that normal is sampled by the shader
  * patch, because three has no second albedo slot with its own UV transform.
  */
-function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
+function bakedPitchMaterial(lab: TextureLab, profile: QualityProfile):
+THREE.MeshStandardMaterial {
   const maps = lab.pitchMaps();
   // three builds a per-map UV transform for the slots it knows about, so the
   // normal map tiles by simply asking it to. The detail ALBEDO has no slot of
@@ -80,6 +89,12 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
     shader.uniforms.ss26Detail = { value: maps.detail };
     shader.uniforms.ss26DetailRepeat = { value: maps.repeat.clone() };
     shader.uniforms.ss26StripeK = { value: Math.PI / STRIPE_PERIOD };
+    // §7A.3b: where the shell turf is standing, this plane IS the shaded floor
+    // under it — see grassPlaneAo()
+    const ao = grassPlaneAo(profile);
+    shader.uniforms.ss26GrassAo = {
+      value: new THREE.Vector3(ao.strength, ao.from, ao.to),
+    };
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 ss26WorldPos;')
@@ -92,6 +107,7 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
       uniform sampler2D ss26Detail;
       uniform vec2 ss26DetailRepeat;
       uniform float ss26StripeK;
+      uniform vec3 ss26GrassAo;
 
       // -1 in one band, +1 in the next. The crossing width is derivative-
       // driven: crisp where a band is metres of screen (the near half of a
@@ -130,6 +146,14 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
         // lean below carries it there) plus up to ~8% raking, which is the
         // only half of the effect that survives a shaded pitch
         diffuseColor.rgb *= 1.0 + ss26Ph * 0.030 + ss26Into * ss26Graze * 0.085;
+
+        // the floor of the shell turf: inside the turf's radius the only part
+        // of this plane anyone can see is the gaps BETWEEN the blades, and
+        // those are in shade. Same fade window as the shells, so the two
+        // surfaces arrive at the open pitch together.
+        float ss26GrassNear = 1.0 - smoothstep( ss26GrassAo.y, ss26GrassAo.z,
+          length( cameraPosition - ss26WorldPos ) );
+        diffuseColor.rgb *= 1.0 - ss26GrassAo.x * ss26GrassNear;
       }
     `);
 

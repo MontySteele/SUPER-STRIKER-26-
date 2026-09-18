@@ -30,12 +30,30 @@ const WANT_FULLSCREEN = process.env.SS26_WINDOWED !== '1';
 // windowed size, for the bench (`npm run app:bench` wants a known 1920x1080)
 const WANT_W = Number(process.env.SS26_WIDTH || 0);
 const WANT_H = Number(process.env.SS26_HEIGHT || 0);
+// fill the whole work area without going native-fullscreen (which animates
+// into its own macOS Space): what `npm run app:bench -- --panel` wants, so an
+// unpinned bench measures the frame the panel really asks for
+const WANT_MAXIMIZE = process.env.SS26_MAXIMIZE === '1';
 // bench/capture runs must not float over whatever the user is doing
 const WANT_FOCUS = process.env.SS26_NO_FOCUS !== '1';
 const OPEN_DEVTOOLS = process.env.SS26_DEVTOOLS === '1';
 // headless-ish smoke test: capture a PNG N ms after load, then quit
 const CAPTURE_PATH = process.env.SS26_CAPTURE || '';
 const CAPTURE_DELAY = Number(process.env.SS26_CAPTURE_DELAY || 6000);
+// A JS expression polled in the renderer until it is truthy, THEN the shot is
+// taken (CAPTURE_DELAY becomes the timeout rather than the wait). A fixed
+// delay cannot serve the capture contract: a still that steps 2500 sim frames
+// takes as long as it takes, and a screenshot of a half-warmed scene is a
+// baseline nobody can reproduce.
+const CAPTURE_READY = process.env.SS26_CAPTURE_READY || '';
+// A JS expression evaluated in the renderer every SS26_EVAL_EVERY ms and
+// printed to stdout as `[eval] …`. The shell already forwards console lines,
+// but a console.log has to be WRITTEN INTO the game to exist; this lets a
+// tooling script interrogate live renderer state (uniforms, buffer sizes, the
+// adaptive-resolution step) without shipping a debug print for every question
+// anyone ever asks.
+const EVAL_EXPR = process.env.SS26_EVAL || '';
+const EVAL_EVERY = Number(process.env.SS26_EVAL_EVERY || 1000);
 const QUIT_AFTER = Number(process.env.SS26_QUIT_AFTER || 0);
 
 let errorCount = 0;
@@ -121,8 +139,8 @@ function createWindow() {
     // an explicit size is taken at face value (the bench quotes numbers for a
     // 1920x1080 frame and a clamped window would quietly measure something
     // else); otherwise fit the work area
-    width: WANT_W || Math.min(1600, width),
-    height: WANT_H || Math.min(900, height),
+    width: WANT_W || (WANT_MAXIMIZE ? width : Math.min(1600, width)),
+    height: WANT_H || (WANT_MAXIMIZE ? height : Math.min(900, height)),
     backgroundColor: '#06090d',
     show: false,
     title: "SUPER STRIKER '26",
@@ -150,9 +168,11 @@ function createWindow() {
   });
 
   wireLogging(win);
+  if (EVAL_EXPR) wireEval(win);
 
   win.once('ready-to-show', () => {
     if (WANT_W && WANT_H) win.setContentSize(WANT_W, WANT_H);
+    else if (WANT_MAXIMIZE) win.maximize();
     if (WANT_FOCUS) win.show();
     else win.showInactive();
     if (WANT_FOCUS) win.focus();
@@ -209,6 +229,21 @@ function wireLogging(win) {
   });
   wc.on('unresponsive', () => process.stderr.write('[unresponsive]\n'));
   wc.on('did-finish-load', () => process.stdout.write(`[shell] loaded ${wc.getURL()}\n`));
+}
+
+/** Poll a renderer-side expression and print whatever it returns. */
+function wireEval(win) {
+  const timer = setInterval(async () => {
+    try {
+      const v = await win.webContents.executeJavaScript(
+        `(() => { try { return JSON.stringify(${EVAL_EXPR}); }`
+        + ` catch (e) { return 'ERR ' + e.message; } })()`, true);
+      process.stdout.write(`[eval] ${v}\n`);
+    } catch (err) {
+      process.stdout.write(`[eval] <unavailable: ${err && err.message}>\n`);
+    }
+  }, EVAL_EVERY);
+  win.on('closed', () => clearInterval(timer));
 }
 
 // -------------------------------------------------------------------- menu
@@ -272,6 +307,20 @@ function buildMenu() {
 
 // ------------------------------------------------------------ capture mode
 
+/** Poll CAPTURE_READY in the renderer until truthy, or give up. */
+async function waitForReady(win) {
+  const deadline = Date.now() + CAPTURE_DELAY;
+  for (;;) {
+    let ok = false;
+    try {
+      ok = await win.webContents.executeJavaScript(`!!(${CAPTURE_READY})`, true);
+    } catch { /* page still loading */ }
+    if (ok) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
 async function capture(win) {
   const image = await win.webContents.capturePage();
   await fsp.mkdir(path.dirname(CAPTURE_PATH), { recursive: true });
@@ -304,9 +353,18 @@ app.whenReady().then(() => {
 
   if (CAPTURE_PATH || QUIT_AFTER) {
     win.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
+      const go = async () => {
         try {
-          if (CAPTURE_PATH) await capture(win);
+          if (CAPTURE_PATH) {
+            if (CAPTURE_READY && !(await waitForReady(win))) {
+              errorCount++;
+              process.stderr.write(`[shell] timed out waiting for ${CAPTURE_READY}\n`);
+            }
+            // one more paint after the flag flips, so the screenshot is of the
+            // frame the page just drew and not the one before it
+            await new Promise((r) => setTimeout(r, 400));
+            await capture(win);
+          }
         } catch (err) {
           errorCount++;
           process.stderr.write(`[shell] capture failed: ${err && err.message}\n`);
@@ -317,7 +375,9 @@ app.whenReady().then(() => {
         // give it half a second and then leave the hard way
         setTimeout(() => process.exit(code), 500).unref();
         app.exit(code);
-      }, CAPTURE_PATH ? CAPTURE_DELAY : QUIT_AFTER);
+      };
+      if (CAPTURE_PATH && CAPTURE_READY) void go();
+      else setTimeout(go, CAPTURE_PATH ? CAPTURE_DELAY : QUIT_AFTER);
     });
   }
 }).catch((err) => {

@@ -837,6 +837,46 @@
 }
 .fe-row-v u { font-style: normal; text-decoration: none; color: rgba(255, 255, 255, 0.18); font-size: 12px; }
 .fe-row-v.warn { color: #ff8d7d; }
+
+/* --- §7.3 volume faders: gold fill in a dark groove, numeric readout ------ */
+.fe-vol {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  cursor: ew-resize;
+  touch-action: none;           /* drag must not become a page scroll */
+}
+.fe-vol-groove {
+  position: relative;
+  display: block;
+  width: 190px;
+  height: 9px;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #05070c, #131924);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.9),
+              inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+.fe-vol-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 5px 0 0 5px;
+  background: linear-gradient(90deg, var(--fe-gold-dim), var(--fe-gold));
+  box-shadow: 0 0 10px rgba(255, 206, 74, 0.30);
+  transition: width var(--fe-fast) linear;
+}
+.fe-vol-num {
+  display: inline-block;
+  min-width: 2.6em;             /* 0 / 55 / 100 must not shuffle the row */
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  color: #8e99ad;
+}
+.fe-row.focus .fe-vol-num { color: var(--fe-gold); }
+.fe-row.focus .fe-vol-groove { box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.9), inset 0 0 0 1px rgba(255, 206, 74, 0.45); }
+/* a fader at zero still reads as a control, not as a broken bar */
+.fe-vol[aria-valuenow="0"] .fe-vol-num { color: #6f7a8f; }
 .fe-row.focus {
   background: linear-gradient(90deg, rgba(255, 206, 74, 0.22), rgba(255, 206, 74, 0.02) 78%);
   border-left-color: var(--fe-gold);
@@ -1157,6 +1197,17 @@
   color: #d6dde9;
 }
 .fe-pause-opt.primary { border-left-color: var(--fe-gold); color: #fff; }
+/* the one live control on the pause card: master volume, ◀ ▶ or drag */
+.fe-pause-vol {
+  justify-content: space-between;
+  margin-top: 12px;
+  border-left-color: var(--fe-gold);
+  cursor: default;
+}
+.fe-pause-vol .fe-row-k { font-size: 13px; letter-spacing: 0.14em; color: #d6dde9; }
+.fe-pause-vol .fe-vol-groove { width: 150px; }
+.fe-pause-vol .fe-vol-num { color: var(--fe-gold); }
+.fe-pause-vol .fe-row-v u { color: var(--fe-gold); }
 
 /* =============================== tournament hub / roster editor overrides ==
    Those two screens still build ui.css tables. `.fe-skin` is added to their

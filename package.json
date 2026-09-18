@@ -19,7 +19,9 @@
     "app:build": "npm run build && node electron/package.mjs",
     "app:smoke": "node electron/smoke.mjs",
     "app:bench": "node electron/bench.mjs",
-    "test:input": "tsx src/input/input.test.ts"
+    "test:input": "tsx src/input/input.test.ts",
+    "test:football": "tsx scripts/footballStats.ts",
+    "test:volume": "node tools/volume-smoke.mjs"
   },
   "repository": {
     "type": "git",

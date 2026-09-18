@@ -119,6 +119,27 @@ export const TonemapGradeShader = {
       float d = distance(vUv, vec2(0.5));
       c.rgb *= 1.0 - vignette * smoothstep(0.32, 0.92, d);
 
+      // ---- output dither ----
+      // The whole chain up to here is half-float. The screen is 8 bits. A sky
+      // gradient that crosses 200 pixels while changing by four code values
+      // gets quantised into four visible bands, and that banding is the single
+      // most "cheap render" artefact left in the frame — it is exactly what
+      // the eye reads as low bit depth, and at DPR 2 the bands are TWICE as
+      // wide in screen terms, so a Retina panel makes it worse, not better.
+      //
+      // The fix is half a code value of noise, applied before quantisation, so
+      // the error is spread instead of stepped. A triangular PDF (two hashes
+      // differenced) is the right shape: uniform noise leaves a residual bias
+      // at the band edges that reads as a faint remaining stripe.
+      //
+      // Applied here rather than in OutputPass because this is the last place
+      // the value is still linear-ish and, more importantly, the last pass
+      // that is already reading and writing this pixel.
+      vec2 dp = gl_FragCoord.xy;
+      float r0 = fract(sin(dot(dp, vec2(12.9898, 78.233))) * 43758.5453);
+      float r1 = fract(sin(dot(dp + 17.31, vec2(12.9898, 78.233))) * 43758.5453);
+      c.rgb += (r0 - r1) * (1.0 / 255.0);
+
       gl_FragColor = vec4(clamp(c.rgb, 0.0, 1.0), c.a);
     }
   `,

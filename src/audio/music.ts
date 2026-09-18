@@ -52,7 +52,12 @@ export class MusicPlayer {
   private step = 0;
   private track: MusicTrack = 'menu';
 
-  start(ctx: AudioContext, track: MusicTrack = 'menu'): void {
+  /**
+   * `dest` is the engine's MUSIC fader (AudioEngine.musicBus()); without one
+   * the player falls back to the raw destination, which is what the headless
+   * harnesses get.
+   */
+  start(ctx: AudioContext, track: MusicTrack = 'menu', dest?: AudioNode | null): void {
     if (this.timer !== null) {
       if (this.track === track) return;
       this.stop(); // crossfade-ish: old master ramps down while the new starts
@@ -61,7 +66,7 @@ export class MusicPlayer {
     this.track = track;
     this.master = ctx.createGain();
     this.master.gain.value = 0.0;
-    this.master.connect(ctx.destination);
+    this.master.connect(dest ?? ctx.destination);
     this.master.gain.setTargetAtTime(TRACKS[track].volume, ctx.currentTime, 0.5);
     this.nextStepTime = ctx.currentTime + 0.1;
     this.step = 0;

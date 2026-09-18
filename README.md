@@ -54,7 +54,44 @@ npm run app:bench -- --pin window                   # the frame THIS panel draws
 npm run app:bench -- --quality medium --label med   # another level
 npm run app:bench -- --situations corner --secs 3   # iterate on one
 npm run app:bench -- --profile samples:0            # A/B one profile field
+npm run app:bench -- --pin off --panel              # NO pinning: the frame a
+                                                    # player really gets, with
+                                                    # the adaptive valve live
+npm run app:bench -- --burst 20x10                  # longer burst → a cleaner
+                                                    # `best ms` on a busy machine
+npm run app:bench -- --eval 'window.__ss26Grass'    # print live renderer state
 ```
+
+`--pin off` is the only mode that can answer *what resolution am I actually
+seeing*: every other mode fixes the drawing buffer and disables the adaptive
+resolution valve by construction. Its report carries a `gfx` block with the
+buffer size, the pixel ratio, the adaptive step, the composer's own target and
+the AA in force. The same read-out is available in-game as an overlay with
+`?gfx=1` (or `?gfx=log`, which prints it to the console every two seconds
+instead — which is what the native shell's stdout wants).
+
+**`best ms` vs `burst ms`.** The burst phase redraws one settled frame in
+chunks; `burst ms` is the mean of those chunks and `best ms` is the cleanest
+one. On a laptop that is doing something else — another capture run, a build —
+the mean measures the other process and only `best ms` is worth quoting. If
+the two are far apart, the machine was busy and the run should be repeated.
+
+### `node tools/gpu-stills.mjs` — real-GPU stills at DPR 2
+
+`npm run capture` is the reproducible gate, and it is 1280x720 at pixel ratio 1
+under SwiftShader — which cannot show the two things a Retina laptop actually
+reveals: sharpness at 2x and how the anti-aliasing interacts with it. This runs
+the same deterministic `?capture=<shot>` pages in the native shell with the GPU
+on and screenshots the DEVICE pixels.
+
+```bash
+node tools/gpu-stills.mjs                              # the default four
+node tools/gpu-stills.mjs --shots tele_endzone --label after
+node tools/gpu-stills.mjs --size 1440x810 --out captures/foo
+```
+
+It is a companion to `npm run capture`, never a replacement: these PNGs are not
+reproducible across machines and must not be used as a baseline to diff.
 
 Two numbers, and they are not the same number. **fps / 1% low** come from a
 vsync-paced roll and answer *does it hold 60*. **frame ms** is the presented

@@ -39,3 +39,7 @@ export const KICK_COOLDOWN = 0.28;         // can't re-touch own kick, makes pas
 export const SIM_DT = 1 / 60;
 export const CPU_DECISION_TICK = 0.3;      // §6.2
 export const SHOT_MAX_HOLD = 0.8;          // §5 hold-to-power
+// Pass power is also hold-to-power, but on a much shorter fuse: a tap is a
+// 5-yard ball to feet, a full hold is a driven 30-yard pass. Short enough that
+// passing still feels like flicking a marble (§2 pillar 1).
+export const PASS_MAX_HOLD = 0.45;

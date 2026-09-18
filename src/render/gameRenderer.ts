@@ -17,7 +17,17 @@ import { SkinnedPlayerMesh, actionClipReport } from './skinnedPlayer';
 import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
 import { CameraDirector, type CamMode, type ModeOptions } from './camera';
-import { HALF_L } from '../sim/constants';
+import { HALF_L, SIM_DT } from '../sim/constants';
+
+/**
+ * Ground speed above which a position change is a TELEPORT, not locomotion.
+ *
+ * A sprint tops out around 10 m/s and a keeper's dive is capped at 11; a
+ * penalty being set up moves twenty-two men across the pitch in one tick.
+ * Anything past this is the sim cutting, and asking a run cycle to cover it
+ * would give the whole squad one frame at RATE_MAX.
+ */
+const TELEPORT_SPEED = 14;
 
 interface Snap {
   x: number; y: number; facing: number; speed: number;
@@ -34,7 +44,7 @@ export interface PlayerView {
   updateLOD(camera: THREE.Camera): void;
   /** §6.3 keeper state, for a pipeline that can use it. Outfielders get null;
    *  the capsule path does not implement this at all. */
-  setKeeperState?(state: string | null, lateral: number): void;
+  setKeeperState?(state: string | null, lateral: number, clip?: string | null): void;
   update(dt: number, x: number, y: number, z: number, facing: number, speed: number,
     anim: ActionAnim, animT: number): void;
   dispose(): void;
@@ -330,17 +340,30 @@ export class GameRenderer {
   private feedKeeperState(): void {
     const all = this.match.allPlayers;
     for (let i = 0; i < all.length; i++) {
-      this.playerMeshes[i]?.setKeeperState?.(null, 0);
+      this.playerMeshes[i]?.setKeeperState?.(null, 0, null);
     }
     for (const brain of this.match.keepers) {
       const i = all.indexOf(brain.keeper);
       if (i < 0) continue;
       const k = brain.keeper;
-      const sp = Math.hypot(k.vel.x, k.vel.y);
+      // Which way he is sliding, measured the same way snapshot() measures his
+      // speed: off the ground he actually covered, not off vel. A dive and a
+      // penalty shuffle both move him without ever writing vel, and reading
+      // vel there returned a lateral of 0 — so the sidestep never came up and
+      // the sidestep is the entire reason this number exists.
+      const cur = this.currSnaps[i];
+      const prv = this.prevSnaps[i];
+      let dx = k.vel.x, dy = k.vel.y;
+      if (cur && prv) {
+        const mx = (cur.x - prv.x) / SIM_DT, my = (cur.y - prv.y) / SIM_DT;
+        const m = Math.hypot(mx, my);
+        if (m > Math.hypot(dx, dy) && m < TELEPORT_SPEED) { dx = mx; dy = my; }
+      }
+      const sp = Math.hypot(dx, dy);
       // his own right, in sim coords: forward is (cos f, sin f)
       const lateral = sp > 0.05
-        ? (k.vel.x * Math.sin(k.facing) - k.vel.y * Math.cos(k.facing)) / sp : 0;
-      this.playerMeshes[i]?.setKeeperState?.(brain.state, lateral);
+        ? (dx * Math.sin(k.facing) - dy * Math.cos(k.facing)) / sp : 0;
+      this.playerMeshes[i]?.setKeeperState?.(brain.state, lateral, brain.animClip);
     }
   }
 
@@ -349,10 +372,27 @@ export class GameRenderer {
     this.prevSnaps = this.currSnaps;
     this.prevBall = this.currBall;
     const players = this.match.allPlayers;
-    this.currSnaps = players.map((p) => ({
-      x: p.pos.x, y: p.pos.y, facing: p.facing,
-      speed: Math.hypot(p.vel.x, p.vel.y),
-    }));
+    this.currSnaps = players.map((p, i) => {
+      // The animation layer is rate-matched against the ground the body
+      // actually covers, and PlayerEntity.vel is NOT that number in every
+      // case: a keeper's dive integrates pos straight off diveVel and never
+      // touches vel, and a phase machine that writes pos directly (the penalty
+      // controller's sway on the line used to) does not touch it either. Both
+      // of those reported speed 0 while translating metres — which is the
+      // definition of a slide, and is exactly what the goalkeeper was doing
+      // through a whole shootout.
+      //
+      // So: take the larger of the velocity and the distance actually covered.
+      // Never the smaller — a player accelerating from a standstill is moving
+      // his feet before the position catches up — and never a teleport.
+      let speed = Math.hypot(p.vel.x, p.vel.y);
+      const q = this.prevSnaps[i];
+      if (q) {
+        const moved = Math.hypot(p.pos.x - q.x, p.pos.y - q.y) / SIM_DT;
+        if (moved > speed && moved < TELEPORT_SPEED) speed = moved;
+      }
+      return { x: p.pos.x, y: p.pos.y, facing: p.facing, speed };
+    });
     const b = this.match.ball.pos;
     this.currBall = [b.x, b.y, b.z];
 

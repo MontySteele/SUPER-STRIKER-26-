@@ -25,6 +25,7 @@ import { applyRosterOverrides } from './data/roster';
 import { TournamentUI } from './ui/tournamentUI';
 import { AudioEngine } from './audio/audio';
 import { MusicPlayer, musicSetting } from './audio/music';
+import { VOLUME_BUSES, VOLUME_EVENT, volumeSetting, type VolumeChangeDetail } from './audio/volume';
 import { Commentary } from './audio/commentary';
 import { SIM_DT } from './sim/constants';
 import type { TeamData } from './data/types';
@@ -38,7 +39,16 @@ const music = new MusicPlayer();
 const commentary = new Commentary(audio);
 // always-on audio hook: pipeline/audio/smoke.mjs checks the voice pack and the
 // stingers from the menu, long before any match publishes `__ss26`
-(window as unknown as Record<string, unknown>).__ss26audio = { audio, commentary };
+(window as unknown as Record<string, unknown>).__ss26audio = {
+  audio,
+  commentary,
+  music,
+  // §7.3: what the four faders are actually doing to the graph right now —
+  // tools/volume-smoke.mjs asserts the persisted values reached these nodes
+  volumes: () => Object.fromEntries(VOLUME_BUSES.map((b) => [b, {
+    pct: volumeSetting(b), gain: audio.volumeGainOf(b),
+  }])),
+};
 
 let inMenus = true;
 
@@ -48,10 +58,21 @@ function applyMusic(): void {
   const s = musicSetting();
   const want = s === 'off' ? null : inMenus ? 'menu' : s === 'all' ? 'match' : null;
   if (!want || !ctx) { music.stop(); return; }
-  music.start(ctx, want);
+  music.start(ctx, want, audio.musicBus());
 }
 // the menu settings row toggles the persisted value, then pokes us
 window.addEventListener('ss26-music-change', applyMusic);
+
+// §7.3 volume faders: the menu and the pause overlay only write localStorage
+// and fire this; the engine is ours, so the push into the graph lives here.
+// The tick plays INTO the fader that moved, which is what makes dragging a
+// slider audible at the level you just chose.
+window.addEventListener(VOLUME_EVENT, (e) => {
+  audio.unlock();
+  audio.applyVolumes();
+  const bus = (e as CustomEvent<VolumeChangeDetail>).detail?.bus;
+  if (bus) audio.volumeTick(bus);
+});
 
 // §7A.7: the graphics level is baked into the renderer at construction, so the
 // attract match behind the menu has to be rebuilt to show the new one. Only
@@ -75,10 +96,18 @@ window.addEventListener('ss26-attract-resume', () => {
   if (inMenus && !attractMatch) startAttract();
 });
 
-hub.onAnyButton = () => {
+const unlockAndMusic = (): void => {
   audio.unlock();
   applyMusic();
 };
+hub.onAnyButton = unlockAndMusic;
+// the front end polls pads itself (the match loop is not running there), so
+// a pad-only session never produced a keydown/pointerdown for audio.ts to see
+window.addEventListener('ss26-any-input', unlockAndMusic);
+// the native shell relaxes the autoplay policy: no gesture needed, start now
+if ((window as unknown as { ss26Native?: { isNative?: boolean } }).ss26Native?.isNative) {
+  setTimeout(unlockAndMusic, 0);
+}
 
 // §5.4 hot-plug. In the menus a new pad just shows up (Menu and Lobby both
 // listen for gamepadconnected and re-render, so it can take a seat straight

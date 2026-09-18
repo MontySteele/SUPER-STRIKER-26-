@@ -29,7 +29,7 @@ import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import { preloadCharacters } from '../render/characterAssets';
 import { forceQuality, overrideProfile, type QualityLevel, type QualityProfile } from '../render/quality';
-import type { TimeOfDay } from '../render/scene';
+import type { GfxStats, TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { SIM_DT } from '../sim/constants';
 import { Match } from '../sim/match';
@@ -65,8 +65,18 @@ const PREROLL_MS = 2500;
 //     demonstrably takes 33ms to present, because ANGLE-on-Metal's finish
 //     returns when OUR commands are done and not when the frame is on screen.
 //     A saturated queue has nowhere to hide that difference.
-const BURST_CHUNKS = 6;
-const BURST_PER_CHUNK = 8;
+//
+// Both are tunable from the URL (`&burst=12x16`) for one reason: this is a
+// LAPTOP, and a laptop runs other things. When the machine is loaded, every
+// chunk picks up whatever CPU contention it happened to meet, and the mean of
+// six chunks is then a measurement of the other process. More chunks plus the
+// MINIMUM (reported as frameMs.min) is the answer — the cleanest chunk of a
+// long run is the closest thing to an uncontended number you can get without
+// owning the machine, and it is the one to quote in an A/B.
+const DEFAULT_BURST_CHUNKS = 6;
+const DEFAULT_BURST_PER_CHUNK = 8;
+let BURST_CHUNKS = DEFAULT_BURST_CHUNKS;
+let BURST_PER_CHUNK = DEFAULT_BURST_PER_CHUNK;
 
 export interface BenchSituation {
   name: string;
@@ -135,8 +145,9 @@ export interface BenchResult {
   /** the presented intervals themselves — a clean 16.7 vs a clean 33.3 is the
    *  difference between "we fit" and "we miss every other vsync" */
   intervalMs: { p50: number; p95: number; max: number };
-  /** what the frame costs with the queue saturated (the burst phase) */
-  frameMs: { avg: number; p50: number; p95: number; p99: number; max: number };
+  /** what the frame costs with the queue saturated (the burst phase). `min` is
+   *  the cleanest chunk of the run — the number to use on a shared machine. */
+  frameMs: { min: number; avg: number; p50: number; p95: number; p99: number; max: number };
   /** 1000 / frameMs.avg — the unpaced throughput of this frame */
   headroomFps: number;
   triangles: { avg: number; max: number };
@@ -152,6 +163,9 @@ export interface BenchReport {
   canvas: { cssWidth: number; cssHeight: number; ratio: number; width: number; height: number };
   window: { innerWidth: number; innerHeight: number; devicePixelRatio: number };
   renderer: string;
+  /** what the resolution valve was doing when the last situation ended.
+   *  Under `&pin=off` this is the answer to "what does the player see". */
+  gfx: GfxStats | null;
   situations: BenchResult[];
 }
 
@@ -182,7 +196,12 @@ const breathe = (): Promise<void> => new Promise((r) => { setTimeout(r, 0); });
 /** `&pin=window` measures the frame this shell window would really draw
  *  instead of the fixed 1920x1080@2 one — useful when the machine's panel is
  *  smaller than the target and the compositor's rescale is in the numbers. */
-function pinnedSize(mode: string | null): { w: number; h: number; ratio: number } {
+function pinnedSize(mode: string | null): { w: number; h: number; ratio: number } | null {
+  // `&pin=off` does NOT pin: the shell window's own size, the adaptive
+  // resolution valve live, i.e. exactly the frame a player gets. This is the
+  // only mode that can answer "what resolution am I actually seeing" — every
+  // other mode disables the valve by construction.
+  if (mode === 'off' || mode === 'none' || mode === 'live') return null;
   // `&pin=1280x720@2` pins an arbitrary frame — how the fill-rate question
   // ("is this resolution-bound or geometry-bound?") gets answered
   const m = mode?.match(/^(\d+)x(\d+)(?:@(\d+(?:\.\d+)?))?$/);
@@ -198,8 +217,12 @@ function pinnedSize(mode: string | null): { w: number; h: number; ratio: number 
 }
 
 async function runSituation(
-  canvas: HTMLCanvasElement, s: BenchSituation, pin: { w: number; h: number; ratio: number },
-): Promise<{ result: BenchResult; buffer: { width: number; height: number; ratio: number } }> {
+  canvas: HTMLCanvasElement, s: BenchSituation, pin: { w: number; h: number; ratio: number } | null,
+): Promise<{
+  result: BenchResult;
+  buffer: { width: number; height: number; ratio: number };
+  gfx: GfxStats;
+}> {
   const match = new Match({
     home: findTeam(s.home),
     away: findTeam(s.away),
@@ -212,7 +235,7 @@ async function runSituation(
   });
   const renderer = new GameRenderer(canvas, match, s.timeOfDay, s.stadium);
   match.events.on((e) => renderer.onEvent(e));
-  renderer.sceneMgr.pinRenderSize(pin.w, pin.h, pin.ratio);
+  if (pin) renderer.sceneMgr.pinRenderSize(pin.w, pin.h, pin.ratio);
 
   const present = s.cutscene
     ? new Presentation(renderer, match, {
@@ -305,6 +328,10 @@ async function runSituation(
 
   info.autoReset = prevAutoReset;
   const buffer = renderer.sceneMgr.bufferSize();
+  // taken BEFORE dispose(): under `&pin=off` this is the whole point of the
+  // run — what the adaptive valve settled on, and how big the buffer it is
+  // feeding the composer really is
+  const gfx = renderer.sceneMgr.gfxStats();
 
   const sortedCost = costs.slice().sort((a, b) => a - b);
   const sortedInterval = intervals.slice().sort((a, b) => a - b);
@@ -325,27 +352,29 @@ async function runSituation(
       max: r2(Math.max(...intervals, 0)),
     },
     frameMs: {
+      min: r2(Math.min(...costs, Infinity)),
       avg: r2(mean(costs)),
       p50: r2(pct(sortedCost, 0.5)),
       p95: r2(pct(sortedCost, 0.95)),
       p99: r2(pct(sortedCost, 0.99)),
       max: r2(Math.max(...costs, 0)),
     },
-    headroomFps: r1(1000 / Math.max(mean(costs), 1e-6)),
+    // quoted off the cleanest chunk, for the same reason min exists
+    headroomFps: r1(1000 / Math.max(Math.min(...costs, Infinity), 1e-6)),
     triangles: { avg: Math.round(mean(tris)), max: Math.max(...tris, 0) },
     drawCalls: { avg: Math.round(mean(calls)), max: Math.max(...calls, 0) },
   };
 
   present?.dispose();
   renderer.dispose();
-  return { result, buffer };
+  return { result, buffer, gfx };
 }
 
 /** A fixed-width table, printed to the console so the runner can forward it. */
 export function benchTable(report: BenchReport): string {
-  const head = ['situation', 'fps', '1% low', 'frame ms', 'burst ms', 'max ms', 'headroom',
-    'tris', 'calls'];
-  const w = [22, 7, 7, 9, 9, 7, 9, 10, 7];
+  const head = ['situation', 'fps', '1% low', 'frame ms', 'burst ms', 'best ms', 'max ms',
+    'headroom', 'tris', 'calls'];
+  const w = [22, 7, 7, 9, 9, 8, 7, 9, 10, 7];
   const rows = report.situations.map((s) => [
     s.name,
     s.fps.avg.toFixed(1),
@@ -353,6 +382,7 @@ export function benchTable(report: BenchReport): string {
     // the presented interval IS the frame time the player lives with
     s.intervalMs.p50.toFixed(2),
     s.frameMs.avg.toFixed(2),
+    s.frameMs.min.toFixed(2),
     s.frameMs.max.toFixed(2),
     s.headroomFps.toFixed(1),
     String(s.triangles.avg),
@@ -361,10 +391,17 @@ export function benchTable(report: BenchReport): string {
   const line = (cells: string[]): string =>
     cells.map((c, i) => (i === 0 ? c.padEnd(w[i]) : c.padStart(w[i]))).join(' ');
   const c = report.canvas;
+  const g = report.gfx;
   return [
     `bench "${report.label}" — quality ${report.quality}, `
       + `${c.cssWidth}x${c.cssHeight} @${c.ratio} = ${c.width}x${c.height} device px`
       + ` (shell window ${report.window.innerWidth}x${report.window.innerHeight})`,
+    g
+      ? `  ${g.pinned ? 'PINNED' : 'LIVE'} — scale x${g.scale} (step ${g.step}/`
+        + `${g.steps.length - 1}), composer ${g.composer.w}x${g.composer.h}, `
+        + `aa ${g.aa}, msaa ${g.msaaSamples}x, sharpen ${g.sharpen}, aniso ${g.anisotropy}, `
+        + `vsync ${g.vsyncMs}ms — ${g.note}`
+      : '',
     report.renderer,
     line(head),
     line(w.map((n) => '-'.repeat(n))),
@@ -403,6 +440,8 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
     const wanted = arg && arg !== '1' && arg !== 'all'
       ? arg.split(',').map((x) => x.trim()).filter(Boolean) : null;
     const secs = Number(params.get('secs') || 0);
+    const burst = params.get('burst')?.match(/^(\d+)x(\d+)$/);
+    if (burst) { BURST_CHUNKS = Number(burst[1]); BURST_PER_CHUNK = Number(burst[2]); }
     const list = (wanted
       ? wanted.map((n) => {
         const hit = SITUATIONS.find((s) => s.name === n);
@@ -415,11 +454,13 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
 
     const pin = pinnedSize(params.get('pin'));
     const results: BenchResult[] = [];
-    let buffer = { width: 0, height: 0, ratio: pin.ratio };
+    let buffer = { width: 0, height: 0, ratio: pin?.ratio ?? 0 };
+    let gfx: GfxStats | null = null;
     for (const s of list) {
       const out = await runSituation(canvas, s, pin);
       results.push(out.result);
       buffer = out.buffer;
+      gfx = out.gfx;
       console.info(`bench ${s.name}: ${out.result.fps.avg}fps `
         + `(1% low ${out.result.fps.low1}), ${out.result.frameMs.avg}ms/frame`);
       await breathe();
@@ -433,7 +474,9 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
       quality,
       profileOverride: profileArg,
       canvas: {
-        cssWidth: pin.w, cssHeight: pin.h, ratio: pin.ratio,
+        cssWidth: pin?.w ?? window.innerWidth,
+        cssHeight: pin?.h ?? window.innerHeight,
+        ratio: pin?.ratio ?? buffer.ratio,
         width: buffer.width, height: buffer.height,
       },
       window: {
@@ -444,6 +487,7 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
       renderer: dbg && gl
         ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL))
         : 'unknown GPU',
+      gfx,
       situations: results,
     };
 

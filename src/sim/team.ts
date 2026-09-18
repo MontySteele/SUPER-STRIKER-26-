@@ -23,6 +23,10 @@ export class Team {
   possessionTicks = 0;
   shots = 0;
   shotsOnTarget = 0;
+  /** Passes struck (short/loft/through — clearances and shots excluded). */
+  passes = 0;
+  /** Passes that reached a team-mate. */
+  passesCompleted = 0;
 
   constructor(
     public data: TeamData,

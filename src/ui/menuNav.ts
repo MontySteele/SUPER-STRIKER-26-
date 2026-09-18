@@ -12,6 +12,32 @@
 
 export type NavDir = 'up' | 'down' | 'left' | 'right';
 
+// Mouse hover only counts while the mouse is actually being used. A focused
+// tile grows, so a re-layout under a STATIONARY cursor makes Chromium fire
+// mouseenter on whatever tile now sits under it — with a pad in hand that
+// snatched the focus straight back to the tile the cursor happened to rest
+// on. Real pointer movement re-arms hover; pad or key input disarms it and
+// hides the cursor (fullscreen with a pad should look like a console).
+let lastMouseMove = 0;
+let cursorHidden = false;
+if (typeof window !== 'undefined') {
+  window.addEventListener('mousemove', (e) => {
+    if (e.movementX === 0 && e.movementY === 0) return;
+    lastMouseMove = performance.now();
+    if (cursorHidden) { document.documentElement.style.cursor = ''; cursorHidden = false; }
+  });
+}
+export function mouseIsLive(): boolean {
+  return performance.now() - lastMouseMove < 400;
+}
+/** Pad/key input happened: hide the cursor and tell main (audio unlock, music). */
+export function noteNonMouseInput(): void {
+  lastMouseMove = 0;
+  if (!cursorHidden) { document.documentElement.style.cursor = 'none'; cursorHidden = true; }
+  window.dispatchEvent(new Event('ss26-any-input'));
+}
+
+
 export interface NavHandlers {
   onDir?: (d: NavDir) => void;
   onConfirm?: () => void;
@@ -192,7 +218,7 @@ export class MenuNav {
       }
       this.held.set(gp.index, state);
 
-      if (pressedSomething) this.h.onAny?.();
+      if (pressedSomething) { noteNonMouseInput(); this.h.onAny?.(); }
     }
   }
 }

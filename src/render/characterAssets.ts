@@ -110,9 +110,13 @@ export interface ClipSpec {
 
 export type ClipId =
   | 'idle' | 'trudge' | 'walk' | 'jog' | 'run' | 'sprint'
-  | 'gkIdle' | 'gkHold' | 'gkStepL' | 'gkStepR'
-  | 'kickA' | 'kickB' | 'kickC' | 'kickD' | 'header'
+  | 'gkIdle' | 'gkHold' | 'gkStepL' | 'gkStepR' | 'gkGetUp'
+  | 'gkThrow' | 'gkPunt'
+  | 'kickA' | 'kickB' | 'kickC' | 'kickD' | 'header' | 'trap'
   | 'slide' | 'diveL' | 'diveR' | 'collect' | 'celebrate' | 'dejected'
+  // --- the keeper's save repertoire, picked by ball height at the save point
+  // (KeeperBrain / PenaltyController set the row; SkinnedPlayerMesh plays it)
+  | 'diveLowL' | 'diveLowR' | 'catchHigh' | 'catchHighRun' | 'collectLow'
   // --- presentation (§7, src/present): the cutscene set. These are never
   // reached by the sim's ActionAnim table — a scripted scene names them.
   | 'strut' | 'happyWalk' | 'happyRun'
@@ -166,6 +170,32 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
     anim: ['mx_Goalkeeper_Right_Sidestep', 'mx_Walking_Strafe_To_The_Right',
       'mx_Strafe_Walking_To_The_Right', 'mx_Soccer_Strafe_Right'],
   },
+  // After a dive he is on the grass, and the thing that used to happen next —
+  // standing up in one frame and skating back to the line — is exactly the
+  // artefact this row exists to kill. Anchored on 'sink' (hips lowest = flat
+  // on the deck) so animT = 0 is the moment he starts to push up.
+  gkGetUp: {
+    anim: ['mx_Getting_Up_From_Being_Knocked_Down_On_The_Ground',
+      'mx_Getting_Up_From_Stomach', 'mx_Getting_Up_From_Back'],
+    anchor: 'sink', lead: 0, tail: 1.1, contact: 0, groundSpeed: 0,
+  },
+  // Distribution. The punt anchors on 'strike' for free — peak right-toe speed
+  // relative to the hips IS the boot going through the dropped ball. A throw
+  // has no foot contact to find, so it anchors on the hips' apex, which on an
+  // overhand throw is the step-through, a frame or two either side of release.
+  // No `contact`: it defaults to the anchor, which is what this row wants —
+  // the sim calls ball.kick() and playAnim('loft') in the same tick, so animT 0
+  // is the RELEASE. (A dive is the other way round: there, playAnim fires at
+  // the launch, which is why diveL/diveR pin contact to 0 and keep `lead` as
+  // visible push-off.)
+  gkThrow: {
+    anim: ['mx_Goalkeeper_Far_Overhand_Throw', 'mx_Goalie_Overhand_Throw'],
+    anchor: 'apex', lead: 0.12, tail: 0.6, groundSpeed: 0,
+  },
+  gkPunt: {
+    anim: ['mx_Goalkeeper_Drop_Kicking_Ball'], anchor: 'strike', tail: 0.6,
+    groundSpeed: 0,
+  },
 
   // --- strikes: trimmed to start on the frame the foot goes through the ball.
   // Four so a team does not strike the ball in unison; the two CMU ones are
@@ -175,6 +205,18 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
   kickB: { anim: ['mx_Jogging_And_Kicking_A_Soccerball_Forward', 'cmu_74_04'], anchor: 'strike', tail: 0.6 },
   kickC: { anim: ['cmu_74_05'], anchor: 'strike', tail: 0.6 },
   kickD: { anim: ['cmu_74_06'], anchor: 'strike', tail: 0.6 },
+
+  // The first touch that kills a pass dead (§6.1, ballContact.ts). The sim
+  // plays this on the tick the ball is brought under control, so the same rule
+  // as a strike applies: animT = 0 is the TOUCH. 'strike' finds it — on a
+  // receive, the frame the foot is moving fastest relative to the hips is the
+  // foot going out to meet the ball, not a plant step — and the 0.12s of lead
+  // is there for the blend to come out of rather than to be played.
+  trap: {
+    anim: ['mx_Receiving_A_Soccerball_And_Playing_With_It', 'mx_Soccer_Idle_Chest_Receive',
+      'mx_Soccer_Header_In_Place'],
+    anchor: 'strike', lead: 0.12, tail: 0.45,
+  },
 
   // --- everything else; each falls back to a procedural pose if absent
   header: { anim: ['mx_Soccer_Header_In_Place', 'mx_Idle_Soccer_Header', 'cmu_16_01'], anchor: 'apex', tail: 0.5 },
@@ -193,8 +235,51 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
     anim: ['mx_Goalkeeper_Right_Diving_Save', 'mx_Goalkeeper_Right_Body_Block'],
     anchor: 'apex', lead: 0.5, tail: 0.9, contact: 0,
   },
+  // The low dive is a different ACTION, not a shorter version of the same one:
+  // the body block is the keeper going down behind the ball with his chest,
+  // which is what a shot at his feet or from close range gets. Anchored on
+  // 'sink' — the hips are lowest at the block — so animT = 0 is the save.
+  diveLowL: {
+    anim: ['mx_Goalkeeper_Left_Body_Block', 'mx_Goalkeeper_Left_Diving_Save'],
+    anchor: 'sink', lead: 0.45, tail: 0.9, contact: 0,
+  },
+  diveLowR: {
+    anim: ['mx_Goalkeeper_Right_Body_Block', 'mx_Goalkeeper_Right_Diving_Save'],
+    anchor: 'sink', lead: 0.45, tail: 0.9, contact: 0,
+  },
+  // Above the crossbar-ish and near enough to reach standing: he goes up, not
+  // sideways. 'apex' is the top of the leap, i.e. the frame the hands close.
+  // animT 0 is the CATCH, not the crouch before it: KeeperBrain.pickUp puts the
+  // ball in his gloves and calls playAnim in the same tick, so `contact` is left
+  // to default to the anchor and the 0.45s of lead is there for the blend to
+  // come out of, not to be played.
+  catchHigh: {
+    anim: ['mx_Goalkeeper_Jump_Catching_Ball_High_Height', 'mx_Jump_And_Catch_With_One_Hand',
+      'mx_Goalkeeper_Jump_And_Miss'],
+    anchor: 'apex', lead: 0.45, tail: 1.1,
+  },
+  // Same catch off a run-up: what a cross claimed on the move actually looks
+  // like. The sim only picks this when the keeper is travelling.
+  catchHighRun: {
+    anim: ['mx_Goalkeeper_Running_Jump_Catch_Ball_High_Height',
+      'mx_Goalkeeper_Jump_Catching_Ball_High_Height'],
+    anchor: 'apex', lead: 0.45, tail: 1.1,
+  },
+  // Collects. Both were UNANCHORED, which is where the float came from: with
+  // contact 0 and no trim, animT = 0 was the clip's first frame — the actor
+  // still upright, mid-approach, hips several millimetres above the stance the
+  // archetype's groundOffset was measured on (the walk's frame 0). Anchoring
+  // on 'sink' puts animT = 0 on the frame he is down over the ball, which is
+  // both the moment of contact and the frame his feet are most firmly planted;
+  // what is left is the clip's own residual (6.7mm on the medium catch, 7.2 on
+  // the low one, measured by the pipeline's ground pass into ground_stats.json).
   collect: {
     anim: ['mx_Goalkeeper_Catching_Ball_Medium_Height', 'mx_Goalkeeper_Catching_Ball_Low_Height'],
+    anchor: 'sink', lead: 0.22, tail: 0.5,
+  },
+  collectLow: {
+    anim: ['mx_Goalkeeper_Catching_Ball_Low_Height', 'mx_Goalkeeper_Catching_Ball_Medium_Height'],
+    anchor: 'sink', lead: 0.22, tail: 0.5,
   },
   celebrate: { anim: ['mx_Celebrating_After_A_Win', 'mx_Aj_Victory_Idle', 'mx_Big_Vegas_Victory_Idle'] },
   dejected: { anim: ['mx_Aj_Defeat_Idle', 'mx_Big_Vegas_Defeat_Idle', 'mx_Standing_In_A_Sad_Disposition'] },

@@ -11,16 +11,19 @@ import { effectiveRating } from '../data/loader';
 import type { PlayerInput } from '../input/input';
 import {
   bestPassTarget, executeLoft, executeShortPass, executeShot, executeThrough,
+  executeThrowIn,
 } from './actions';
+import { ballBodyContacts } from './ballContact';
+import { resolveBodyCollisions } from './collision';
 import { cpuDribble, cpuOnBallDecision } from './ai/onBall';
 import { assignDefense, updateDefender } from './ai/defense';
 import { KeeperBrain } from './ai/keeper';
 import { runTarget, shapeTarget } from './ai/teamShape';
 import { Ball } from './ball';
 import {
-  BOX_DEPTH, BOX_HALF_W, CPU_DECISION_TICK, GOAL_HALF_W, GOAL_HEIGHT, HALF_L,
-  HALF_W, PLAYER_CONTROL_RADIUS, PLAYER_TACKLE_RADIUS, SHOT_MAX_HOLD, SIM_DT,
-  SIX_DEPTH,
+  BALL_RADIUS, BOX_DEPTH, BOX_HALF_W, CPU_DECISION_TICK, GOAL_HALF_W,
+  GOAL_HEIGHT, HALF_L, HALF_W, PASS_MAX_HOLD, PLAYER_CONTROL_RADIUS,
+  PLAYER_TACKLE_RADIUS, SHOT_MAX_HOLD, SIM_DT, SIX_DEPTH,
 } from './constants';
 import { OffsideTracker } from './offside';
 import { PenaltyController, type PenResult } from './penalty';
@@ -38,12 +41,14 @@ export interface Difficulty {
   cpuKeeperReactMult: number;  // >1 = slower CPU keeper
   humanShotErrMult: number;    // <1 = more forgiving human shots
   cpuSprint: boolean;          // CPU allowed to sprint freely
+  /** 0..1 pass assist for humans (§5, §6.6): 1 = the game finds the man. */
+  humanPassAssist: number;
 }
 
 export const DIFFICULTIES: Record<DifficultyName, Difficulty> = {
-  amateur: { cpuNoise: 1.7, cpuKeeperReactMult: 1.3, humanShotErrMult: 0.75, cpuSprint: false },
-  pro:     { cpuNoise: 1.0, cpuKeeperReactMult: 1.0, humanShotErrMult: 1.0, cpuSprint: true },
-  legend:  { cpuNoise: 0.5, cpuKeeperReactMult: 0.85, humanShotErrMult: 1.15, cpuSprint: true },
+  amateur: { cpuNoise: 1.7, cpuKeeperReactMult: 1.3, humanShotErrMult: 0.75, cpuSprint: false, humanPassAssist: 1.0 },
+  pro:     { cpuNoise: 1.0, cpuKeeperReactMult: 1.0, humanShotErrMult: 1.0, cpuSprint: true, humanPassAssist: 0.82 },
+  legend:  { cpuNoise: 0.5, cpuKeeperReactMult: 0.85, humanShotErrMult: 1.15, cpuSprint: true, humanPassAssist: 0.6 },
 };
 
 // ------------------------------------------------------------- seat slots (§5.4.6)
@@ -59,6 +64,23 @@ export function slotTeam(slot: number): number { return slot & 1; }
 export function slotRole(slot: number): number { return slot >> 1; }
 /** The slot a given side/role pair lives in. */
 export function teamSlot(teamIdx: number, role: number): number { return role * 2 + teamIdx; }
+
+/**
+ * Advantage (§6.4 says no advantage rule in MVP; this is the cheap version):
+ * seconds the referee lets a body foul run before pulling it back.
+ */
+const ADVANTAGE_WINDOW = 1.8;
+
+/**
+ * Dribbling (§6.1): how far a touch is allowed to run from the carrier before
+ * a nearer opponent can simply take it. Bigger than a close-control touch,
+ * smaller than a heavy one — which is the whole risk of sprinting with it.
+ */
+const LOOSE_TOUCH_GAP = 1.15;
+/** Metres of head start the intended receiver gets on a loose-ball contest. */
+const RECEIVER_PRIORITY = 0.45;
+/** Seconds after a first touch before the carrier knocks it on again. */
+const FIRST_TOUCH_SETTLE = 0.26;
 
 /** How far off the ball the useful off-ball runner sits, in metres. */
 const PARTNER_SUPPORT_RANGE = 14;
@@ -139,6 +161,8 @@ export class Match {
 
   private cpuDecisionTimers = [0, 0];
   private shotCharging = [false, false, false, false];
+  /** Pass fired at max hold; blocks a repeat until the button comes back up. */
+  private passLatched = [false, false, false, false];
   /** Seconds of possession without reaching the final third (per team). */
   buildupTime = [0, 0];
   /** in-flight shot, if any — keepers keep their hands live while one exists */
@@ -149,6 +173,8 @@ export class Match {
   private deferred: { at: number; fn: () => void }[] = [];
   private lastGoalTeamIdx = 0;
   private firstKickoffTeam = 0;
+  /** The pass currently in the air, for completion stats and receiver AI. */
+  passInFlight: { passer: PlayerEntity; intended: PlayerEntity | null; teamIdx: number; at: number } | null = null;
   /** teamIdx whose penalty resumes as this restart after resolve */
   private pendingPenaltyTeam: number | null = null;
 
@@ -261,6 +287,7 @@ export class Match {
     this.phaseTimer = 0;
     this.ball.reset(0, 0);
     this.offside.clear();
+    this.resolvePass(null);
     this.activeShot = null;
     // stale brains teleported the ball into a 'hold' from the previous period
     // and threw phantom dives at kickoff passes
@@ -271,6 +298,7 @@ export class Match {
     for (let s = 0; s < SEAT_SLOTS; s++) {
       this.controlled[s] = null;
       this.shotCharging[s] = false;
+      this.passLatched[s] = false;
     }
     for (let i = 0; i < 2; i++) {
       const primary = this.primarySlot(i);
@@ -295,6 +323,7 @@ export class Match {
     this.seats[slot] = seat;
     this.teams[teamIdx].isHuman = this.primarySlot(teamIdx) >= 0;
     this.shotCharging[slot] = false;
+    this.passLatched[slot] = false;
     if (!seat) {
       this.controlled[slot] = null;
     } else {
@@ -306,6 +335,47 @@ export class Match {
     // the side's roles may have just shuffled — re-derive the pairing so the
     // two humans are never left wearing the same shirt
     this.assignPartner(teamIdx, true);
+  }
+
+  // ---------------------------------------------------------------- passing bookkeeping
+
+  /**
+   * Called by actions.ts the instant a pass is struck. Arms the receiver
+   * intent the AI steers on (`Ball.intendedReceiver`) and opens a completion
+   * record for the stats harness.
+   */
+  registerPassAttempt(passer: PlayerEntity, intended: PlayerEntity | null, aim: V2 | null): void {
+    this.resolvePass(null);           // a previous ball still in the air never arrived
+    this.teams[passer.teamIdx].passes++;
+    this.passInFlight = { passer, intended, teamIdx: passer.teamIdx, at: this.simTime };
+    this.ball.intendedReceiver = intended;
+    this.ball.intendedAim = aim;
+    // offside is a line check at the moment of the pass (§6.4) — EVERY pass,
+    // not just the through ball that used to be the only caller
+    if (intended && !intended.isGK) this.offside.registerPass(passer, intended);
+    else this.offside.clear();
+    // FIFA-style: the stick follows the ball. Handing the human the intended
+    // receiver at the moment of the pass is what makes "pass and move" work —
+    // otherwise he is still steering the passer while the ball runs away.
+    // …but never off the SECOND human on that sofa: if his shirt is the one
+    // you just played the ball to, it stays his. Stealing it would leave him
+    // holding the passer, 10m behind the play (§5.4.6).
+    if (intended && !intended.isGK && !intended.sentOff && !this.humanDriven(intended)) {
+      const slot = this.primarySlot(passer.teamIdx);
+      if (slot >= 0 && this.controlled[slot] === passer) this.setPrimaryControl(passer.teamIdx, intended);
+    }
+  }
+
+  /** Close the open pass record. `receivedBy` null = the pass died. */
+  resolvePass(receivedBy: PlayerEntity | null): void {
+    const p = this.passInFlight;
+    this.ball.intendedReceiver = null;
+    this.ball.intendedAim = null;
+    if (!p) return;
+    this.passInFlight = null;
+    if (receivedBy && receivedBy.teamIdx === p.teamIdx && receivedBy !== p.passer) {
+      this.teams[p.teamIdx].passesCompleted++;
+    }
   }
 
   private nearestOutfield(team: Team, to: V2): PlayerEntity {
@@ -382,6 +452,9 @@ export class Match {
     this.prevBallPos = v2(this.ball.pos.x, this.ball.pos.y);
     const prevZ = this.ball.pos.z;
 
+    // a ball nobody ever collected: the pass is dead, bank it as incomplete
+    if (this.passInFlight && this.simTime - this.passInFlight.at > 4) this.resolvePass(null);
+
     this.updatePossession(dt);
     // an offside whistle mid-possession begins a restart; running the rest of
     // the tick against the freshly-spotted ball converted goalmouth offsides
@@ -392,10 +465,19 @@ export class Match {
     this.updateHumanControl(dt);
     this.updateAI(dt);
     for (const p of this.allPlayers) p.update(dt);
+    // bodies are solid: separate overlaps, jostle, shield, and hand hard
+    // contacts to the referee. A whistle here can start a restart, so bail
+    // before the ball is integrated against a pitch that no longer exists
+    resolveBodyCollisions(this, dt);
+    if (this.phase !== 'play') return;
     this.updateDribble(dt);
+    const prevBall = { x: this.prevBallPos.x, y: this.prevBallPos.y, z: prevZ };
     this.ball.update(dt);
     this.keepers[0].update(this, dt);
     this.keepers[1].update(this, dt);
+    // …then the ball against the bodies it just flew through (the keeper's
+    // hands have already had their chance above, so this is his body block)
+    ballBodyContacts(this, prevBall);
     this.checkGoalAndBounds(prevZ);
     this.updateStatsAndCrowd(dt);
 
@@ -491,10 +573,27 @@ export class Match {
     if (this.keepers[0].holding() || this.keepers[1].holding()) return;
 
     if (ball.owner) {
+      // a touch that has run too far from the man is genuinely loose: if an
+      // opponent is nearer to it than the carrier, it stops being his
+      const carrierGap = dist2(ball.owner.pos, { x: ball.pos.x, y: ball.pos.y });
+      if (carrierGap > LOOSE_TOUCH_GAP) {
+        for (const opp of this.teams[1 - ball.owner.teamIdx].players) {
+          if (opp.sentOff || opp.shieldedOut > 0) continue;
+          if (dist2(opp.pos, { x: ball.pos.x, y: ball.pos.y }) < carrierGap) {
+            ball.owner = null;
+            break;
+          }
+        }
+      }
+    }
+
+    if (ball.owner) {
       // tackle contests: nearby opponents nibble at the ball
       const carrier = ball.owner;
       for (const opp of this.teams[1 - carrier.teamIdx].players) {
         if (opp.diving || opp.sentOff || (this.tackleCooldowns.get(opp) ?? 0) > 0) continue;
+        // a body between him and the ball: he is not getting it this tick
+        if (opp.shieldedOut > 0) continue;
         const d = dist2(opp.pos, carrier.pos);
         if (d < PLAYER_TACKLE_RADIUS) {
           const def = effectiveRating(opp.data, 'defending');
@@ -529,8 +628,9 @@ export class Match {
       return;
     }
 
-    // loose ball: who captures it?
-    if (ball.pos.z > 1.5) return;
+    // loose ball: who captures it? Knee height and below is a foot; anything
+    // higher is the aerial-control path in ballContact.ts.
+    if (ball.pos.z > 1.1) return;
     let best: PlayerEntity | null = null;
     let bestD = PLAYER_CONTROL_RADIUS;
     for (const p of this.allPlayers) {
@@ -539,7 +639,12 @@ export class Match {
       if (p.isGK && ball.speed() > 6) continue;
       if (ball.noControlPlayer === p) continue;
       if (p.actionAnim === 'slide') continue;
-      const d = dist2(p.pos, { x: ball.pos.x, y: ball.pos.y });
+      if (p.shieldedOut > 0) continue;
+      let d = dist2(p.pos, { x: ball.pos.x, y: ball.pos.y });
+      // the man it was played to gets first call on it — he is the one
+      // adjusting his feet for it, and this is what stops a pass being
+      // intercepted by the body it was threaded past
+      if (ball.intendedReceiver === p) d -= RECEIVER_PRIORITY;
       if (d < bestD) { best = p; bestD = d; }
     }
     if (!best) return;
@@ -554,25 +659,59 @@ export class Match {
       return;
     }
 
+    // ---- first touch (§5 feel): a reception is a skill check, and failing it
+    // means a heavy touch you have to chase, NOT a rebound off your shins.
+    // The old model bounced the ball back off the receiver, which is exactly
+    // what a pass "hitting his back" looks like from the couch.
     const sp = ball.speed();
     const skill = effectiveRating(best.data, 'passing');
-    if (sp > 12) {
-      const trapChance = clamp((skill / 99) * (1 - (sp - 12) / 22), 0.1, 0.92);
-      if (this.rng.next() > trapChance) {
-        ball.vel.x *= -0.25 + this.rng.noise() * 0.2;
-        ball.vel.y *= 0.4 + this.rng.noise() * 0.3;
-        ball.vel.z = Math.abs(ball.vel.z) * 0.3 + 1.2;
-        ball.noControlTimer = 0.2;
-        ball.noControlPlayer = best;
-        ball.lastTouch = best;
-        return;
-      }
+    const meantForHim = ball.intendedReceiver === best
+      || (this.passInFlight !== null && this.passInFlight.teamIdx === best.teamIdx);
+    let control = 0.5 + (skill / 99) * 0.48;
+    control -= clamp((sp - 7) / 24, 0, 1) * 0.46;          // pace is hard to kill
+    control -= clamp((ball.pos.z - 0.3) / 0.9, 0, 1) * 0.16; // bouncing is harder
+    if (meantForHim) control += 0.24;                       // he was expecting it
+    if (best.sprinting) control -= 0.1;
+    if (ball.intendedReceiver && ball.intendedReceiver !== best) control -= 0.12; // interception
+    // the keeper only reaches this path for a stray ball rolling to his feet,
+    // and he is allowed to use his hands on it — a 'passing'-rated fumble in
+    // his own six-yard box would be a gift, not drama
+    if (best.isGK) control += 0.25;
+    control = clamp(control, 0.1, 0.97);
+
+    const runDir = len2(best.vel) > 1.2
+      ? norm2(best.vel)
+      : { x: Math.cos(best.facing), y: Math.sin(best.facing) };
+
+    if (this.rng.next() > control) {
+      // heavy touch: it squirts on PAST him, in the direction it was already
+      // travelling, and he has to turn and chase — a loose ball, not a bounce
+      const keep = 0.3 + this.rng.next() * 0.25;
+      const bd = norm2({ x: ball.vel.x, y: ball.vel.y });
+      const spOut = Math.max(sp * keep, 2.2);
+      const a = Math.atan2(bd.y || runDir.y, bd.x || runDir.x) + this.rng.noise() * 0.5;
+      ball.vel.x = Math.cos(a) * spOut;
+      ball.vel.y = Math.sin(a) * spOut;
+      ball.vel.z = Math.max(0, ball.vel.z * 0.3);
+      ball.spinY = 0;
+      ball.noControlTimer = 0.22;
+      ball.noControlPlayer = best;
+      ball.lastTouch = best;
+      best.playAnim('trap', 0.1);
+      this.events.emit({ type: 'bounce', speed: spOut });
+      return;
     }
 
-    // clean capture
+    // clean capture — the touch kills the pace and sets the ball rolling
+    // ahead of him into a dribble, rather than freezing it to his boot
+    this.resolvePass(best);
     ball.owner = best;
     ball.lastTouch = best;
-    ball.vel = { x: best.vel.x, y: best.vel.y, z: 0 };
+    const push = clamp(len2(best.vel) * 0.35 + 0.6, 0.6, 2.4);
+    ball.vel = { x: best.vel.x + runDir.x * push, y: best.vel.y + runDir.y * push, z: 0 };
+    ball.pos.z = BALL_RADIUS;
+    best.touchCd = FIRST_TOUCH_SETTLE;
+    if (sp > 6) best.playAnim('trap', 0.12);
     ball.spinY = 0;
     if (this.possessionTeam !== best.teamIdx) {
       this.possessionTeam = best.teamIdx;
@@ -682,7 +821,11 @@ export class Match {
       let score: number;
       if (attacking) {
         const advance = p.pos.x * team.attackDir;
-        score = Math.abs(d - PARTNER_SUPPORT_RANGE) + (HALF_L - advance) * 0.25;
+        // Being an OUTLET is most of the job: weight how far up the pitch he
+        // is nearly as hard as how far off the ball. With solid bodies the
+        // support distance is easy to satisfy in a crowd, and the old 0.25
+        // left the second human loitering in the same phone box as the first.
+        score = Math.abs(d - PARTNER_SUPPORT_RANGE) * 0.7 + (HALF_L - advance) * 0.5;
       } else {
         const goalSide = (p.pos.x - ballV.x) * Math.sign(ownGoalX - ballV.x) > 0;
         score = d + (goalSide ? 0 : 9);
@@ -703,38 +846,62 @@ export class Match {
     this.events.emit({ type: 'switch', teamIdx, slot });
   }
 
-  /** Close control: the ball is repeatedly touched ahead, never glued (§6.1). */
+  /**
+   * Dribbling (§6.1): the ball is never glued to the foot. It is KNOCKED
+   * ahead on a cadence — small and often at close control, long and rarely at
+   * a sprint — and between touches it simply rolls, which is what makes
+   * interceptions, jockeying and heavy touches emergent rather than scripted.
+   *
+   * Between touches a weak steering assist keeps the ball roughly on the run
+   * line (strong when walking it, almost nothing at full pace), so turning
+   * sharply at speed loses it — as it should.
+   */
   private updateDribble(dt: number): void {
     const ball = this.ball;
     const owner = ball.owner;
     if (!owner) return;
-    if (owner.actionLock > 0.05 && owner.actionAnim !== 'none' && owner.actionAnim !== 'pass') {
+    if (owner.actionLock > 0.05 && owner.actionAnim !== 'none'
+      && owner.actionAnim !== 'pass' && owner.actionAnim !== 'trap'
+      && owner.actionAnim !== 'shield') {
       return; // mid-kick: ball has already been struck
     }
     const speed = len2(owner.vel);
+    const ballV: V2 = { x: ball.pos.x, y: ball.pos.y };
+    const gap = dist2(ballV, owner.pos);
+    if (gap > PLAYER_CONTROL_RADIUS * 1.75) {
+      ball.owner = null; // ran away from him — turn too sharp, or a heavy touch
+      return;
+    }
+
+    const sprinting = owner.sprinting && speed > 5;
+    const ahead = { x: Math.cos(owner.facing), y: Math.sin(owner.facing) };
+
+    if (owner.touchCd <= 0 && speed > 0.8) {
+      // knock it on. Distance scales with pace and doubles at a sprint: that
+      // is the sprint-vs-close-control trade, in one number.
+      const reach = sprinting ? 1.0 + speed * 0.10 : 0.5 + speed * 0.045;
+      const cadence = sprinting ? 0.40 : 0.30;
+      const want = clamp((reach - gap) / cadence, -1.5, sprinting ? 7 : 3.2);
+      ball.vel.x = owner.vel.x + ahead.x * want;
+      ball.vel.y = owner.vel.y + ahead.y * want;
+      ball.vel.z = 0;
+      ball.pos.z = BALL_RADIUS;
+      owner.touchCd = cadence;
+      ball.lastTouch = owner;
+      return;
+    }
+
+    // between touches: let it roll, nudged gently back onto the run line
     const foot: V2 = {
-      x: owner.pos.x + Math.cos(owner.facing) * 0.55,
-      y: owner.pos.y + Math.sin(owner.facing) * 0.55,
+      x: owner.pos.x + ahead.x * 0.5,
+      y: owner.pos.y + ahead.y * 0.5,
     };
-    const d = dist2({ x: ball.pos.x, y: ball.pos.y }, foot);
-
-    if (owner.sprinting && speed > 5.5) {
-      ball.kick(
-        { x: Math.cos(owner.facing), y: Math.sin(owner.facing), z: 0.01 },
-        speed * 1.18 + 1.2, owner,
-      );
-      ball.noControlTimer = 0.18;
-      return;
-    }
-
-    if (d > PLAYER_CONTROL_RADIUS * 1.6) {
-      ball.owner = null; // lost it (turn too sharp)
-      return;
-    }
-    const pull = clamp(d * 14, 0, speed + 7);
-    const dir = norm2(sub2(foot, { x: ball.pos.x, y: ball.pos.y }));
-    ball.vel.x = owner.vel.x + dir.x * pull;
-    ball.vel.y = owner.vel.y + dir.y * pull;
+    const toFoot = sub2(foot, ballV);
+    const assist = 1 - Math.pow(sprinting ? 0.95 : 0.78, dt * 60);
+    const desiredX = owner.vel.x + toFoot.x * 3.2;
+    const desiredY = owner.vel.y + toFoot.y * 3.2;
+    ball.vel.x += (desiredX - ball.vel.x) * assist;
+    ball.vel.y += (desiredY - ball.vel.y) * assist;
     if (ball.pos.z > 0.4) ball.vel.z = -2;
   }
 
@@ -789,10 +956,29 @@ export class Match {
       }
       if (this.shotCharging[slot]) return; // don't pass while charging
 
-      if (seat.consumePress('pass')) {
-        const target = bestPassTarget(this, p, aimDir, {});
-        if (target) executeShortPass(this, p, target);
-        else executeThrough(this, p, aimDir);
+      // Pass is hold-to-power like the shot (§5): the stick picks the ray, the
+      // hold picks how far down it you are looking, and the assist strength
+      // (§6.6) decides how much the game is allowed to find the man for you.
+      const passHeldNow = seat.isHeld('pass');
+      const passRel = seat.consumeRelease('pass');
+      const passHeld = seat.heldDuration('pass');
+      if (this.passLatched[slot]) {
+        // either this hold already fired a pass, or the button was down for
+        // off-ball pressure before he won the ball. Either way its release is
+        // stale — swallow it, and make him ask again.
+        if (!passHeldNow) this.passLatched[slot] = false;
+      } else if (passRel !== null || (passHeldNow && passHeld >= PASS_MAX_HOLD)) {
+        if (passHeldNow) this.passLatched[slot] = true;
+        const heldFor = passRel ? passRel.heldFor : PASS_MAX_HOLD;
+        const power = clamp(heldFor / PASS_MAX_HOLD, 0.2, 1);
+        const target = bestPassTarget(this, p, aimDir, { power });
+        if (target) {
+          executeShortPass(this, p, target, {
+            assist: this.difficulty.humanPassAssist, aimDir,
+          });
+        } else {
+          executeThrough(this, p, aimDir);
+        }
         return;
       }
       if (seat.consumePress('loft')) { executeLoft(this, p, aimDir); return; }
@@ -802,6 +988,10 @@ export class Match {
       if (seat.consumePress('switch')) this.switchPlayer(slot);
       if (seat.isHeld('pass')) {
         p.moveToward({ x: this.ball.pos.x, y: this.ball.pos.y }, 1, sprint);
+        // pass doubles as "pressure" off the ball, and it is held down for
+        // seconds at a time. Latch it so winning the ball mid-press doesn't
+        // instantly fire a blind full-power pass — you have to ask again.
+        this.passLatched[slot] = true;
       }
       if (seat.consumePress('shoot')) this.trySlide(p);
     }
@@ -876,19 +1066,37 @@ export class Match {
     this.deferred.push({ at: this.simTime + 0.22, fn: check });
   }
 
-  private callFoul(victim: PlayerEntity, offender: PlayerEntity): void {
+  /**
+   * Whistle a foul (§6.4). `allowAdvantage` is the simple version of the
+   * advantage rule used by body contacts: if the fouled side still has the
+   * ball when the contact lands, play carries on and the referee only pulls it
+   * back if they lose possession inside ADVANTAGE_WINDOW. Cards are shown
+   * either way — the offence happened.
+   */
+  callFoul(
+    victim: PlayerEntity, offender: PlayerEntity,
+    opts: { allowAdvantage?: boolean; severity?: number } = {},
+  ): void {
+    const severity = clamp(opts.severity ?? 1, 0, 1);
     const offTeam = this.teams[offender.teamIdx];
     const minute = this.displayMinute();
     this.events.emit({ type: 'foul', teamIdx: offender.teamIdx, playerName: offender.data.name, minute });
-    victim.actionLock = Math.max(victim.actionLock, 0.5);
-    this.ball.owner = null;
+    const spot = v2(victim.pos.x, victim.pos.y);
+    const advantage = !!opts.allowAdvantage
+      && this.ball.owner !== null
+      && this.ball.owner.teamIdx === victim.teamIdx;
+    if (!advantage) {
+      victim.actionLock = Math.max(victim.actionLock, 0.5);
+      this.ball.owner = null;
+    }
 
     // from behind risks cards (§6.4)
     const toOff = norm2(sub2(offender.pos, victim.pos));
     const fromBehind = Math.cos(victim.facing) * toOff.x + Math.sin(victim.facing) * toOff.y < -0.2;
-    if (fromBehind || this.rng.next() < 0.25) {
+    const bookable = this.rng.next() < (fromBehind ? 0.9 : 0.25) * severity;
+    if (bookable) {
       offender.yellows++;
-      const straightRed = this.rng.next() < 0.1;
+      const straightRed = this.rng.next() < 0.1 * severity;
       const secondYellow = offender.yellows >= 2;
       if (straightRed || secondYellow) {
         this.events.emit({ type: 'card', color: 'red', teamIdx: offender.teamIdx, playerName: offender.data.name, minute });
@@ -902,11 +1110,30 @@ export class Match {
     const ownGoalSide = Math.sign(-HALF_L * offTeam.attackDir);
     const inBox = victim.pos.x * ownGoalSide > HALF_L - BOX_DEPTH
       && Math.abs(victim.pos.y) < BOX_HALF_W;
+
+    if (advantage && !inBox) {
+      // play on — but the referee remembers. If the fouled side has lost the
+      // ball when the window closes, he brings it back.
+      const team = victim.teamIdx;
+      this.deferred.push({
+        at: this.simTime + ADVANTAGE_WINDOW,
+        fn: () => {
+          if (this.phase !== 'play') return;
+          const keptIt = this.ball.owner?.teamIdx === team
+            || (!this.ball.owner && this.possessionTeam === team);
+          if (keptIt) return;
+          this.beginRestart('freeKick', team, spot);
+        },
+      });
+      return;
+    }
+
     if (inBox) {
+      this.ball.owner = null;
       this.events.emit({ type: 'penaltyAwarded', teamIdx: victim.teamIdx, minute });
       this.beginPenalty(victim.teamIdx);
     } else {
-      this.beginRestart('freeKick', victim.teamIdx, v2(victim.pos.x, victim.pos.y));
+      this.beginRestart('freeKick', victim.teamIdx, spot);
     }
   }
 
@@ -1009,6 +1236,15 @@ export class Match {
           continue;
         }
 
+        // the man the pass was played to goes and MEETS it. Without this the
+        // receiver carries on running his shape line while the ball crosses
+        // behind him — which is precisely "the pass went off his back".
+        if (this.ball.intendedReceiver === p && !owner) {
+          const meet = this.receiveTarget(p);
+          p.moveToward(meet, 1, dist2(p.pos, meet) > 6 && p.stamina > 0.25);
+          continue;
+        }
+
         if (chasers.has(p)) {
           const lead = clamp(dist2(p.pos, ballV) * 0.12, 0, 0.9);
           p.moveToward({
@@ -1033,6 +1269,29 @@ export class Match {
         p.moveToward(shapeTarget(this, team, p), 0.9);
       }
     }
+  }
+
+  /**
+   * Where a receiver should stand to take the ball: the point on the ball's
+   * path closest to him, stepped a short way BACK down that path toward the
+   * ball — the "come to the ball" adjustment every coach shouts. A ball still
+   * in the air is met at its landing spot instead.
+   */
+  private receiveTarget(p: PlayerEntity): V2 {
+    const ball = this.ball;
+    const ballV: V2 = { x: ball.pos.x, y: ball.pos.y };
+    if (ball.pos.z > 0.9 && ball.vel.z > -6) {
+      const land = ball.predictLanding();
+      if (land) return land;
+    }
+    const sp = len2({ x: ball.vel.x, y: ball.vel.y });
+    if (sp < 1) return ball.intendedAim ?? ballV;
+    const dir = norm2({ x: ball.vel.x, y: ball.vel.y });
+    // how far along the ball's line his own position projects
+    const along = clamp((p.pos.x - ballV.x) * dir.x + (p.pos.y - ballV.y) * dir.y, 0, 60);
+    // …then come to it: shorten by up to COME_TO_BALL metres
+    const come = clamp(along * 0.3, 0, 3);
+    return { x: ballV.x + dir.x * (along - come), y: ballV.y + dir.y * (along - come) };
   }
 
   /** Desperate CPU slide when the carrier is getting away. */
@@ -1153,6 +1412,7 @@ export class Match {
       }
     }
     this.activeShot = null;
+    this.resolvePass(null);
     this.lastGoalTeamIdx = scoringTeam;
     this.phase = 'goalseq';
     this.phaseTimer = 0;
@@ -1212,13 +1472,14 @@ export class Match {
     const taker = kind === 'goalKick'
       ? team.keeper
       : this.nearestOutfield(team, pos);
+    this.resolvePass(null);
     this.restart = { kind, teamIdx, pos, timer: 0, taker };
     this.phase = 'restart';
     this.phaseTimer = 0;
     this.ball.reset(pos.x, pos.y);
     this.offside.clear();
     this.activeShot = null;
-    for (let s = 0; s < SEAT_SLOTS; s++) this.shotCharging[s] = false;
+    for (let s = 0; s < SEAT_SLOTS; s++) { this.shotCharging[s] = false; this.passLatched[s] = false; }
     for (let i = 0; i < 2; i++) {
       const primary = this.primarySlot(i);
       if (primary < 0) continue;
@@ -1308,9 +1569,13 @@ export class Match {
         }
         break;
       case 'throwIn':
+        // a throw is a throw: over the head, short, and to a man — not a
+        // 30-metre ground pass struck from outside the touchline
+        executeThrowIn(this, taker, aimDir);
+        break;
       case 'freeKick':
       default: {
-        const t = bestPassTarget(this, taker, aimDir, { maxDist: 32 });
+        const t = bestPassTarget(this, taker, aimDir, { maxDist: 32, cone: Math.PI * 0.8 });
         if (t) executeShortPass(this, taker, t);
         else executeLoft(this, taker, { x: team.attackDir, y: this.rng.noise() });
         break;

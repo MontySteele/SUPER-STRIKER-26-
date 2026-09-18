@@ -9,6 +9,9 @@
 import './menu.css';
 import { esc } from './escape';
 import { prompt } from './menuGlyphs';
+import { MenuNav } from './menuNav';
+import { VOLUME_LABEL, nudgeVolume } from '../audio/volume';
+import { refreshVolumeRows, volumeRowHtml, wireVolumeRows } from './volumeRow';
 
 export interface PauseInfo {
   home?: string;
@@ -22,6 +25,13 @@ export interface PauseInfo {
 }
 
 let node: HTMLElement | null = null;
+/**
+ * Left/right on the MASTER row while paused. It is a MenuNav rather than a
+ * hook into main.ts's pause branch because MenuNav only READS the pads — it
+ * cannot desync the hub's edge detection that the pause state machine runs on
+ * — and it handles nothing but onDir, so it can never swallow resume or quit.
+ */
+let volNav: MenuNav | null = null;
 
 export function showPauseOverlay(info: PauseInfo = {}): void {
   const root = document.getElementById('ui-root');
@@ -47,12 +57,40 @@ export function showPauseOverlay(info: PauseInfo = {}): void {
       ${line}
       <div class="fe-pause-opt primary">${prompt('confirm', 'RESUME MATCH')}</div>
       <div class="fe-pause-opt">${prompt('back', `QUIT TO ${esc(info.quitTo ?? 'MAIN MENU')}`)}</div>
+      <div class="fe-pause-opt fe-pause-vol">
+        <span class="fe-row-k">${esc(VOLUME_LABEL.master)}</span>
+        <span class="fe-row-v"><u>◀</u>${volumeRowHtml('master', VOLUME_LABEL.master)}<u>▶</u></span>
+      </div>
     </div>`;
   root.appendChild(el);
   node = el;
+  wireVolumeRows(el);
+
+  const nudge = (dir: -1 | 1): void => {
+    nudgeVolume('master', dir);
+    if (node) refreshVolumeRows(node);
+  };
+  volNav?.destroy();
+  // padOnly: MenuNav's keyboard map treats A/D as left/right, and A/D are
+  // gameplay keys — a paused player must not move the fader by resting on one.
+  // The arrows are unambiguous, so they get their own listener.
+  volNav = new MenuNav({
+    onDir: (d) => { if (d === 'left' || d === 'right') nudge(d === 'left' ? -1 : 1); },
+  }, { padOnly: true });
+  window.addEventListener('keydown', onPauseKey);
+}
+
+function onPauseKey(e: KeyboardEvent): void {
+  if (!node) return;
+  if (e.code !== 'ArrowLeft' && e.code !== 'ArrowRight') return;
+  nudgeVolume('master', e.code === 'ArrowLeft' ? -1 : 1);
+  refreshVolumeRows(node);
 }
 
 export function hidePauseOverlay(): void {
+  window.removeEventListener('keydown', onPauseKey);
+  volNav?.destroy();
+  volNav = null;
   node?.remove();
   node = null;
 }

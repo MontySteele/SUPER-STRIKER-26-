@@ -26,6 +26,7 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
 import { Atmosphere } from './Atmosphere';
+import type { GrassBall, GrassField } from './grass';
 import { SHADOW_LAYER, setMaxAnisotropy } from './materials';
 import { RetroGradeShader, ScaledBloomPass, TonemapGradeShader } from './postFX';
 import {
@@ -36,17 +37,96 @@ import {
 export type TimeOfDay = 'day' | 'sunset' | 'night';
 
 // Adaptive resolution (§7A.7): under frame pressure we give up PIXELS, never
-// features. Steps are gentle and hysteresis is deliberately lopsided — drop
-// after ~1s of pain, climb back only after ~4s of comfort, so a single hitch
-// never starts an oscillation the player can see.
-const RATIO_STEPS = [1, 0.85, 0.72, 0.6];
+// features.
+//
+// THE BUG THIS REPLACES. The first version compared an EMA of the frame
+// interval against two absolute thresholds: drop over 22ms, climb back under
+// 13ms. The drop half works. The climb half is UNREACHABLE on a vsync-locked
+// display: rAF hands you one frame per refresh, so on a 60Hz panel the
+// interval is 16.7ms when everything is perfect and the EMA can never go below
+// 13. The controller was therefore a one-way ratchet — the shader-compile
+// stalls in the first seconds of a match spend a second of "hot" time, the
+// buffer steps down, and it stays down for the rest of the session no matter
+// how much headroom the GPU has. At DPR 2 that is a 2940x1912 frame quietly
+// becoming 2500x1625, which is exactly "still kinda low-res".
+//
+// The rewrite measures MISSED VSYNCS instead of absolute milliseconds:
+//
+//  • the display's refresh period is learned from the shortest interval we
+//    ever see (under vsync that IS the period), so the same code is right on
+//    60Hz, 120Hz and a ProMotion panel;
+//  • a frame "misses" when it took more than 1.4 refreshes — i.e. we actually
+//    dropped one, which is the only thing a player can see;
+//  • we drop after ~1s of sustained misses and RESTORE after ~1.5s clean,
+//    because at 60fps with 400fps of headroom (the measured case) there is no
+//    reason to sit at reduced resolution for four seconds;
+//  • a promotion that is punished by a drop within 4s doubles the next
+//    promotion's patience, up to 20s, so a genuinely marginal machine settles
+//    instead of pumping;
+//  • frames longer than STALL_MS are neither hot nor cool — a shader compile,
+//    a texture upload or a window drag is not fill-rate pressure and must not
+//    cost pixels;
+//  • and the first WARMUP_MS of a renderer's life is ignored outright, which
+//    is where every one of those stalls lives.
+const RATIO_STEPS: Record<QualityLevel, number[]> = {
+  // HIGH floors at 0.85: below that a Retina panel reads as soft, and a
+  // machine that cannot hold HIGH at 0.85 wants MEDIUM, not a blurrier HIGH.
+  high: [1, 0.92, 0.85],
+  medium: [1, 0.85, 0.72],
+  retro: [1, 0.85, 0.72, 0.6],
+};
 
 /** A mesh on SHADOW_LAYER and nothing else — i.e. a shadow proxy. */
 const PROXY_MASK = 1 << SHADOW_LAYER;
-const DROP_MS = 22;   // ~45fps
-const RAISE_MS = 13;  // ~77fps
+/** a frame this long is a stall, not fill-rate pressure */
+const STALL_MS = 90;
+/** ignore everything for this long after the renderer is built */
+const WARMUP_MS = 2500;
+/** > this many refresh periods = a dropped frame */
+const MISS_FACTOR = 1.4;
+/** the learned refresh period is clamped here (240Hz … 55Hz) */
+const VSYNC_MIN = 4.0;
+const VSYNC_MAX = 18.5;
+/** the estimate leaks upward ~4%/s so a 120Hz→60Hz move is picked up */
+const VSYNC_LEAK = 1.0007;
 const DROP_AFTER = 1.0;
-const RAISE_AFTER = 4.0;
+const RAISE_AFTER = 1.5;
+const RAISE_AFTER_MAX = 20;
+/** a promotion punished within this many seconds doubles the next wait */
+const PROMOTION_REGRET = 4.0;
+/** frames right after a resolution change are re-allocation, not gameplay */
+const SETTLE = 0.35;
+
+/** What the resolution valve is doing right now — for the `?gfx=1` overlay,
+ *  the bench report and anyone debugging "why is it soft". */
+export interface GfxStats {
+  css: { w: number; h: number };
+  buffer: { w: number; h: number };
+  composer: { w: number; h: number };
+  devicePixelRatio: number;
+  basePixelRatio: number;
+  pixelRatio: number;
+  /** adaptive scale currently applied (1 = full) */
+  scale: number;
+  step: number;
+  steps: number[];
+  pinned: boolean;
+  quality: QualityLevel;
+  aa: 'smaa' | 'fxaa' | 'none';
+  msaaSamples: number;
+  sharpen: number;
+  anisotropy: number;
+  /** learned display refresh period, ms */
+  vsyncMs: number;
+  /** last presented frame interval, ms */
+  frameMs: number;
+  /** presented fps over the last second */
+  fps: number;
+  /** fraction of the last second's frames that missed a vsync */
+  missPct: number;
+  /** why the valve last moved (or didn't) */
+  note: string;
+}
 
 export class SceneManager {
   renderer: THREE.WebGLRenderer;
@@ -66,12 +146,27 @@ export class SceneManager {
   /** see drawShadows(): a camera that sees the proxy layer and nothing else */
   private shadowProbe = new THREE.PerspectiveCamera(1, 1, 0.01, 0.02);
   private shadowScratch = new THREE.WebGLRenderTarget(1, 1);
-  private frameEma = 16.7;
+
+  // ---- adaptive-resolution state (see RATIO_STEPS above)
+  private steps: number[];
+  private vsyncMs = 16.7;
   private hotFor = 0;
   private coolFor = 0;
+  private warmupLeft = WARMUP_MS;
+  private settleLeft = 0;
+  private raiseAfter = RAISE_AFTER;
+  private sinceRaise = Infinity;
+  /** rolling one-second window of presented intervals, for the overlay */
+  private recent: number[] = [];
+  private recentMs = 0;
+  private lastNote = 'warmup';
+  private lastFrameMs = 16.7;
+  /** ?gfx=1 debug overlay / console trace */
+  private debug: { el: HTMLDivElement | null; log: boolean; t: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement, public timeOfDay: TimeOfDay, level?: QualityLevel) {
     this.profile = qualityProfile(level ?? qualitySetting());
+    this.steps = RATIO_STEPS[this.profile.level] ?? RATIO_STEPS.high;
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: this.profile.retro });
     this.basePixelRatio = Math.min(window.devicePixelRatio, 2);
@@ -154,7 +249,12 @@ export class SceneManager {
       // reconstruction and leaves the image slightly soft, which at DPR 2 on a
       // Retina panel reads as "not quite in focus". FXAA (MEDIUM) is already a
       // blur and sharpening it just amplifies its own artefacts.
-      this.gradePass.uniforms.sharpen.value = this.profile.aa === 'smaa' ? 0.22 : 0;
+      // ...and MORE of it at DPR 2 than at DPR 1. The taps are one DEVICE
+      // pixel apart (see syncTexel), so on a Retina panel the mask is
+      // operating on half-a-CSS-pixel detail, where it is a genuine acuity
+      // gain and nowhere near the ringing the same number would cause at 1x.
+      this.gradePass.uniforms.sharpen.value = this.profile.aa === 'smaa'
+        ? (this.basePixelRatio >= 1.75 ? 0.30 : 0.22) : 0;
       this.composer.addPass(this.gradePass);
 
       if (this.profile.aa === 'smaa') {
@@ -168,6 +268,7 @@ export class SceneManager {
     this.composer.setSize(w, h);
     if (!this.profile.retro) this.syncTexel();
 
+    this.setupDebug();
     window.addEventListener('resize', this.resizeHandler);
   }
 
@@ -180,6 +281,8 @@ export class SceneManager {
    */
   dispose(): void {
     window.removeEventListener('resize', this.resizeHandler);
+    this.debug?.el?.remove();
+    this.debug = null;
     // lights, cascade shadow maps, the PMREM target and the sky dome first —
     // the traversal below would otherwise walk a subtree we still own
     this.atmos.dispose();
@@ -223,37 +326,163 @@ export class SceneManager {
     // a pinned buffer is a measurement, not a game: giving up pixels under
     // load is exactly what the bench is trying to observe
     if (this.pinned || dtReal <= 0) return;
-    const ms = Math.min(dtReal * 1000, 250);
-    this.frameEma += (ms - this.frameEma) * 0.1;
+    const ms = dtReal * 1000;
+    this.lastFrameMs = ms;
+    this.sinceRaise += dtReal;
 
-    if (this.frameEma > DROP_MS) {
+    // the one-second window the overlay quotes fps and miss% from
+    this.recent.push(ms);
+    this.recentMs += ms;
+    while (this.recentMs > 1000 && this.recent.length > 1) {
+      this.recentMs -= this.recent.shift() as number;
+    }
+
+    if (this.warmupLeft > 0) {
+      this.warmupLeft -= ms;
+      this.lastNote = 'warmup';
+      return;
+    }
+    // a stall is not fill-rate pressure: shader compile, texture upload, GC,
+    // a window drag, the user Cmd-Tabbing away. Neither hot nor cool.
+    if (ms > STALL_MS) {
+      this.lastNote = `stall ${ms | 0}ms (ignored)`;
+      return;
+    }
+    if (this.settleLeft > 0) {
+      this.settleLeft -= dtReal;
+      this.lastNote = 'settling';
+      return;
+    }
+
+    // Learn the refresh period: under vsync the SHORTEST interval we ever see
+    // is exactly one refresh. The slow upward leak lets the estimate follow a
+    // display change (120Hz laptop panel → 60Hz projector) instead of pinning
+    // itself to the fastest frame of the session forever.
+    this.vsyncMs = Math.min(
+      Math.max(Math.min(ms, VSYNC_MAX), VSYNC_MIN),
+      Math.min(this.vsyncMs * VSYNC_LEAK, VSYNC_MAX),
+    );
+
+    const missed = ms > this.vsyncMs * MISS_FACTOR;
+    if (missed) {
       this.coolFor = 0;
       this.hotFor += dtReal;
-      if (this.hotFor >= DROP_AFTER && this.ratioIdx < RATIO_STEPS.length - 1) {
-        this.hotFor = 0;
-        this.setRatioStep(this.ratioIdx + 1);
-      }
-    } else if (this.frameEma < RAISE_MS) {
-      this.hotFor = 0;
-      this.coolFor += dtReal;
-      if (this.coolFor >= RAISE_AFTER && this.ratioIdx > 0) {
-        this.coolFor = 0;
-        this.setRatioStep(this.ratioIdx - 1);
-      }
     } else {
-      this.hotFor = 0;
-      this.coolFor = 0;
+      this.coolFor += dtReal;
+      // a lone dropped frame in an otherwise clean second must not accumulate
+      // into a demotion, so the hot clock bleeds back down while we are fine
+      this.hotFor = Math.max(0, this.hotFor - dtReal * 0.5);
+    }
+
+    if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1) {
+      // a promotion that got us here was a mistake; be more patient next time
+      if (this.sinceRaise < PROMOTION_REGRET) {
+        this.raiseAfter = Math.min(this.raiseAfter * 2, RAISE_AFTER_MAX);
+      }
+      this.setRatioStep(this.ratioIdx + 1, 'dropped: missed vsyncs for 1s');
+    } else if (this.coolFor >= this.raiseAfter && this.ratioIdx > 0) {
+      this.setRatioStep(this.ratioIdx - 1, 'restored: 1s+ clean');
+      this.sinceRaise = 0;
+    } else {
+      this.lastNote = missed ? `hot ${this.hotFor.toFixed(2)}s` : `ok ${this.coolFor.toFixed(1)}s`;
     }
   }
 
-  private setRatioStep(idx: number): void {
+  private setRatioStep(idx: number, why: string): void {
     this.ratioIdx = idx;
-    const ratio = this.basePixelRatio * RATIO_STEPS[idx];
+    const ratio = this.basePixelRatio * this.steps[idx];
     this.renderer.setPixelRatio(ratio);
     this.composer.setPixelRatio(ratio);
     this.syncTexel();
     // a resolution change is a fresh baseline; don't judge it on stale frames
-    this.frameEma = (DROP_MS + RAISE_MS) / 2;
+    this.hotFor = 0;
+    this.coolFor = 0;
+    this.settleLeft = SETTLE;
+    this.lastNote = `${why} → x${this.steps[idx]}`;
+    console.info(`ss26 render scale x${this.steps[idx]} (${why})`);
+  }
+
+  /** Everything the `?gfx=1` overlay, the bench report and a bug report need. */
+  gfxStats(): GfxStats {
+    const buf = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    const rt = this.composer.renderTarget1;
+    const frames = this.recent.length;
+    return {
+      css: { w: window.innerWidth, h: window.innerHeight },
+      buffer: { w: buf.x, h: buf.y },
+      composer: { w: rt.width, h: rt.height },
+      devicePixelRatio: window.devicePixelRatio,
+      basePixelRatio: this.basePixelRatio,
+      pixelRatio: this.renderer.getPixelRatio(),
+      scale: this.pinned ? 1 : this.steps[this.ratioIdx],
+      step: this.ratioIdx,
+      steps: this.steps,
+      pinned: !!this.pinned,
+      quality: this.profile.level,
+      aa: this.profile.aa,
+      msaaSamples: effectiveSamples(this.profile, this.basePixelRatio),
+      sharpen: (this.gradePass.uniforms.sharpen?.value as number) ?? 0,
+      anisotropy: this.renderer.capabilities.getMaxAnisotropy(),
+      vsyncMs: Math.round(this.vsyncMs * 100) / 100,
+      frameMs: Math.round(this.lastFrameMs * 100) / 100,
+      fps: frames > 1 ? Math.round((frames / Math.max(this.recentMs, 1)) * 10000) / 10 : 0,
+      missPct: frames > 1
+        ? Math.round((this.recent.filter((m) => m > this.vsyncMs * MISS_FACTOR).length
+          / frames) * 1000) / 10
+        : 0,
+      note: this.lastNote,
+    };
+  }
+
+  /**
+   * `?gfx=1` — the resolution audit, on screen and on the console.
+   *
+   * There is no other honest way to answer "what am I actually looking at":
+   * the drawing buffer, the pixel ratio, the adaptive step, the composer's own
+   * target and the AA in force are five different numbers that a screenshot
+   * cannot tell apart. `?gfx=log` is the same trace with no overlay, which is
+   * what the native shell's stdout wants.
+   */
+  private setupDebug(): void {
+    let mode: string | null = null;
+    try {
+      mode = new URLSearchParams(location.search).get('gfx');
+    } catch { /* no location (worker/test) */ }
+    if (!mode || mode === '0') return;
+    const log = mode === 'log' || mode === '2';
+    let el: HTMLDivElement | null = null;
+    if (!log && typeof document !== 'undefined') {
+      el = document.createElement('div');
+      el.style.cssText = 'position:fixed;left:8px;top:8px;z-index:9999;pointer-events:none;'
+        + 'font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;'
+        + 'color:#bfe9c6;background:rgba(4,10,8,.72);padding:6px 9px;border-radius:5px;'
+        + 'border:1px solid rgba(120,220,150,.28);text-shadow:0 1px 2px #000';
+      document.body.appendChild(el);
+    }
+    this.debug = { el, log, t: 0 };
+  }
+
+  private updateDebug(): void {
+    const d = this.debug;
+    if (!d) return;
+    const now = performance.now();
+    const every = d.log ? 2000 : 220;
+    if (now - d.t < every) return;
+    d.t = now;
+    const s = this.gfxStats();
+    const text = [
+      `buffer   ${s.buffer.w}x${s.buffer.h}   (css ${s.css.w}x${s.css.h})`,
+      `ratio    ${s.pixelRatio.toFixed(2)}  = dpr ${s.devicePixelRatio} x base`
+        + ` ${s.basePixelRatio} x scale ${s.scale}${s.pinned ? ' [PINNED]' : ''}`,
+      `composer ${s.composer.w}x${s.composer.h}   step ${s.step}/${s.steps.length - 1}`,
+      `quality  ${s.quality}  aa ${s.aa}  msaa ${s.msaaSamples}x  sharpen ${s.sharpen}`
+        + `  aniso ${s.anisotropy}`,
+      `frame    ${s.fps.toFixed(1)}fps  ${s.frameMs.toFixed(2)}ms  vsync`
+        + ` ${s.vsyncMs.toFixed(2)}ms  miss ${s.missPct}%`,
+      `valve    ${s.note}`,
+    ].join('\n');
+    if (d.el) d.el.textContent = text;
+    else console.info(`[gfx]\n${text}`);
   }
 
   /**
@@ -296,6 +525,16 @@ export class SceneManager {
     const w = window.innerWidth, h = window.innerHeight;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    // a resize can be a MOVE: dragging the window onto a 1x external monitor
+    // changes devicePixelRatio, and a base ratio captured at construction
+    // would leave the game rendering at 2x on a 1x panel (or, worse, 1x on a
+    // Retina one) for the rest of the session
+    const base = Math.min(window.devicePixelRatio, 2);
+    if (base !== this.basePixelRatio) {
+      this.basePixelRatio = base;
+      this.renderer.setPixelRatio(base * this.steps[this.ratioIdx]);
+      this.composer.setPixelRatio(base * this.steps[this.ratioIdx]);
+    }
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
     this.syncTexel();
@@ -373,6 +612,17 @@ export class SceneManager {
   }
 
   render(): void {
+    // §7A.3b: the shell turf follows the camera's look point and has to be
+    // re-centred BEFORE the cascades are fitted (it is a shadow receiver) and
+    // before anything reads a world matrix. It is driven from here rather than
+    // from the game renderer because the only two things it needs are the
+    // camera and the clock, and both live in this file.
+    //
+    // performance.now() — which the capture harness replaces with a virtual
+    // clock, so a still of the wind is as reproducible as everything else.
+    const grass = this.scene.userData.ss26Grass as GrassField | undefined;
+    grass?.update(this.camera, performance.now() * 0.001,
+      (this.scene.userData.ss26Ball as GrassBall | undefined) ?? null);
     // cascades follow the camera and the sky dome rides on it, so this has to
     // happen after the camera director has moved and before anything draws
     this.atmos.update();
@@ -381,5 +631,6 @@ export class SceneManager {
     this.camera.updateMatrixWorld();
     this.drawShadows();
     this.composer.render();
+    if (this.debug) this.updateDebug();
   }
 }

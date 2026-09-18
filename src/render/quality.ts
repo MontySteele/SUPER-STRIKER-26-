@@ -37,6 +37,10 @@ export interface QualityProfile {
   grade: boolean;
   /** PMREM sky environment on scene.environment */
   env: boolean;
+  /** shell layers in the turf (§7A.3b, render/grass.ts); 0 = no shell turf */
+  grassShells: number;
+  /** metres from the lens at which the shells have faded back into the plane */
+  grassRadius: number;
 }
 
 const PROFILES: Record<QualityLevel, QualityProfile> = {
@@ -51,6 +55,12 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
     // see effectiveSamples() — at pixel ratio 2 this is spent as 0 and SMAA
     // carries the edges alone. The 4 is what a 1x display gets.
     samples: 4, bloomScale: 1, aa: 'smaa', grade: true, env: true,
+    // §7A.3b. Both numbers were set by measurement, not by taste — see the
+    // table in render/grass.ts. Shells are priced per SCREEN PIXEL COVERED,
+    // so the radius is the expensive dial and the layer count is the cheap
+    // one: doubling the radius roughly doubles the cost, while the eighth
+    // layer costs a tenth of what the first one does.
+    grassShells: 7, grassRadius: 30,
   },
   // the sensible step down: half the shadow resolution, one fewer cascade,
   // bloom at half res, FXAA. MEDIUM is what a machine that cannot hold HIGH
@@ -58,10 +68,13 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
   medium: {
     level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024,
     samples: 0, bloomScale: 0.5, aa: 'fxaa', grade: false, env: true,
+    grassShells: 5, grassRadius: 18,
   },
   retro: {
     level: 'retro', retro: true, cascades: 0, shadowMapSize: 2048,
     samples: 0, bloomScale: 1, aa: 'none', grade: true, env: false,
+    // RETRO is the v1.1 renderer on purpose; it had a flat pitch and keeps one
+    grassShells: 0, grassRadius: 0,
   },
 };
 

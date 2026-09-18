@@ -1,6 +1,6 @@
 // The ball is a real physics object, never glued to feet (§6.1).
 
-import { v3, type V3 } from '../core/math';
+import { v3, type V2, type V3 } from '../core/math';
 import {
   BALL_AIR_DRAG, BALL_RADIUS, BALL_RESTITUTION, BALL_ROLL_FRICTION,
   GRAVITY, MAGNUS_COEFF,
@@ -19,6 +19,14 @@ export class Ball {
   /** Set after a kick so the kicker doesn't instantly re-capture. */
   noControlTimer = 0;
   noControlPlayer: PlayerEntity | null = null;
+  /**
+   * Who a pass in flight is meant for (§5 pass assist). The AI reads this to
+   * come to meet the ball, and the reception model gives him a friendlier
+   * first touch than an interception gets.
+   */
+  intendedReceiver: PlayerEntity | null = null;
+  /** Where the passer aimed — the receiver's run is steered onto this line. */
+  intendedAim: V2 | null = null;
 
   onBounce: ((speed: number) => void) | null = null;
 
@@ -29,6 +37,8 @@ export class Ball {
     this.owner = null;
     this.noControlTimer = 0;
     this.noControlPlayer = null;
+    this.intendedReceiver = null;
+    this.intendedAim = null;
   }
 
   kick(dir: V3, speed: number, kicker: PlayerEntity, spin = 0): void {
@@ -39,6 +49,10 @@ export class Ball {
     this.lastTouch = kicker;
     this.noControlTimer = 0.28;
     this.noControlPlayer = kicker;
+    // any new strike voids the previous pass's intent; callers that ARE a
+    // pass re-arm it immediately after kicking (actions.ts)
+    this.intendedReceiver = null;
+    this.intendedAim = null;
     if (this.pos.z < BALL_RADIUS) this.pos.z = BALL_RADIUS;
   }
 
@@ -52,6 +66,26 @@ export class Ball {
 
   grounded(): boolean {
     return this.pos.z <= BALL_RADIUS + 0.02 && Math.abs(this.vel.z) < 0.8;
+  }
+
+  /**
+   * Where a ball in flight will next meet the ground, integrated with the
+   * same fixed step the sim uses so the answer is deterministic (§8).
+   * null when it is already down or still up after `maxT` seconds.
+   */
+  predictLanding(maxT = 3): V2 | null {
+    let { x, y, z } = this.pos;
+    let vx = this.vel.x, vy = this.vel.y, vz = this.vel.z;
+    const step = 1 / 60;
+    for (let t = 0; t < maxT; t += step) {
+      vz -= GRAVITY * step;
+      const sp = Math.hypot(vx, vy, vz);
+      const drag = BALL_AIR_DRAG * sp * step;
+      vx -= vx * drag; vy -= vy * drag; vz -= vz * drag;
+      x += vx * step; y += vy * step; z += vz * step;
+      if (z <= BALL_RADIUS && vz < 0) return { x, y };
+    }
+    return null;
   }
 
   update(dt: number): void {

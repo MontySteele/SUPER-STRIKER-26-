@@ -108,6 +108,15 @@ const RATE_MAX = 1.8;
  *  slower out (the follow-through should settle, not snap). */
 /** Above this the keeper is running, not shuffling. */
 const SIDESTEP_MAX_SPEED = 2.4;
+/**
+ * Below this a player is standing, not travelling.
+ *
+ * 5cm/s: an order of magnitude under the slowest thing the chain can rate-match
+ * (a walk clip at RATE_MIN is ~0.7 m/s) and an order of magnitude over the
+ * jitter a 60Hz position difference carries. Anything above it is ground
+ * translation and something in the chain has to be MOVING, or the player skates.
+ */
+const LOCO_FLOOR = 0.05;
 
 const ACTION_IN = 0.05;
 const ACTION_OUT = 0.18;
@@ -126,6 +135,15 @@ interface Pose {
   head?: number;
   /** pretend the player is moving this fast for the locomotion layer */
   loco?: number;
+  /**
+   * Lean from the SPINE up, radians (+ = back). Unlike `lean`, which tips the
+   * whole root and takes the legs with it, this bends the torso over legs that
+   * are still running — which is the only way to lay a body-contact pose over
+   * a locomotion cycle without costing a step.
+   */
+  torso?: number;
+  /** Shoulders turned about the up axis, radians (+ = toward his right). */
+  twist?: number;
 }
 
 interface ActionDef {
@@ -185,6 +203,25 @@ const ACTIONS: Partial<Record<ActionAnim, ActionDef>> = {
     clip: 'diveR',
     dur: 1.0,
     pose: (u) => ({ roll: 0.5 + u * 0.95, lift: Math.sin(u * Math.PI) * 0.45 - u * 0.35, arms: 0.9 }),
+  },
+
+  // §6.1 first touch. A real clip, trimmed so animT 0 is the touch; the
+  // stand-in reaches a foot out by dipping and turning slightly into the ball.
+  trap: {
+    clip: 'trap',
+    dur: 0.42,
+    pose: (u) => ({ lean: 0.18 * (1 - u), torso: 0.1, loco: 1.4 * (1 - u * 0.7) }),
+  },
+
+  // §6.1 shielding. NO CLIP, deliberately — this one fires while the carrier is
+  // running, the sim gives it no action lock, and any one-shot would take the
+  // body off the locomotion layer and cost him the step the shield exists to
+  // protect. So it is pose-only: the torso turns and leans back into the man
+  // behind while the legs keep the ball moving. `dur` mirrors the sim's 0.42s
+  // default; collision.ts re-arms it every time it lapses.
+  shield: {
+    dur: 0.42,
+    pose: () => ({ torso: -0.2, twist: 0.42, arms: 0.16 }),
   },
 
   // stand-in: crouch over the ball
@@ -331,6 +368,21 @@ export class SkinnedPlayerMesh {
   /** keeper state from the sim (§6.3), and how sideways he is moving */
   private gkState: string | null = null;
   private gkLateral = 0;
+  /**
+   * The CLIP_TABLE row the keeper's one-shot layer should play instead of the
+   * one ACTIONS names for the ActionAnim the sim set.
+   *
+   * The sim's ActionAnim vocabulary is small and shared by every player on the
+   * pitch ('diveL', 'collect', 'loft'); a keeper's repertoire is not — a body
+   * block, a jump catch, a low collect, a get-up, a throw and a punt are six
+   * different animations that all arrive as one of those three names. Rather
+   * than widen the union for one position, KeeperBrain / PenaltyController name
+   * the ROW (§6.3) and it is substituted here, keeping the sim's timing — the
+   * anim's duration and animT — exactly as it was.
+   */
+  private gkClip: ClipId | null = null;
+  /** which clip id the action layer is currently holding, variant included */
+  private actClipId: ClipId | null = null;
 
   get lodTier(): number { return Math.max(0, this.tier); }
 
@@ -457,11 +509,15 @@ export class SkinnedPlayerMesh {
     this.root.position.set(x, z, y);
     this.root.rotation.y = Math.PI / 2 - facing;
 
-    // ---- action layer: pick up a new one-shot the moment the sim starts it
-    if (anim !== this.curAnim) {
+    // ---- action layer: pick up a new one-shot the moment the sim starts it.
+    // A keeper's variant row (gkClip) counts as a new one-shot too: the sim
+    // re-arms 'diveL' for the get-up that follows the dive, and the anim name
+    // alone cannot tell those two apart.
+    const wantClip = this.gkClip ?? this.defaultClipFor(anim);
+    if (anim !== this.curAnim || wantClip !== this.actClipId) {
       this.curAnim = anim;
       this.curDef = anim === 'none' ? null : ACTIONS[anim] ?? null;
-      this.startClip(this.curDef);
+      this.startClip(this.curDef, wantClip);
     }
 
     const def = this.curDef;
@@ -505,7 +561,7 @@ export class SkinnedPlayerMesh {
     const locoSpeed = pose.loco ?? speed;
     const locoW = (1 - this.actWeight) * (1 - this.cueTotal());
     this.loco = this.pickChain(locoSpeed);
-    if (this.loco.length >= 2) this.blendLoco(locoSpeed, locoW);
+    if (this.loco.length) this.blendLoco(locoSpeed, locoW);
 
     this.finish(dt, pose);
   }
@@ -592,10 +648,17 @@ export class SkinnedPlayerMesh {
    *   position  → a standing goalkeeper idle (hands low, watching)
    *   set/react → the outfield crouch, which is a keeper's ready stance
    *   hold      → the idle that has a ball in its hands
+   *   getup     → he is on the grass; the one-shot owns the body anyway
    *
    * and while he is shuffling slowly across his line rather than running, a
    * sidestep replaces the walk — picked by which way the sim is sliding him,
    * not by a guess about where the ball is.
+   *
+   * `locoSpeed` here is the distance the keeper's ROOT actually covered this
+   * tick, not his velocity vector: a penalty shuffle and a dive both move him
+   * over the grass without ever writing PlayerEntity.vel, and a chain chosen
+   * off the velocity is what put a standing idle on top of three metres of
+   * translation (gameRenderer.snapshot / feedKeeperState).
    */
   private pickChain(locoSpeed: number): LocoEntry[] {
     // a cutscene's chain outranks everything: on a walkout the keeper is a man
@@ -609,7 +672,13 @@ export class SkinnedPlayerMesh {
     // 'set' and 'react' want the on-the-toes crouch: that is the outfield idle
     const base = this.gkState === 'set' || this.gkState === 'react' || this.gkState === 'smother'
       ? this.chainOutfield : this.chainKeeper;
-    if (locoSpeed > 0.25 && locoSpeed < SIDESTEP_MAX_SPEED && Math.abs(this.gkLateral) > 0.6) {
+    if (!base.length) return this.chainOutfield;
+    // Any sideways drift that is not a run gets a sidestep. The gate used to
+    // be |lateral| > 0.6, which a keeper easing along his line never reached —
+    // so the slow, mostly-sideways movement, the one case the sidesteps exist
+    // for, was exactly the case that fell through to a static idle.
+    if (locoSpeed > LOCO_FLOOR && locoSpeed < SIDESTEP_MAX_SPEED
+        && Math.abs(this.gkLateral) > 0.45) {
       const step = this.locoById.get(
         this.gkLateral < 0 ? GK_SIDESTEP.left : GK_SIDESTEP.right);
       if (step) return [base[0], step].sort((a, b) => a.speed - b.speed);
@@ -618,13 +687,15 @@ export class SkinnedPlayerMesh {
   }
 
   /**
-   * The sim's keeper state (§6.3) and how sideways he is moving: -1 fully to
-   * his left, +1 fully to his right. Set from the renderer, which is the only
-   * place that can see both the KeeperBrain and the mesh. Null = outfielder.
+   * The sim's keeper state (§6.3), how sideways he is moving (-1 fully to his
+   * left, +1 fully to his right), and the CLIP_TABLE row his one-shot layer
+   * should play. Set from the renderer, which is the only place that can see
+   * both the KeeperBrain and the mesh. Null state = outfielder.
    */
-  setKeeperState(state: string | null, lateral: number): void {
+  setKeeperState(state: string | null, lateral: number, clip: string | null = null): void {
     this.gkState = state;
     this.gkLateral = lateral;
+    this.gkClip = (clip as ClipId | null) ?? null;
   }
 
   /**
@@ -633,11 +704,16 @@ export class SkinnedPlayerMesh {
    */
   private blendLoco(locoSpeed: number, locoW: number): void {
     const n = this.loco.length;
-    let hi = 1;
+    // A chain of ONE is a real case, not a degenerate one: 'hold' is a single
+    // clip (the keeper standing with the ball in his gloves). This used to be
+    // gated out at the call site, which meant nothing wrote gkHold's weight —
+    // and, worse, nothing switched the PREVIOUS chain's clips off, so a keeper
+    // who had just collected went on playing whatever he had been walking on.
+    let hi = Math.min(1, n - 1);
     while (hi < n - 1 && this.loco[hi].speed < locoSpeed) hi++;
     const lo = Math.max(0, hi - 1);
     const loA = this.loco[lo], loB = this.loco[hi];
-    const t = THREE.MathUtils.clamp(
+    const t = n < 2 ? 0 : THREE.MathUtils.clamp(
       (locoSpeed - loA.speed) / Math.max(loB.speed - loA.speed, 1e-3), 0, 1);
     // the idle contributes no speed, so a blend against it must take its rate
     // from the moving clip alone or the rate explodes as the player stops
@@ -709,6 +785,7 @@ export class SkinnedPlayerMesh {
     }
     this.curAnim = 'none';
     this.curDef = null;
+    this.actClipId = null;
     this.actWeight = 0;
 
     this.setLocoChain(pose.chain ?? null);
@@ -719,7 +796,7 @@ export class SkinnedPlayerMesh {
     if (this.cue) this.cue.setEffectiveTimeScale(pose.rate ?? 1);
 
     this.loco = this.pickChain(speed);
-    if (this.loco.length >= 2) this.blendLoco(speed, 1 - this.cueTotal());
+    if (this.loco.length) this.blendLoco(speed, 1 - this.cueTotal());
 
     this.finish(dt, EMPTY);
   }
@@ -825,18 +902,32 @@ export class SkinnedPlayerMesh {
     this.cue = a;
   }
 
-  /** Swap the one-shot clip the action layer is holding. */
-  private startClip(def: ActionDef | null): void {
+  /** Which CLIP_TABLE row an ActionAnim plays when nothing overrides it. */
+  private defaultClipFor(anim: ActionAnim): ClipId | null {
+    const def = anim === 'none' ? null : ACTIONS[anim];
+    if (!def?.clip) return null;
+    return Array.isArray(def.clip)
+      ? def.clip[this.kickPick % def.clip.length] : def.clip;
+  }
+
+  /** Swap the one-shot clip the action layer is holding. `override` is the
+   *  keeper's variant row (see gkClip); null falls back to the ACTIONS row. */
+  private startClip(def: ActionDef | null, override: ClipId | null = null): void {
     if (this.act) {
       this.act.setEffectiveWeight(0);
       this.act.stop();
       this.act = null;
       this.actClip = null;
     }
+    // remember what was ASKED for, not what resolved, so a variant row that is
+    // not on disk does not re-enter this every frame
+    this.actClipId = override ?? this.defaultClipFor(this.curAnim);
     if (!def?.clip) return;
-    const id = Array.isArray(def.clip)
+    const fallback = Array.isArray(def.clip)
       ? def.clip[this.kickPick % def.clip.length] : def.clip;
-    const pc = this.rig.clip(id);
+    // a variant row that is not on disk falls back to the ACTIONS row rather
+    // than to nothing: a dive with no clip is a man standing in the goalmouth
+    const pc = (override ? this.rig.clip(override) : null) ?? this.rig.clip(fallback);
     if (!pc) return;
     const a = this.mixer.clipAction(pc.clip);
     a.reset();

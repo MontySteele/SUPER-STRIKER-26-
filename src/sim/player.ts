@@ -6,7 +6,10 @@ import { BASE_SPEED, HALF_L, HALF_W, PACE_SPEED, PLAYER_ACCEL, SPRINT_MULT } fro
 /** One-shot action animations the renderer plays over locomotion. */
 export type ActionAnim =
   | 'none' | 'pass' | 'loft' | 'shoot' | 'slide' | 'header'
-  | 'diveL' | 'diveR' | 'collect' | 'celebrate' | 'dejected';
+  | 'diveL' | 'diveR' | 'collect' | 'celebrate' | 'dejected'
+  // §6.1 reception + body play. 'trap' is the first touch that kills a pass
+  // dead; 'shield' is the carrier turning his back into a defender.
+  | 'trap' | 'shield';
 
 export class PlayerEntity {
   pos: V2;
@@ -29,6 +32,18 @@ export class PlayerEntity {
   // keeper dive state (render + physics both read this)
   diving = false;
   diveVel: V2 = v2();
+
+  // ---- body contact (src/sim/collision.ts) --------------------------------
+  /** Seconds left of "a body is in my way, I can't reach the ball". */
+  shieldedOut = 0;
+  /** True while this carrier is holding an opponent off the ball. */
+  shielding = false;
+  /** Seconds left of leaning on somebody — renderers can lean the torso. */
+  jostling = 0;
+  /** Seconds before this player can concede another body foul. */
+  contactFoulCd = 0;
+  /** Seconds until the dribbler's next touch (§6.1: never glued to the foot). */
+  touchCd = 0;
 
   constructor(
     public data: PlayerData,
@@ -81,11 +96,20 @@ export class PlayerEntity {
 
   update(dt: number): void {
     if (this.actionLock > 0) this.actionLock -= dt;
+    if (this.shieldedOut > 0) this.shieldedOut -= dt;
+    if (this.jostling > 0) this.jostling -= dt;
+    if (this.contactFoulCd > 0) this.contactFoulCd -= dt;
+    if (this.touchCd > 0) this.touchCd -= dt;
+    // re-asserted by the contact pass at the end of the tick, so renderers
+    // always read this frame's answer, never last frame's
+    this.shielding = false;
     if (this.actionAnim !== 'none') {
       this.actionAnimT += dt;
       const dur = this.actionAnim === 'slide' ? 0.8
         : this.actionAnim === 'diveL' || this.actionAnim === 'diveR' ? 1.0
         : this.actionAnim === 'celebrate' || this.actionAnim === 'dejected' ? 3.0
+        : this.actionAnim === 'trap' ? 0.3
+        : this.actionAnim === 'shield' ? 0.5
         : 0.42;
       if (this.actionAnimT > dur) { this.actionAnim = 'none'; this.actionAnimT = 0; }
     }

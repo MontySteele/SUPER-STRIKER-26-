@@ -27,10 +27,12 @@ import type { StadiumSize } from '../render/stadium';
 import { Tournament } from '../sim/tournament';
 import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
 import { MUSIC_KEY, musicSetting, type MusicSetting } from '../audio/music';
+import { VOLUME_BUSES, VOLUME_LABEL, nudgeVolume, volumeSetting, type VolumeBus } from '../audio/volume';
+import { volumeRowHtml, wireVolumeRows } from './volumeRow';
 import { CONTROLS_KEY, controlsSetting, type ControlsSetting } from './prefs';
 import { QUALITY_OPTIONS, qualitySetting, setQuality } from '../render/quality';
 import { esc } from './escape';
-import { MenuNav, type NavDir } from './menuNav';
+import { MenuNav, mouseIsLive, type NavDir } from './menuNav';
 import { MenuBackdrop } from './menuBackdrop';
 import { anyButtonLabel, promptBar } from './menuGlyphs';
 import { crest, rating, ratingBar, shirtSvg, stars } from './menuKit';
@@ -42,6 +44,11 @@ const MUSIC_OPTIONS: [MusicSetting, string][] = [
 const CONTROLS_OPTIONS: [ControlsSetting, string][] = [
   ['fade', 'FADE'], ['on', 'ALWAYS'], ['off', 'OFF'],
 ];
+
+/** Settings-row label -> audio bus, for the four §7.3 faders. */
+const VOLUME_BY_LABEL = new Map<string, VolumeBus>(
+  VOLUME_BUSES.map((b) => [VOLUME_LABEL[b], b] as [string, VolumeBus]),
+);
 
 export type GameMode = 'kickoff' | 'versus' | 'online' | 'shootout' | 'golden';
 
@@ -488,7 +495,7 @@ export class Menu {
   }
 
   /** The four global preference rows — shared by MATCH SETTINGS and SETTINGS. */
-  private prefRows(): [string, string][] {
+  private basePrefRows(): [string, string][] {
     return [
       ['GRAPHICS', (QUALITY_OPTIONS.find(([v]) => v === qualitySetting()) ?? QUALITY_OPTIONS[0])[1]],
       ['COMMENTARY', commentaryEnabled() ? 'ON' : 'OFF'],
@@ -497,8 +504,20 @@ export class Menu {
     ];
   }
 
+  /**
+   * GAME SETTINGS only: the toggles plus the four volume faders. MATCH SETTINGS
+   * keeps the short list — you are one press from kick-off there, and the mix
+   * is not a per-match decision.
+   */
+  private prefRows(): [string, string][] {
+    return [
+      ...this.basePrefRows(),
+      ...VOLUME_BUSES.map((b): [string, string] => [VOLUME_LABEL[b], String(volumeSetting(b))]),
+    ];
+  }
+
   private settingsRows(): [string, string][] {
-    const prefs = this.prefRows();
+    const prefs = this.basePrefRows();
     if (this.mode === 'tournament') {
       return [
         ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
@@ -558,6 +577,11 @@ export class Menu {
 
   private cycleKey(key: string, d: number): void {
     this.overwriteArmed = false;
+    // §7.3 faders: ±5 per press, and MenuNav's hold-to-repeat makes that a
+    // steady slide. The write itself fires ss26-volume-change (main.ts ramps
+    // the gain and ticks the fader), so there is nothing else to do here.
+    const bus = VOLUME_BY_LABEL.get(key);
+    if (bus) { nudgeVolume(bus, d); return; }
     if (key === 'PLAYERS' && this.mode === 'golden' && this.padCount() > 0) {
       this.golden2p = !this.golden2p;
     }
@@ -749,6 +773,7 @@ export class Menu {
     ]));
     this.body.querySelectorAll<HTMLElement>('.fe-tile').forEach((el) => {
       el.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return;
         this.tileIdx = Number(el.dataset.tile);
         this.subIdx = 0;
         this.refocusTiles();
@@ -773,6 +798,7 @@ export class Menu {
       </div>`).join('');
     host.querySelectorAll<HTMLElement>('.fe-subrow').forEach((el) => {
       el.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return;
         this.subIdx = Number(el.dataset.sub);
         this.refocusSub();
       });
@@ -838,6 +864,7 @@ export class Menu {
 
     this.body.querySelectorAll<HTMLElement>('.fe-cell').forEach((el) => {
       el.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return;
         this.zone = 'grid';
         this.focus = Number(el.dataset.idx);
         this.refocusGrid();
@@ -902,6 +929,7 @@ export class Menu {
   private wireStrip(): void {
     this.body.querySelectorAll<HTMLElement>('.fe-stripitem').forEach((el) => {
       el.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return;
         this.zone = 'strip';
         this.stripIdx = Number(el.dataset.strip);
         this.refocusStrip();
@@ -995,6 +1023,10 @@ export class Menu {
       COMMENTARY: 'Broadcast ticker and crowd calls',
       MUSIC: 'Menu and match music',
       'CONTROLS HINT': 'The in-match controls card',
+      [VOLUME_LABEL.master]: 'Everything the game makes · also on the pause card',
+      [VOLUME_LABEL.music]: 'The front-end anthem and the match groove',
+      [VOLUME_LABEL.sfx]: 'Terraces, whistles, boots and the woodwork',
+      [VOLUME_LABEL.voice]: 'How loud the man in the box is',
     };
     this.body.innerHTML = `
       <div class="${this.anim}">
@@ -1012,16 +1044,20 @@ export class Menu {
   }
 
   private rowHtml(k: string, v: string, i: number, note?: string): string {
-    return `<div class="fe-row${i === this.focus ? ' focus' : ''}" data-row="${i}">
-      <span class="fe-row-k">${k}${note ? `<small class="fe-row-sub">${esc(note)}</small>` : ''}</span>
-      <span class="fe-row-v"><u>◀</u>${esc(v)}<u>▶</u></span>
+    const bus = VOLUME_BY_LABEL.get(k);
+    const value = bus ? volumeRowHtml(bus, k) : esc(v);
+    return `<div class="fe-row${bus ? ' fe-row--vol' : ''}${i === this.focus ? ' focus' : ''}" data-row="${i}">
+      <span class="fe-row-k">${esc(k)}${note ? `<small class="fe-row-sub">${esc(note)}</small>` : ''}</span>
+      <span class="fe-row-v"><u>◀</u>${value}<u>▶</u></span>
     </div>`;
   }
 
   private wireRows(goRow: number, onGo: () => void): void {
+    wireVolumeRows(this.body);
     this.body.querySelectorAll<HTMLElement>('.fe-row').forEach((el) => {
       const row = Number(el.dataset.row);
-      el.addEventListener('mouseenter', () => { this.focus = row; this.refocusRows(); });
+      el.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return; this.focus = row; this.refocusRows(); });
       el.addEventListener('click', () => {
         this.focus = row;
         if (this.screen === 'prefs') this.cycleKey(this.prefRows()[row][0], 1);
@@ -1030,7 +1066,8 @@ export class Menu {
       });
     });
     const go = this.body.querySelector<HTMLElement>('.fe-go');
-    go?.addEventListener('mouseenter', () => { this.focus = goRow; this.refocusRows(); });
+    go?.addEventListener('mouseenter', () => {
+        if (!mouseIsLive()) return; this.focus = goRow; this.refocusRows(); });
     go?.addEventListener('click', () => { this.focus = goRow; onGo(); });
   }
 
