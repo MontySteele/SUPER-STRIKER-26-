@@ -400,9 +400,28 @@ w.__ss26ModelLabPoses = ['apose', 'stand', 'kick'];
 const t0 = env.realNow();
 const loader = new GLTFLoader();
 
-loader.load(modelUrl, (gltf) => {
+// A v2 archetype ships four haircuts in one GLB and the match loader drops
+// three of them the moment a player is cloned (characterAssets.ts). The lab
+// loads the raw file, so it has to do the same or it photographs a man in
+// four wigs. The pool's `hair` list is the authority; `?hair=N` picks a cut.
+const hairPick = Math.max(0, Number(params.get('hair') ?? 0) || 0);
+const saneName = (s: string): string => s.replace(/\s/g, '_').replace(/[[\].:/]/g, '');
+const spareHair: Promise<Set<string>> = (async () => {
+  try {
+    const r = await fetch(modelUrl.replace(/(_lod\d)?\.glb$/i, '') + '_faces.json');
+    if (!r.ok) return new Set<string>();
+    const file = (await r.json()) as { hair?: string[] };
+    const hair = (file.hair ?? []).map(saneName);
+    return new Set(hair.filter((_, i) => i !== Math.min(hairPick, hair.length - 1)));
+  } catch {
+    return new Set<string>();
+  }
+})();
+
+loader.load(modelUrl, async (gltf) => {
   const loadMs = Math.round((env.realNow() - t0) * 10) / 10;
   const root = gltf.scene;
+  const spare = await spareHair;
 
   let skinnedMeshes = 0;
   let vertices = 0;
@@ -413,6 +432,7 @@ loader.load(modelUrl, (gltf) => {
     const mesh = obj as THREE.Mesh;
     if (!mesh.isMesh) return;
     if (hidden.some((h) => mesh.name.toLowerCase().includes(h))) { mesh.visible = false; return; }
+    if (spare.has(saneName(mesh.name))) { mesh.visible = false; return; }
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     // a skinned mesh's bind-pose bounds do not cover a posed limb; three then

@@ -80,6 +80,9 @@ export class CameraDirector {
   mode: CamMode = 'broadcast';
   private pos = new THREE.Vector3(0, 26, 48);
   private look = new THREE.Vector3(0, 0, 0);
+  /** where the lens is pointed this frame (read-only; the lens focuses here
+   *  for an external pose, which is the one rig with no subject and no ball) */
+  get lookPoint(): THREE.Vector3 { return this.look; }
   /** seconds spent in the current mode — drives every canned move */
   private modeT = 0;
   private cutPending = false;
