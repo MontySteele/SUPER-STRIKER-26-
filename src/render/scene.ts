@@ -34,7 +34,7 @@ import { Atmosphere } from './Atmosphere';
 import { DepthAOPass } from './ao';
 import type { GrassBall, GrassField } from './grass';
 import { SHADOW_LAYER, setMaxAnisotropy } from './materials';
-import { GradePass, RetroGradeShader, ScaledBloomPass, TonemapGradeShader } from './postFX';
+import { DofBlurPass, GradePass, RetroGradeShader, ScaledBloomPass, TonemapGradeShader } from './postFX';
 import {
   effectiveSamples, qualityProfile, qualitySetting,
   type QualityLevel, type QualityProfile,
@@ -145,6 +145,7 @@ export class SceneManager {
   private gradePass: ShaderPass;
   /** §7A.6b — null on RETRO and on any level whose profile says aoStrength 0 */
   private aoPass: DepthAOPass | null = null;
+  private dofPass: DofBlurPass | null = null;
 
   private basePixelRatio: number;
   private ratioIdx = 0;
@@ -284,7 +285,15 @@ export class SceneManager {
         this.profile.bloomScale);
       this.composer.addPass(this.bloom);
 
+      // The lens blur buffer (§7A.6c): reads the bloomed frame + depth, writes
+      // its own half-res targets, skipped entirely while dofAmount is 0.
+      this.dofPass = new DofBlurPass();
+      this.dofPass.setCameraRange(this.camera.near, this.camera.far);
+      this.composer.addPass(this.dofPass);
+
       this.gradePass = new GradePass();
+      this.gradePass.uniforms.tDofBlur.value = this.dofPass.texture;
+      this.dofPass.radiusFrac = this.gradePass.uniforms.dofRadius.value;
       this.gradePass.uniforms.exposure.value = this.atmos.exposure;
       this.gradePass.uniforms.gradeAmount.value = this.profile.grade ? 1 : 0;
       this.gradePass.uniforms.cameraRange.value.set(this.camera.near, this.camera.far);
@@ -601,6 +610,7 @@ export class SceneManager {
     u.dofAmount.value = this.profile.retro ? 0 : amount;
     u.dofFocus.value = focusMetres;
     u.dofRange.value = rangeMetres;
+    this.dofPass?.setLens(u.dofAmount.value, focusMetres, rangeMetres);
   }
 
   /** The drawing buffer the GPU is actually filling, in device pixels. */

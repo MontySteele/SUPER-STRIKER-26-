@@ -1084,33 +1084,44 @@ export class GameRenderer {
     const subj = this.cam.subject;
     const useSubject = (mode === 'celebration' || mode === 'external' || mode === 'crowd')
       && subj.lengthSq() > 1e-6;
+    // The nearest player in front of the lens. Every close camera is a shot
+    // of players, and a man three metres from the glass rendered as a smear
+    // does not read as a lens, it reads as a low-res model.
+    const fwd = camera.getWorldDirection(this.lensTmp);
+    let nearest: THREE.Vector3 | null = null;
+    let nearD = Infinity;
+    for (const pm of this.playerMeshes) {
+      const p = pm.root.position;
+      const dx = p.x - camera.position.x, dy = p.y - camera.position.y, dz = p.z - camera.position.z;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d < 1.5 || d >= nearD) continue;
+      // in front of the lens, and not so far off-axis that he is out of frame
+      if ((dx * fwd.x + dy * fwd.y + dz * fwd.z) / d < 0.8) continue;
+      nearD = d; nearest = p;
+    }
     // An external pose with no subject (the walkout, the line-up, the
-    // handshake) is a shot OF PLAYERS whose aim point is usually empty grass
-    // (the walkout's track looks 20 m out while the files are 12 m off), and
-    // the ball is on the centre spot behind it all. A pulled focus goes to
-    // the nearest man in front of the lens; the aim point is the fallback.
+    // handshake) is aimed at empty grass with the files 12 m off; the ball is
+    // on the centre spot behind it all. Focus on the nearest man instead.
     let target: THREE.Vector3 = this.ballMesh.root.position;
     if (useSubject) target = subj;
-    else if (mode === 'external') {
-      target = this.cam.lookPoint;
-      const fwd = camera.getWorldDirection(this.lensTmp);
-      let best = Infinity;
-      for (const pm of this.playerMeshes) {
-        const p = pm.root.position;
-        const dx = p.x - camera.position.x, dy = p.y - camera.position.y, dz = p.z - camera.position.z;
-        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (d < 1.5 || d >= best) continue;
-        // in front of the lens, and not so far off-axis that he is out of frame
-        if ((dx * fwd.x + dy * fwd.y + dz * fwd.z) / d < 0.8) continue;
-        best = d; target = p;
-      }
-    }
-    const dist = camera.position.distanceTo(target);
+    else if (mode === 'external') target = nearest ?? this.cam.lookPoint;
+    let focus = camera.position.distanceTo(target);
     // the focal ZONE scales with the distance, the way a real one does: a
     // third of the subject distance is roughly an f/4 lens at these focal
     // lengths, and it keeps a whole sprinting player sharp rather than just
-    // his shirt number
-    this.sceneMgr.setDepthOfField(1, dist, Math.max(1.6, dist * 0.34));
+    // his shirt number...
+    let range = Math.max(1.6, focus * 0.34);
+    // ...and it is pulled forward to take in the nearest man when he is
+    // closer than that. The crowd forty metres back stays defocused either
+    // way; what changes is that the team-mate running past the lens does not
+    // dissolve.
+    if (nearest && nearD < focus - range) {
+      const lo = nearD - 0.5;
+      const hi = focus + range * 0.5;
+      focus = (lo + hi) * 0.5;
+      range = Math.max(1.6, (hi - lo) * 0.5);
+    }
+    this.sceneMgr.setDepthOfField(1, focus, range);
   }
 
   // ------------------------------------------------------ capture harness
