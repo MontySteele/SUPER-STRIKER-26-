@@ -88,7 +88,7 @@ try {
         await page.goto(`${base}/index.html?broadcast=${encodeURIComponent(name)}`,
           { waitUntil: 'load' });
         await page.waitForFunction(() => window.__ss26Capture?.ready === true,
-          null, { timeout: SHOT_TIMEOUT_MS });
+          null, { timeout: SHOT_TIMEOUT_MS, polling: 500 });
         const result = await page.evaluate(() => window.__ss26Capture);
         if (result.error) throw new Error(result.error);
 

@@ -96,8 +96,12 @@ try {
       const fp = String(args.fps) === '0' ? '&fps=0' : '';
       await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}${pl}${fp}`,
         { waitUntil: 'load' });
+      // interval polling, not Playwright's default rAF polling: a page whose
+      // last rAF has fired (the still is drawn, nothing schedules another) never
+      // runs a rAF-polled predicate again, and the shot times out with the flag
+      // sitting there true (tele_farside, 2026-09-18)
       await page.waitForFunction(() => window.__ss26Capture?.ready === true,
-        null, { timeout: SHOT_TIMEOUT_MS });
+        null, { timeout: SHOT_TIMEOUT_MS, polling: 500 });
       const result = await page.evaluate(() => window.__ss26Capture);
       if (result.error) throw new Error(result.error);
 
