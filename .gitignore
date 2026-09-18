@@ -28,3 +28,4 @@ build/
 
 # character review renders (regenerable by make_player.py)
 pipeline/characters/previews/
+public/models/players_v1_backup/

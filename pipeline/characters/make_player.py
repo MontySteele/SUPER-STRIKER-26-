@@ -32,7 +32,8 @@ because the parts are not worth the same number of texels:
                  level (prepareArchetype), so these are a fallback, not what is
                  drawn. Default 512.
 """
-import bpy, importlib, json, math, os, re, sys
+import bpy, importlib, json, math, os, random, re, struct, sys
+from mathutils import Vector, kdtree
 
 
 def dynamic_import(absolute_package_str, key):
@@ -106,13 +107,28 @@ if skin:
 HumanService.add_builtin_rig(basemesh, spec.get("rig", "mixamo"))
 rig = basemesh.parent
 
+# The hair POOL. One archetype carries several short cuts as separate meshes in
+# the same GLB; the runtime keeps the one a player's seed picked and drops the
+# rest at clone time (characterAssets.ts, pickHair). That is why hair variety
+# costs one extra mesh in one file instead of a per-player download, and why the
+# LOD siblings below are exported with only the first cut — nobody resolves a
+# haircut at forty-five metres.
+#
+# NO DELETE GROUP is applied for hair. The mhclo delete group carves the scalp
+# out of the basemesh, which is correct for exactly one cut and leaves a hole
+# under every other one; with four cuts sharing a skull the scalp has to stay.
+# Short cuts sit ON the head, so nothing shows through — verified in the face
+# plate, and the reason `hair_pool` is short cuts only.
+hair_pool = spec.get("hair_pool") or [spec.get("hair", "short01.mhclo")]
+hair_objects = []
+
 parts = [
     ("eyes", spec.get("eyes", "low-poly.mhclo"), "Eyes"),
     ("eyebrows", spec.get("eyebrows", "eyebrow001.mhclo"), "Eyebrows"),
     ("eyelashes", spec.get("eyelashes", "eyelashes01.mhclo"), "Eyelashes"),
     ("teeth", spec.get("teeth", "teeth_shape01.mhclo"), "Teeth"),
     ("tongue", spec.get("tongue", "tongue01.mhclo"), "Tongue"),
-    ("hair", spec.get("hair", "short01.mhclo"), "Hair"),
+] + [("hair", h, "Hair") for h in hair_pool] + [
     ("clothes", spec.get("shirt", "elvs_crude_t-shirt_male.mhclo"), "Clothes"),
     ("clothes", spec.get("shorts", "cortu_jeans_shorts.mhclo"), "Clothes"),
     ("clothes", spec.get("shoes", "shoes06.mhclo"), "Clothes"),
@@ -121,8 +137,51 @@ for subdir, fname, atype in parts:
     if not fname:
         continue
     p = asset(subdir, fname)
-    if p:
-        HumanService.add_mhclo_asset(p, basemesh, asset_type=atype, material_type="GAMEENGINE")
+    if not p:
+        continue
+    before_objs = set(bpy.data.objects)
+    before_mods = {m.name for m in basemesh.modifiers}
+    HumanService.add_mhclo_asset(p, basemesh, asset_type=atype, material_type="GAMEENGINE")
+    new_objs = [o for o in bpy.data.objects if o not in before_objs and o.type == "MESH"]
+    if atype == "Hair":
+        hair_objects.extend(new_objs)
+        for m in list(basemesh.modifiers):
+            if m.type == "MASK" and m.name not in before_mods:
+                print(f"[make_player] dropping hair delete-group mask {m.name}")
+                basemesh.modifiers.remove(m)
+print(f"[make_player] hair pool: {[o.name for o in hair_objects]}")
+
+# A hair budget, because the library does not have one. `elvs_braided_rows`
+# models every cornrow as real tube geometry and arrives at FORTY THOUSAND
+# triangles — more than the rest of the character put together, for a haircut
+# that is 60 px tall in the closest shot this game takes. Anything over the cap
+# is collapsed down to it; anything under is left exactly as authored.
+# The same applies to garments: the polo shirt is worth its collar and its
+# sleeve hems but not four thousand triangles of them, and a library that does
+# not know what it is being used for will hand you whatever it was modelled at.
+HAIR_TRIS = int(spec.get("hair_tris", 6000))
+GARMENT_TRIS = int(spec.get("garment_tris", 3200))
+budgets = [(o, HAIR_TRIS) for o in hair_objects]
+hair_set = set(hair_objects)
+for o in bpy.data.objects:
+    if o.type != "MESH" or o in hair_set or o is basemesh:
+        continue
+    if re.search(r"polo|shirt|short|trunk|trouser|jean", o.name or "", re.I):
+        budgets.append((o, GARMENT_TRIS))
+for o, cap in budgets:
+    o.data.calc_loop_triangles()
+    n = len(o.data.loop_triangles)
+    if n <= cap:
+        continue
+    bpy.ops.object.select_all(action="DESELECT")
+    o.select_set(True)
+    bpy.context.view_layer.objects.active = o
+    m = o.modifiers.new("tribudget", "DECIMATE")
+    m.ratio = cap / n
+    m.use_collapse_triangulate = True
+    bpy.ops.object.modifier_apply(modifier="tribudget")
+    o.data.calc_loop_triangles()
+    print(f"[make_player] tri budget {o.name}: {n} -> {len(o.data.loop_triangles)} tris")
 
 def dump(tag):
     print(f"[make_player] --- {tag}")
@@ -141,6 +200,205 @@ leg = blen("mixamorig:LeftUpLeg") + blen("mixamorig:LeftLeg")
 sh, hd, hp = bhead("mixamorig:LeftArm"), bhead("mixamorig:Head"), bhead("mixamorig:Hips")
 if sh and hd and hp:
     print(f"[make_player] proportions: arm={arm:.3f} leg={leg:.3f} hip->shoulder={(sh-hp).length:.3f} shoulder->head={(hd-sh).length:.3f} arm/leg={arm/leg:.3f} hipY={hp.z:.3f}")
+
+# --- the face pool -------------------------------------------------------------
+#
+# WHY A DELTA POOL AND NOT TWENTY-TWO CHARACTERS.
+#
+# Twenty-two men with twenty-two faces is, on the face of it, twenty-two GLBs;
+# at 2.4 MB each that is 53 MB of download to put eleven-a-side on a pitch, and
+# 53 MB of decoded skin in a 16 GB machine. But two players of the same
+# archetype differ ONLY in the head: same skeleton, same body, same kit, same
+# 2048 skin atlas. What is actually unique is a few thousand vertex positions.
+#
+# So the pipeline ships those, and nothing else: for each archetype, ONE array
+# of head-region base positions and N arrays of int16 offsets from it. The
+# runtime clones the archetype's LOD0 geometry per player (which it must do
+# anyway to put a number on a shirt) and adds one variant's offsets. No extra
+# mesh, no extra draw call, no neck seam to hide, no second skeleton to bind —
+# and a whole pool costs about what ONE extra character would have.
+#
+# The offsets are masked by the Head bone's skin weight, ramped to zero through
+# the jaw/neck transition, so the deltas are a smooth field that dies out before
+# the collar. A face target can therefore never crack the neck open.
+FACE_COUNT = int(spec.get("face_count", 0))
+FACE_SEED = int(spec.get("face_seed", 20260218))
+
+# Each knob is (target when negative, target when positive, sigma). "{s}" is
+# expanded to the l-/r- pair and driven with the same weight, so a face comes
+# out symmetric; ASYM below adds back the small amount of asymmetry that stops
+# a head reading as a mannequin.
+FACE_KNOBS = [
+    ("head/head-scale-depth-decr", "head/head-scale-depth-incr", 0.50),
+    ("head/head-scale-horiz-decr", "head/head-scale-horiz-incr", 0.40),
+    ("head/head-scale-vert-decr", "head/head-scale-vert-incr", 0.40),
+    ("head/head-fat-decr", "head/head-fat-incr", 0.55),
+    ("head/head-age-decr", "head/head-age-incr", 0.50),
+    ("head/head-back-scale-depth-decr", "head/head-back-scale-depth-incr", 0.40),
+    ("head/head-angle-in", "head/head-angle-out", 0.35),
+    ("forehead/forehead-nubian-decr", "forehead/forehead-nubian-incr", 0.45),
+    ("forehead/forehead-scale-vert-decr", "forehead/forehead-scale-vert-incr", 0.45),
+    ("forehead/forehead-temple-decr", "forehead/forehead-temple-incr", 0.40),
+    ("forehead/forehead-trans-backward", "forehead/forehead-trans-forward", 0.35),
+    ("nose/nose-scale-depth-decr", "nose/nose-scale-depth-incr", 0.50),
+    ("nose/nose-scale-horiz-decr", "nose/nose-scale-horiz-incr", 0.50),
+    ("nose/nose-scale-vert-decr", "nose/nose-scale-vert-incr", 0.45),
+    ("nose/nose-hump-decr", "nose/nose-hump-incr", 0.55),
+    ("nose/nose-curve-concave", "nose/nose-curve-convex", 0.45),
+    ("nose/nose-nostrils-width-decr", "nose/nose-nostrils-width-incr", 0.50),
+    ("nose/nose-point-down", "nose/nose-point-up", 0.45),
+    ("nose/nose-width1-decr", "nose/nose-width1-incr", 0.40),
+    ("nose/nose-width2-decr", "nose/nose-width2-incr", 0.40),
+    ("nose/nose-base-down", "nose/nose-base-up", 0.35),
+    ("nose/nose-greek-decr", "nose/nose-greek-incr", 0.35),
+    ("chin/chin-bones-decr", "chin/chin-bones-incr", 0.55),
+    ("chin/chin-height-decr", "chin/chin-height-incr", 0.45),
+    ("chin/chin-prognathism-decr", "chin/chin-prognathism-incr", 0.45),
+    ("chin/chin-prominent-decr", "chin/chin-prominent-incr", 0.50),
+    ("chin/chin-width-decr", "chin/chin-width-incr", 0.50),
+    ("chin/chin-cleft-decr", "chin/chin-cleft-incr", 0.35),
+    ("mouth/mouth-scale-horiz-decr", "mouth/mouth-scale-horiz-incr", 0.50),
+    ("mouth/mouth-scale-vert-decr", "mouth/mouth-scale-vert-incr", 0.45),
+    ("mouth/mouth-scale-depth-decr", "mouth/mouth-scale-depth-incr", 0.40),
+    ("mouth/mouth-upperlip-volume-decr", "mouth/mouth-upperlip-volume-incr", 0.50),
+    ("mouth/mouth-lowerlip-volume-decr", "mouth/mouth-lowerlip-volume-incr", 0.50),
+    ("mouth/mouth-angles-down", "mouth/mouth-angles-up", 0.40),
+    ("mouth/mouth-trans-backward", "mouth/mouth-trans-forward", 0.30),
+    ("mouth/mouth-philtrum-volume-decr", "mouth/mouth-philtrum-volume-incr", 0.35),
+    ("eyes/{s}-eye-scale-decr", "eyes/{s}-eye-scale-incr", 0.45),
+    ("eyes/{s}-eye-height1-decr", "eyes/{s}-eye-height1-incr", 0.40),
+    ("eyes/{s}-eye-height2-decr", "eyes/{s}-eye-height2-incr", 0.40),
+    ("eyes/{s}-eye-push1-in", "eyes/{s}-eye-push1-out", 0.40),
+    ("eyes/{s}-eye-trans-in", "eyes/{s}-eye-trans-out", 0.30),
+    ("eyes/{s}-eye-corner1-down", "eyes/{s}-eye-corner1-up", 0.35),
+    ("eyes/{s}-eye-corner2-down", "eyes/{s}-eye-corner2-up", 0.35),
+    ("eyes/{s}-eye-bag-decr", "eyes/{s}-eye-bag-incr", 0.40),
+    ("eyes/{s}-eye-eyefold-down", "eyes/{s}-eye-eyefold-up", 0.40),
+    ("cheek/{s}-cheek-bones-decr", "cheek/{s}-cheek-bones-incr", 0.55),
+    ("cheek/{s}-cheek-inner-decr", "cheek/{s}-cheek-inner-incr", 0.45),
+    ("cheek/{s}-cheek-volume-decr", "cheek/{s}-cheek-volume-incr", 0.50),
+    ("cheek/{s}-cheek-trans-down", "cheek/{s}-cheek-trans-up", 0.35),
+    ("ears/{s}-ear-scale-decr", "ears/{s}-ear-scale-incr", 0.45),
+    ("ears/{s}-ear-rot-backward", "ears/{s}-ear-rot-forward", 0.40),
+    ("ears/{s}-ear-lobe-decr", "ears/{s}-ear-lobe-incr", 0.35),
+    ("ears/{s}-ear-flap-decr", "ears/{s}-ear-flap-incr", 0.35),
+    ("neck/neck-scale-horiz-decr", "neck/neck-scale-horiz-incr", 0.30),
+]
+# exactly one skull shape per head, at a modest weight
+FACE_SHAPES = ["head/head-oval", "head/head-round", "head/head-square",
+               "head/head-rectangular", "head/head-triangular",
+               "head/head-invertedtriangular", "head/head-diamond"]
+# a little real asymmetry, small enough to read as a person and not a defect
+FACE_ASYM = ["asym/asym-nose-1", "asym/asym-nose-2", "asym/asym-nose-3",
+             "asym/asym-eye-1", "asym/asym-eye-2", "asym/asym-eye-3",
+             "asym/asym-cheek-1", "asym/asym-cheek-2",
+             "asym/asym-mouth-1", "asym/asym-mouth-2"]
+
+face_pool = None
+if FACE_COUNT > 0:
+    def expand(t):
+        return [t.replace("{s}", "l"), t.replace("{s}", "r")] if "{s}" in t else [t]
+
+    wanted = set()
+    for neg, pos, _ in FACE_KNOBS:
+        wanted.update(expand(neg)); wanted.update(expand(pos))
+    wanted.update(FACE_SHAPES)
+    for a in FACE_ASYM:
+        wanted.add(a + "-l"); wanted.add(a + "-r")
+
+    # Load every candidate ONCE as a zero-weight shape key; the per-head weights
+    # are then arithmetic on the key data, which costs nothing and — crucially —
+    # never touches the mesh, so the export below is unaffected by how many
+    # faces the pool holds.
+    loaded = {}
+    for tname in sorted(wanted):
+        tpath = os.path.join(targets_root, tname + ".target.gz")
+        if not os.path.exists(tpath):
+            continue
+        key = "fp_" + tname.replace("/", "_")
+        TargetService.load_target(basemesh, tpath, weight=0.0, name=key)
+        loaded[tname] = key
+    kb = basemesh.data.shape_keys.key_blocks
+    basis = kb[basemesh.data.shape_keys.reference_key.name]
+    nv = len(basemesh.data.vertices)
+    print(f"[make_player] face pool: {len(loaded)}/{len(wanted)} targets loaded over {nv} verts")
+
+    # Per-target sparse offset lists, so a head is a few thousand adds and not
+    # fifty passes over twenty thousand vertices.
+    offsets = {}
+    for tname, key in loaded.items():
+        data = kb[key].data
+        bdata = basis.data
+        sparse = []
+        for i in range(nv):
+            d = data[i].co - bdata[i].co
+            if d.length_squared > 1e-12:
+                sparse.append((i, d))
+        offsets[tname] = sparse
+
+    # The mask: 1 on the skull, ramped to 0 through the jaw/neck transition.
+    head_group = basemesh.vertex_groups.get("mixamorig:Head")
+    face_mask = [0.0] * nv
+    if head_group:
+        gi = head_group.index
+        for v in basemesh.data.vertices:
+            w = 0.0
+            for g in v.groups:
+                if g.group == gi:
+                    w = g.weight
+            t = min(1.0, max(0.0, (w - 0.30) / 0.45))
+            face_mask[v.index] = t * t * (3 - 2 * t)
+    else:
+        print("[make_player] WARNING no mixamorig:Head vertex group — face pool unmasked")
+
+    face_variants = []
+    face_recipes = []
+    for vi in range(FACE_COUNT):
+        rng = random.Random(FACE_SEED * 1000003 + vi * 7919 + hash(name) % 100003)
+        picks = {}
+        for neg, pos, sigma in FACE_KNOBS:
+            w = max(-1.0, min(1.0, rng.gauss(0.0, sigma)))
+            if abs(w) < 0.04:
+                continue
+            for t in expand(pos if w > 0 else neg):
+                picks[t] = abs(w)
+        shape = rng.choice(FACE_SHAPES)
+        picks[shape] = 0.30 + rng.random() * 0.55
+        for a in FACE_ASYM:
+            if rng.random() < 0.45:
+                picks[a + rng.choice(["-l", "-r"])] = rng.random() * 0.45
+        delta = [None] * nv
+        for tname, w in picks.items():
+            sparse = offsets.get(tname)
+            if not sparse:
+                continue
+            for i, d in sparse:
+                m = face_mask[i]
+                if m <= 0.0:
+                    continue
+                cur = delta[i]
+                if cur is None:
+                    delta[i] = d * (w * m)
+                else:
+                    cur += d * (w * m)
+        face_variants.append(delta)
+        face_recipes.append({"shape": shape, "knobs": len(picks)})
+    print(f"[make_player] face pool: {FACE_COUNT} variants built")
+    face_pool = {"variants": face_variants, "recipes": face_recipes}
+
+    # zero every pool key so the bake below is the archetype's own face
+    for key in loaded.values():
+        kb[key].value = 0.0
+
+# Carry the MakeHuman vertex index through the mask modifiers, so the face pool
+# can be re-indexed onto the geometry that actually ships. Blender keeps generic
+# point attributes across a Mask apply; the glTF exporter ignores any custom
+# attribute whose name does not start with an underscore, and this one is
+# deleted before the export regardless.
+if face_pool is not None:
+    idx_attr = basemesh.data.attributes.new("mh_idx", "INT", "POINT")
+    for i in range(len(basemesh.data.vertices)):
+        idx_attr.data[i].value = i
 
 # --- export prep (in place, no copy) ------------------------------------------
 # Basemesh: bake the macro/target shape keys into the mesh, then apply the mask
@@ -304,9 +562,9 @@ SURFACE = [
     ("eyebrow|eyelash", 0.72, 0.0),
     ("low-poly|cornea|eyeball", 0.12, 0.0),  # wet, and the only real highlight on a face
     ("shoes|boot", 0.38, 0.0),               # moulded synthetic: glossy, not chrome
-    ("hair|afro|short0", 0.68, 0.0),
+    ("hair|afro|short0|braid|cornrow|micky|messy", 0.68, 0.0),
     ("teeth|tongue", 0.35, 0.0),
-    ("shirt|shorts|trunks|jeans|t-shirt", 0.85, 0.0),   # fabric
+    ("shirt|shorts|trunks|jeans|t-shirt|trouser|polo", 0.85, 0.0),   # fabric
     ("", 0.58, 0.0),                         # skin
 ]
 for mat in bpy.data.materials:
@@ -332,7 +590,17 @@ TEX_MAX = int(spec.get("tex_max", 2048))
 TEX_PARTS = int(spec.get("tex_parts", 1024))
 TEX_HIDDEN = int(spec.get("tex_hidden", 256))
 TEX_LOD = int(spec.get("tex_lod", 512))
-HIDDEN_RE = re.compile(r"teeth|tongue|eyelash|eyebrow", re.I)
+HIDDEN_RE = re.compile(r"teeth|tongue", re.I)
+# Brows and lashes are no longer culled by the loader at LOD0 — a face without
+# them reads as a shop dummy the moment a replay camera gets inside three
+# metres — so they need real texels again. 512 is what the source ships.
+FINE_RE = re.compile(r"eyelash|eyebrow", re.I)
+# A hair POOL means four cuts per archetype instead of one. At 1024 apiece that
+# is four megabytes of scalp per character; 512 is the resolution an alpha-
+# tested hair card actually resolves at the closest shot the game ever takes.
+HAIR_RE = re.compile(r"hair|afro|short0|braid|cornrow|micky|messy", re.I)
+TEX_FINE = int(spec.get("tex_fine", 512))
+TEX_HAIR = int(spec.get("tex_hair", 512))
 
 
 def images_of(obj):
@@ -358,14 +626,118 @@ def scale_images(caps, tag):
 
 caps = {}
 for obj in [basemesh] + assets:
-    cap = TEX_MAX if obj is basemesh else (
-        TEX_HIDDEN if HIDDEN_RE.search(f"{obj.name} {ObjectService.get_object_type(obj) or ''}")
-        else TEX_PARTS)
+    tag = f"{obj.name} {ObjectService.get_object_type(obj) or ''}"
+    if obj is basemesh:
+        cap = TEX_MAX
+    elif HIDDEN_RE.search(tag):
+        cap = TEX_HIDDEN
+    elif FINE_RE.search(tag):
+        cap = TEX_FINE
+    elif HAIR_RE.search(tag):
+        cap = TEX_HAIR
+    else:
+        cap = TEX_PARTS
     for img in images_of(obj):
         caps[img] = min(caps.get(img, cap), cap)
 for img in bpy.data.images:
     caps.setdefault(img, TEX_PARTS)
 scale_images(caps, "scaled")
+
+# --- write the face pool -------------------------------------------------------
+# Positions go out in the SAME space and the SAME axis convention the glTF
+# exporter uses (y-up: blender x,y,z -> x,z,-y) and in mesh-LOCAL coordinates,
+# because that is what the runtime reads off the loaded BufferGeometry. The
+# runtime matches pool vertex to buffer vertex by position, once per archetype,
+# which is immune to the exporter splitting a vertex in two at a UV seam: both
+# copies share the position and therefore both get the same offset.
+def yup(v):
+    return (v.x, v.z, -v.y)
+
+
+if face_pool is not None:
+    attr = basemesh.data.attributes.get("mh_idx")
+    orig = [attr.data[i].value for i in range(len(basemesh.data.vertices))] if attr else []
+    basemesh.data.attributes.remove(attr) if attr else None
+
+    body_ix = [j for j, o in enumerate(orig) if face_mask[o] > 0.001]
+    print(f"[make_player] face pool: {len(body_ix)} of {len(orig)} body verts in the head field")
+
+    bw = basemesh.matrix_world
+    tree = kdtree.KDTree(len(body_ix))
+    for k, j in enumerate(body_ix):
+        tree.insert(bw @ basemesh.data.vertices[j].co, k)
+    tree.balance()
+
+    # Everything parented to the face follows it: the eyeballs, the brows, the
+    # lashes and every cut in the hair pool. Each of those vertices takes the
+    # offset of the nearest skull vertex, which is the same rule MPFB's own
+    # fitting uses and is exact enough at this scale — a brow hair is never more
+    # than a couple of millimetres off the skin it grows out of.
+    FOLLOW_RE = re.compile(r"eyebrow|eyelash|low-poly|eye", re.I)
+    followers = [o for o in assets
+                 if o in hair_objects or FOLLOW_RE.search(o.name or "")]
+    followers = [o for o in followers if not re.search(r"teeth|tongue", o.name or "", re.I)]
+
+    SCALE = 2.0e-5
+    sections, base_buf, delta_buf = [], bytearray(), bytearray()
+    nvar = FACE_COUNT
+
+    def emit(obj, pairs):
+        """pairs: [(local_co, [delta_world per variant])] in vertex order."""
+        if not pairs:
+            return
+        off_base = len(base_buf)
+        for co, _ in pairs:
+            base_buf.extend(struct.pack("<3f", *yup(co)))
+        off_delta = len(delta_buf)
+        inv = obj.matrix_world.inverted().to_3x3()
+        for v in range(nvar):
+            for _, ds in pairs:
+                d = inv @ ds[v] if ds[v] is not None else Vector((0, 0, 0))
+                x, y, z = yup(d)
+                delta_buf.extend(struct.pack("<3h",
+                    max(-32767, min(32767, int(round(x / SCALE)))),
+                    max(-32767, min(32767, int(round(y / SCALE)))),
+                    max(-32767, min(32767, int(round(z / SCALE))))))
+        sections.append({"mesh": obj.name, "count": len(pairs),
+                         "base": off_base, "delta": off_delta})
+
+    body_pairs = []
+    for j in body_ix:
+        o = orig[j]
+        body_pairs.append((basemesh.data.vertices[j].co.copy(),
+                           [fv[o] for fv in face_pool["variants"]]))
+    emit(basemesh, body_pairs)
+    base_bytes_body = len(base_buf)
+
+    for obj in followers:
+        mw = obj.matrix_world
+        pairs = []
+        for v in obj.data.vertices:
+            co, k, dist = tree.find(mw @ v.co)
+            if dist > 0.09:
+                pairs.append((v.co.copy(), [None] * nvar))
+                continue
+            o = orig[body_ix[k]]
+            pairs.append((v.co.copy(), [fv[o] for fv in face_pool["variants"]]))
+        emit(obj, pairs)
+
+    bin_path = os.path.join(out_dir, f"{name}_faces.bin")
+    with open(bin_path, "wb") as fh:
+        fh.write(base_buf)
+        fh.write(delta_buf)
+    manifest = {
+        "name": name, "variants": nvar, "scale": SCALE,
+        "baseBytes": len(base_buf),
+        "hair": [o.name for o in hair_objects],
+        "sections": sections,
+        "recipes": face_pool["recipes"],
+    }
+    with open(os.path.join(out_dir, f"{name}_faces.json"), "w") as fh:
+        json.dump(manifest, fh, separators=(",", ":"))
+    print(f"[make_player] wrote {bin_path} ({len(base_buf) + len(delta_buf) // 1} bytes,"
+          f" {len(sections)} meshes, {nvar} variants,"
+          f" {(len(base_buf)+len(delta_buf))//1024} KB)")
 
 glb = os.path.join(out_dir, f"{name}.glb")
 bpy.ops.export_scene.gltf(filepath=glb, export_format="GLB", use_selection=True,
@@ -410,6 +782,17 @@ if spec.get("preview", True):
         print(f"[make_player] preview {scene.render.filepath}")
 
 # --- LODs ----------------------------------------------------------------------
+# The hair pool does not survive into the LOD siblings. lod1 starts at 45 m and
+# lod2 at 90 m; nobody has ever resolved a haircut at forty-five metres, and
+# carrying four cuts down two decimation passes would cost three extra meshes,
+# three extra textures and three extra draws per distant player for nothing.
+# Everyone past the first detail band wears cut zero.
+for extra in hair_objects[1:]:
+    print(f"[make_player] LOD: dropping hair variant {extra.name}")
+    if extra in children:
+        children.remove(extra)
+    bpy.data.objects.remove(extra, do_unlink=True)
+
 # Textures first: the two LOD siblings used to re-embed a byte-identical copy of
 # every map in the full-detail file, which is where two thirds of the character
 # download went. The runtime hands level 0's materials to every level, so what

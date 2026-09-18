@@ -29,5 +29,14 @@
  "lods": [
   0.55,
   0.15
- ]
+ ],
+ "hair_pool": [
+  "short04.mhclo",
+  "short01.mhclo",
+  "short02.mhclo",
+  "cortu_short_messy_hair.mhclo"
+ ],
+ "face_count": 12,
+ "face_seed": 20389,
+ "shirt": "namuhekam_male_polo_shirt.mhclo"
 }

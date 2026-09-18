@@ -163,6 +163,27 @@ export const KIT_UV = {
 
 export type KitRegion = keyof typeof KIT_UV;
 
+/** The cuts a seeded kit can come in (see TextureLab.kitLayoutFor). */
+export const KIT_PATTERNS = ['plain', 'stripes', 'hoops', 'sash', 'halves', 'shoulders'] as const;
+export type KitPattern = (typeof KIT_PATTERNS)[number];
+
+/** Fictional, on purpose: a generated roster wearing real sponsors is a
+ *  trademark problem, and these read exactly the same from ten metres. */
+export const KIT_SPONSORS = ['VERTEXA', 'NORDLUFT', 'KAIROS', 'MERIDIA', 'ALTAVIA',
+  'ORBEX', 'SOLARIS', 'HELIONA', 'PARAGON', 'TERRANOVA', 'ZENTRIX', 'AQUILA'] as const;
+
+/** One team's cut. Everything a kit is beyond its two hex colours. */
+export interface KitLayout {
+  pattern: KitPattern;
+  bands: number;
+  cuff: number;
+  collar: number;
+  sponsor: string;
+  crest: number;
+  bootAccent: string;
+  seed: number;
+}
+
 const KIT_W = 512;
 const KIT_H = 512;
 /** The per-player shirt back. Small on purpose: 22 of these ship per match. */
@@ -229,6 +250,8 @@ export class TextureLab {
   private kitCache = new Map<string, THREE.CanvasTexture>();
   /** the fabric-weave tile every kit atlas is painted with, baked once */
   private weave: HTMLCanvasElement | null = null;
+  /** the tiling cloth normal the authored garments wear, baked once */
+  private kitNormal: THREE.DataTexture | null = null;
 
   constructor(private seed: number = LAB_SEED) {
     const rng = new RNG(seed);
@@ -709,6 +732,143 @@ export class TextureLab {
       this.weave = c;
     });
     return this.weave!;
+  }
+
+  // ------------------------------------------------- the authored-kit bake
+  //
+  // Everything below serves the SKINNED players (characterAssets.ts), whose
+  // shirt is a real garment mesh with a collar and sleeve hems rather than the
+  // capsule path's five atlas rectangles. It lives here because it is a BAKE:
+  // one weave normal for the match, one crest and one layout per team, all of
+  // it from the two hex colours in teams.json and a seed, and all of it timed
+  // against the same budget as everything else in this file.
+
+  /** The weave tile, for a caller that composites its own garment. */
+  kitWeaveTile(): HTMLCanvasElement {
+    return this.fabricWeave();
+  }
+
+  /**
+   * A tiling cloth NORMAL map — the weave as geometry rather than as a smudge
+   * of light and dark.
+   *
+   * The diffuse weave above is what stops a shirt reading as a coloured
+   * sticker at forty metres. This is what stops it at three: a football shirt
+   * under a floodlight has a grain that catches the key, and no amount of
+   * painted contrast fakes that once the light moves. Baked once, shared by
+   * every kit in the match, tiled hard (the knit is ~1mm and the shirt is half
+   * a metre across).
+   */
+  kitWeaveNormalMap(): THREE.DataTexture {
+    if (this.kitNormal) return this.kitNormal;
+    this.time('kit weave normal', () => {
+      const N = 128;
+      const h = new Float32Array(N * N);
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          // a knit is two interleaved ribs; the diagonal offset is what makes
+          // it read as jersey rather than as graph paper
+          const rib = Math.sin((x / N) * Math.PI * 2 * 16) * 0.5
+            + Math.sin(((y + (x & 1) * 0.5) / N) * Math.PI * 2 * 16) * 0.5;
+          const grain = this.field.octave(5, x / N, y / N);
+          h[y * N + x] = rib * 0.6 + grain * 0.4;
+        }
+      }
+      const data = new Uint8Array(N * N * 4);
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          const l = h[y * N + ((x + N - 1) % N)];
+          const r = h[y * N + ((x + 1) % N)];
+          const u = h[((y + N - 1) % N) * N + x];
+          const d = h[((y + 1) % N) * N + x];
+          const nx = (l - r) * 1.4, ny = (u - d) * 1.4;
+          const len = Math.hypot(nx, ny, 1);
+          const o = (y * N + x) * 4;
+          data[o] = Math.round(((nx / len) * 0.5 + 0.5) * 255);
+          data[o + 1] = Math.round(((ny / len) * 0.5 + 0.5) * 255);
+          data[o + 2] = Math.round(((1 / len) * 0.5 + 0.5) * 255);
+          data[o + 3] = 255;
+        }
+      }
+      const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(16, 16);
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+      tex.colorSpace = THREE.NoColorSpace;
+      tex.needsUpdate = true;
+      this.kitNormal = tex;
+    });
+    return this.kitNormal!;
+  }
+
+  /**
+   * A team's CUT, seeded from the team rather than chosen.
+   *
+   * Two teams whose kits differ only in hue look like the same team in two
+   * colours, which is the single loudest thing wrong with a generated roster.
+   * A seeded layout gives one side hoops and the other a sash, one a wide
+   * collar and the other a placket, and it does it deterministically, so a
+   * team's kit is its kit in every match and every capture.
+   */
+  kitLayoutFor(kit: KitColors, seed: number): KitLayout {
+    const rng = this.stream(seed ^ 0x5f17);
+    const pattern = KIT_PATTERNS[(rng.next() * KIT_PATTERNS.length) | 0];
+    return {
+      pattern,
+      /** how many stripes/hoops across the body */
+      bands: 4 + ((rng.next() * 5) | 0),
+      /** 0 = no trim on the sleeve, 1 = a full contrast cuff */
+      cuff: 0.35 + rng.next() * 0.55,
+      /** how much of the collar is the contrast colour */
+      collar: 0.55 + rng.next() * 0.45,
+      /** a fictional sponsor. Deliberately not a real brand. */
+      sponsor: KIT_SPONSORS[(rng.next() * KIT_SPONSORS.length) | 0],
+      crest: (rng.next() * 4) | 0,
+      /** boots take an accent from the kit rather than being 22 black blobs */
+      bootAccent: rng.next() < 0.5 ? kit.shirt : kit.socks,
+      seed,
+    };
+  }
+
+  /**
+   * The club crest: a shield, a bar and two initials, in the kit's own colours.
+   * Small (96²) because it is 40 px on screen in the closest shot there is.
+   */
+  kitCrestCanvas(kit: KitColors, layout: KitLayout, initials: string): HTMLCanvasElement {
+    const N = 96;
+    const [c, ctx] = canvas2d(N, N);
+    const dark = luminance(kit.shirt) > 0.5;
+    const body = dark ? shade(kit.shirt, -0.55) : shade(kit.shirt, 0.6);
+    const ink = dark ? shade(kit.shirt, 0.75) : shade(kit.shirt, -0.7);
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    const s = layout.crest;
+    if (s === 0) {          // shield
+      ctx.moveTo(N * 0.16, N * 0.12); ctx.lineTo(N * 0.84, N * 0.12);
+      ctx.lineTo(N * 0.84, N * 0.58); ctx.quadraticCurveTo(N * 0.5, N * 0.96, N * 0.16, N * 0.58);
+    } else if (s === 1) {   // roundel
+      ctx.arc(N * 0.5, N * 0.5, N * 0.38, 0, Math.PI * 2);
+    } else if (s === 2) {   // diamond
+      ctx.moveTo(N * 0.5, N * 0.08); ctx.lineTo(N * 0.9, N * 0.5);
+      ctx.lineTo(N * 0.5, N * 0.92); ctx.lineTo(N * 0.1, N * 0.5);
+    } else {                // banner
+      ctx.moveTo(N * 0.12, N * 0.18); ctx.lineTo(N * 0.88, N * 0.18);
+      ctx.lineTo(N * 0.88, N * 0.7); ctx.lineTo(N * 0.5, N * 0.86); ctx.lineTo(N * 0.12, N * 0.7);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = N * 0.055;
+    ctx.stroke();
+    ctx.fillStyle = ink;
+    ctx.fillRect(N * 0.16, N * 0.42, N * 0.68, N * 0.07);
+    ctx.font = `bold ${Math.round(N * 0.3)}px Helvetica, Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(initials.slice(0, 3).toUpperCase(), N * 0.5, N * 0.38);
+    return c;
   }
 
   // ------------------------------------------------------------------- crowd
@@ -1326,6 +1486,8 @@ export class TextureLab {
   dispose(): void {
     for (const t of this.kitCache.values()) t.dispose();
     this.kitCache.clear();
+    this.kitNormal?.dispose();
+    this.kitNormal = null;
     if (this.pitch) {
       this.pitch.macro.dispose();
       this.pitch.detail.dispose();

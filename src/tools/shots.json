@@ -530,6 +530,28 @@
       "weather": "clear",
       "stadium": "national",
       "cam": { "pos": [96, 30, 92], "look": [0, 46, 0], "fov": 46 }
+    },
+    {
+      "name": "face_closeup",
+      "note": "FACES (\u00a77A.2). celebration_closeup's goal, the same 2.6s into the celebration, shot from 1.55m in front of the scorer at eye height: one head across a third of the frame. This is the plate the per-player face pool, the stubble mask, the pore micro-normal, the brows and lashes (kept at LOD0 only) and the hair sheen are all judged on, and the only shot in the contract where any of them is bigger than a few pixels.",
+      "seed": 22343,
+      "home": "cze",
+      "away": "ger",
+      "frames": 0,
+      "seek": {
+        "playerAnim": "celebrate",
+        "playerAnimT": 2.6
+      },
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": "keeper",
+      "camFacing": true,
+      "camOffset": [
+        1.55,
+        1.74,
+        0.3
+      ],
+      "camAim": 1.63
     }
   ]
 }

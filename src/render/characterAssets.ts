@@ -33,7 +33,7 @@ import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.j
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { PlayerData } from '../data/types';
 import { SHADOW_LAYER, queueBroadcastSkin, queueShaderPatch } from './materials';
-import { luminance, shade, type KitColors } from './TextureLab';
+import { luminance, shade, TextureLab, type KitColors, type KitLayout } from './TextureLab';
 import type { KitSpec } from './playerMesh';
 
 // --------------------------------------------------------------- the asset list
@@ -367,7 +367,19 @@ export const TRUDGE_CHAIN: ClipId[] = ['idle', 'trudge', 'walk', 'jog'];
 /** Meshes that are never visible at broadcast distance and cost a draw call
  *  each, times twenty-two, times every shadow cascade. The mouth interior is
  *  7.5k triangles of a CLOSED MOUTH. */
-const CULL_MESHES = /teeth|tongue|eyelash|eyebrow/i;
+const CULL_MESHES = /teeth|tongue/i;
+
+/**
+ * Brows and lashes: kept at LOD0, dropped everywhere else.
+ *
+ * They used to be in CULL_MESHES, which was right when the closest the camera
+ * ever got was ten metres and wrong the moment a celebration close-up put a
+ * face across a third of the frame. A brow ridge with no brow on it is the
+ * single loudest "this is a mannequin" tell there is, and the pair costs 560
+ * triangles and two draws — at LOD0 only, which is at most a handful of players
+ * in any frame. Past the first detail band they go, as before.
+ */
+const FINE_MESHES = /eyebrow|eyelash/i;
 
 /** Shorter than this and it is a failed retarget, not an animation. */
 const MIN_CLIP_SECONDS = 0.2;
@@ -777,6 +789,294 @@ function recolour(ctx: CanvasRenderingContext2D, img: CanvasImageSource,
   ctx.globalCompositeOperation = 'source-over';
 }
 
+// ------------------------------------------------------------- garment maps
+//
+// WHY THE KIT IS NO LONGER PAINTED INTO HARD-CODED UV RECTANGLES.
+//
+// SHIRT_UV above is four numbers measured by hand off one particular garment
+// (`crude_male_shirt`). Everything the kit painter could do was therefore
+// limited to what those four numbers described, and the moment the pipeline
+// swapped that garment for one with an actual collar, every number in it was
+// wrong.
+//
+// So the layout is DERIVED from the mesh instead, once per archetype:
+//
+//   • every triangle is classified in 3D (torso front, torso back, sleeve,
+//     cuff, collar) and rasterised into UV space, so the painter knows what
+//     each texel IS rather than where somebody measured it;
+//   • each texel also carries where it sits ON THE BODY — across (0 = one
+//     flank, 1 = the other) and up (0 = hem, 1 = shoulder) — which is what
+//     makes stripes, hoops, a sash and a hem trim one formula instead of five
+//     hand-placed rectangles;
+//   • the back and front panels each get a least-squares fit from body space to
+//     UV space, which is how a number is printed upright and the right way
+//     round on ANY garment without anybody working out which way the island was
+//     flipped. (The old code had to rotate the back island 180° because that
+//     one happened to be laid out upside down and mirrored.)
+//
+// It costs one software rasterisation of a ~3k-triangle mesh per archetype.
+
+const GARMENT_PX = 1024;
+
+/** smoothstep, for band edges that are a gradient and not a triangle. */
+const smooth = (a: number, b: number, x: number): number => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a || 1e-6)));
+  return t * t * (3 - 2 * t);
+};
+
+/** Triangle classes, as stored in the map's blue channel (×51). */
+const enum Part { Front = 0, Back = 1, Sleeve = 2, Collar = 3, Cuff = 4 }
+
+/** Body space → UV pixels, as a canvas transform. */
+interface TextFrame {
+  /** d(uv pixels)/d(body x) and d(uv pixels)/d(body y) */
+  m: [number, number, number, number];
+  /** uv pixel position of the panel's centroid */
+  cx: number;
+  cy: number;
+  /** half the panel's extent in metres, across the body and up it. Print
+   *  positions are fractions of these, so a crest lands on the chest of any
+   *  garment instead of wherever a number in this file happened to point. */
+  halfW: number;
+  halfH: number;
+  /** uv pixels per metre along the body's x axis */
+  ppm: number;
+}
+
+interface GarmentMap {
+  n: number;
+  /** R = across, G = up, B = part × 51, A = coverage */
+  data: Uint8ClampedArray;
+  back: TextFrame | null;
+  front: TextFrame | null;
+}
+
+/**
+ * Rasterise one garment mesh into a map of what-and-where, in its own UV space.
+ *
+ * Written by hand rather than through the 2D canvas because two channels have
+ * to interpolate independently across a triangle and a canvas gradient only
+ * does one direction at a time. It is a flat barycentric fill over a few
+ * thousand triangles — a couple of milliseconds — and it is exact.
+ */
+function buildGarmentMap(mesh: THREE.Mesh, classify: (
+  cx: number, cy: number, cz: number, nz: number, across: number, up: number,
+) => Part): GarmentMap | null {
+  const pos = mesh.geometry.getAttribute('position');
+  const uv = mesh.geometry.getAttribute('uv');
+  const index = mesh.geometry.getIndex();
+  if (!pos || !uv) return null;
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  let minZ = Infinity, maxZ = -Infinity;
+  for (let i = 0; i < pos.count; i++) {
+    minX = Math.min(minX, pos.getX(i)); maxX = Math.max(maxX, pos.getX(i));
+    minY = Math.min(minY, pos.getY(i)); maxY = Math.max(maxY, pos.getY(i));
+    minZ = Math.min(minZ, pos.getZ(i)); maxZ = Math.max(maxZ, pos.getZ(i));
+  }
+  const spanX = Math.max(1e-4, maxX - minX);
+  const spanY = Math.max(1e-4, maxY - minY);
+  const midZ = (minZ + maxZ) / 2;
+  const halfZ = Math.max(1e-4, (maxZ - minZ) / 2);
+
+  const N = GARMENT_PX;
+  const data = new Uint8ClampedArray(N * N * 4);
+  const tri = index ? index.count / 3 : pos.count / 3;
+
+  // least-squares accumulators for the two panel fits: u,v = a·x + b·y + c
+  const fit = [0, 1].map(() => ({
+    sx: 0, sy: 0, s1: 0, sxx: 0, sxy: 0, syy: 0,
+    su: 0, sxu: 0, syu: 0, sv: 0, sxv: 0, syv: 0,
+    lox: Infinity, hix: -Infinity, loy: Infinity, hiy: -Infinity,
+  }));
+
+  for (let f = 0; f < tri; f++) {
+    const ia = index ? index.getX(f * 3) : f * 3;
+    const ib = index ? index.getX(f * 3 + 1) : f * 3 + 1;
+    const ic = index ? index.getX(f * 3 + 2) : f * 3 + 2;
+    const px = [pos.getX(ia), pos.getX(ib), pos.getX(ic)];
+    const py = [pos.getY(ia), pos.getY(ib), pos.getY(ic)];
+    const pz = [pos.getZ(ia), pos.getZ(ib), pos.getZ(ic)];
+    const cxw = (px[0] + px[1] + px[2]) / 3;
+    const cyw = (py[0] + py[1] + py[2]) / 3;
+    const czw = (pz[0] + pz[1] + pz[2]) / 3;
+    const e1 = [px[1] - px[0], py[1] - py[0], pz[1] - pz[0]];
+    const e2 = [px[2] - px[0], py[2] - py[0], pz[2] - pz[0]];
+    const nz = e1[0] * e2[1] - e1[1] * e2[0];
+    const across = (cxw - minX) / spanX;
+    const up = (cyw - minY) / spanY;
+    const part = classify(cxw, cyw, czw - midZ, nz, across, up);
+
+    // Only CONFIDENTLY front-or-back triangles feed the panel fit. The sides of
+    // a shirt wrap round at cz ≈ 0 and land in a different UV island from the
+    // panel they are nearest; letting them into the least-squares skews the
+    // basis, and a skewed basis prints a squad number diagonally across the
+    // back at four times the size it should be. (It did.)
+    if ((part === Part.Front || part === Part.Back) && Math.abs(czw - midZ) > 0.35 * halfZ) {
+      const a = fit[part === Part.Back ? 1 : 0];
+      for (const i of [ia, ib, ic]) {
+        const x = pos.getX(i), y = pos.getY(i), u = uv.getX(i), v = uv.getY(i);
+        a.sx += x; a.sy += y; a.s1 += 1;
+        a.sxx += x * x; a.sxy += x * y; a.syy += y * y;
+        a.su += u; a.sxu += x * u; a.syu += y * u;
+        a.sv += v; a.sxv += x * v; a.syv += y * v;
+        a.lox = Math.min(a.lox, x); a.hix = Math.max(a.hix, x);
+        a.loy = Math.min(a.loy, y); a.hiy = Math.max(a.hiy, y);
+      }
+    }
+
+    // barycentric fill in UV pixel space
+    const ux = [uv.getX(ia) * N, uv.getX(ib) * N, uv.getX(ic) * N];
+    const uy = [uv.getY(ia) * N, uv.getY(ib) * N, uv.getY(ic) * N];
+    const ax = [(px[0] - minX) / spanX, (px[1] - minX) / spanX, (px[2] - minX) / spanX];
+    const ay = [(py[0] - minY) / spanY, (py[1] - minY) / spanY, (py[2] - minY) / spanY];
+    const x0 = Math.max(0, Math.floor(Math.min(ux[0], ux[1], ux[2])) - 1);
+    const x1 = Math.min(N - 1, Math.ceil(Math.max(ux[0], ux[1], ux[2])) + 1);
+    const y0 = Math.max(0, Math.floor(Math.min(uy[0], uy[1], uy[2])) - 1);
+    const y1 = Math.min(N - 1, Math.ceil(Math.max(uy[0], uy[1], uy[2])) + 1);
+    const det = (uy[1] - uy[2]) * (ux[0] - ux[2]) + (ux[2] - ux[1]) * (uy[0] - uy[2]);
+    if (Math.abs(det) < 1e-9) continue;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const sx = x + 0.5, sy = y + 0.5;
+        const l0 = ((uy[1] - uy[2]) * (sx - ux[2]) + (ux[2] - ux[1]) * (sy - uy[2])) / det;
+        const l1 = ((uy[2] - uy[0]) * (sx - ux[2]) + (ux[0] - ux[2]) * (sy - uy[2])) / det;
+        // strictly inside. An earlier version let each triangle paint a
+        // one-texel skirt to close the gutter between UV islands, and clamping
+        // the barycentrics to do it put out-of-range body coordinates along
+        // every shared edge — which a stripe pattern turns into a black spike
+        // through the middle of every band. dilate() closes the gutter instead,
+        // with texels it knows are copies rather than extrapolations.
+        if (l0 < 0 || l1 < 0 || l0 + l1 > 1) continue;
+        const l2 = 1 - l0 - l1;
+        const o = (y * N + x) * 4;
+        if (data[o + 3] > 0) continue;   // first triangle wins, no blending
+        data[o] = (ax[0] * l0 + ax[1] * l1 + ax[2] * l2) * 255;
+        data[o + 1] = (ay[0] * l0 + ay[1] * l1 + ay[2] * l2) * 255;
+        data[o + 2] = part * 51;
+        data[o + 3] = 255;
+      }
+    }
+  }
+
+  const solve = (a: typeof fit[0]): TextFrame | null => {
+    if (a.s1 < 12) return null;
+    const M = [[a.sxx, a.sxy, a.sx], [a.sxy, a.syy, a.sy], [a.sx, a.sy, a.s1]];
+    const det3 = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+      - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+      + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+    if (Math.abs(det3) < 1e-12) return null;
+    const inv = (r: number, c: number): number => {
+      const m = [0, 1, 2].filter((i) => i !== c).map((i) => [0, 1, 2].filter((j) => j !== r)
+        .map((j) => M[i][j]));
+      const cof = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+      return ((r + c) % 2 ? -cof : cof) / det3;
+    };
+    const rhsU = [a.sxu, a.syu, a.su];
+    const rhsV = [a.sxv, a.syv, a.sv];
+    const cu = [0, 1, 2].map((r) => rhsU.reduce((s, q, c) => s + inv(r, c) * q, 0));
+    const cv = [0, 1, 2].map((r) => rhsV.reduce((s, q, c) => s + inv(r, c) * q, 0));
+    const rx = cu[0] * N, ry = cv[0] * N;      // d(uv px)/dx
+    const bx = cu[1] * N, by = cv[1] * N;      // d(uv px)/dy
+    const cxp = (cu[0] * (a.sx / a.s1) + cu[1] * (a.sy / a.s1) + cu[2]) * N;
+    const cyp = (cv[0] * (a.sx / a.s1) + cv[1] * (a.sy / a.s1) + cv[2]) * N;
+    return {
+      m: [rx, ry, bx, by], cx: cxp, cy: cyp,
+      halfW: (a.hix - a.lox) / 2, halfH: (a.hiy - a.loy) / 2,
+      ppm: Math.hypot(rx, ry) || 1,
+    };
+  };
+  return { n: N, data, back: solve(fit[1]), front: solve(fit[0]) };
+}
+
+/**
+ * How a SHIRT's triangles are classified.
+ *
+ * Every threshold is a fraction of the garment's own bounding box, never a
+ * measurement: the shirt is as wide as its sleeves, so the sleeves are the
+ * outer fifth of that width and the cuffs the outer tenth, whatever garment the
+ * pipeline is dressing these men in this week.
+ */
+const shirtParts = (cx: number, cy: number, cz: number, nz: number,
+  across: number, up: number): Part => {
+  if (across < 0.10 || across > 0.90) return Part.Cuff;
+  if (across < 0.23 || across > 0.77) return Part.Sleeve;
+  // the collar is what sits above the shoulder line AND near the midline: the
+  // shoulder seam is just as high and is not a collar
+  if (up > 0.86 && Math.abs(across - 0.5) < 0.22) return Part.Collar;
+  return cz > 0 ? Part.Front : Part.Back;
+};
+
+/** Shorts have no sleeves and no collar; the hem band is decided in the painter
+ *  off `up`, which keeps its edge smooth instead of on a triangle. */
+const shortsParts = (cx: number, cy: number, cz: number, nz: number,
+  across: number, up: number): Part => (cz > 0 ? Part.Front : Part.Back);
+
+/** Build the map for whichever mesh the predicate picks out, at LOD0. */
+function garmentOf(arch: Archetype, pick: (m: THREE.Mesh) => boolean,
+  classify: Parameters<typeof buildGarmentMap>[1]): GarmentMap | null {
+  let mesh: THREE.Mesh | null = null;
+  arch.scene.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!mesh && m.isMesh && pick(m)) mesh = m;
+  });
+  return mesh ? buildGarmentMap(mesh, classify) : null;
+}
+
+/** Two or three letters for a fictional club crest, from the kit's own seed. */
+function crestInitials(seed: number): string {
+  const A = 'ABCDEFGHIJKLMNOPRSTUVW';
+  const r = seededRandom(seed ^ 0x9e37);
+  return A[(r() * A.length) | 0] + A[(r() * A.length) | 0] + (r() < 0.4 ? A[(r() * A.length) | 0] : '');
+}
+
+/**
+ * Fill the gutter. Texels just outside an island have no colour, and a mip
+ * chain averages them into the island's edge — which is a dark fringe around
+ * every seam of the shirt. Four passes of nearest-neighbour spread is plenty at
+ * this resolution.
+ */
+function dilate(img: ImageData, passes: number): void {
+  const { width: w, height: h, data } = img;
+  for (let p = 0; p < passes; p++) {
+    const copy = new Uint8ClampedArray(data);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const o = (y * w + x) * 4;
+        if (copy[o + 3] > 0) continue;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const q = (ny * w + nx) * 4;
+          if (copy[q + 3] === 0) continue;
+          data[o] = copy[q]; data[o + 1] = copy[q + 1];
+          data[o + 2] = copy[q + 2]; data[o + 3] = 255;
+          break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Point the canvas at one panel of a garment, so everything printed after it is
+ * in PIXELS on a body that is the right way up and the right way round.
+ *
+ * `mirror` is the back of the shirt: a viewer stood behind the player reads
+ * left-to-right along the body's -x, which is the whole reason the old code had
+ * to rotate the back island 180° by hand.
+ *
+ * The basis is scaled to unit length along the reading direction rather than
+ * left in metres, and the callers multiply their sizes by `ppm` instead. That
+ * is not a stylistic choice: a canvas font of "0.25px" is a sub-pixel size, and
+ * what comes out of it is a smear.
+ */
+function panelFrame(ctx: CanvasRenderingContext2D, f: TextFrame, mirror: boolean): void {
+  const s = (mirror ? -1 : 1) / f.ppm;
+  // down the body is -y, always: the mirror only flips the reading direction
+  ctx.setTransform(f.m[0] * s, f.m[1] * s, -f.m[2] / f.ppm, -f.m[3] / f.ppm, f.cx, f.cy);
+}
+
 /** Fill a uv rect, respecting the island alpha already on the canvas. */
 function atopRect(ctx: CanvasRenderingContext2D, r: readonly number[],
   w: number, h: number, style: string | CanvasPattern | CanvasGradient, alpha = 1): void {
@@ -786,6 +1086,324 @@ function atopRect(ctx: CanvasRenderingContext2D, r: readonly number[],
   ctx.fillStyle = style;
   ctx.fillRect(r[0] * w, r[1] * h, (r[2] - r[0]) * w, (r[3] - r[1]) * h);
   ctx.restore();
+}
+
+// ------------------------------------------------------------- the face pool
+//
+// TWENTY-TWO FACES WITHOUT TWENTY-TWO CHARACTERS.
+//
+// Two players built from the same archetype differ only above the collar: same
+// skeleton, same body, same kit, same 2048 skin atlas. Shipping a whole GLB per
+// player to express that would be ~2.9 MB each — 64 MB for a match — to change
+// a few thousand vertex positions.
+//
+// So the pipeline ships the positions and nothing else (make_player.py, "the
+// face pool"): one array of head-region base positions per archetype, plus N
+// arrays of int16 offsets from it. Each offset field is pre-multiplied by the
+// Head bone's skin weight ramped smoothly to zero through the jaw, so it dies
+// out before the neck and CANNOT crack the collar open however extreme the
+// face targets behind it were.
+//
+// At load, each archetype matches pool vertex → buffer vertex ONCE, by
+// position. Position is the right key because the glTF exporter splits a vertex
+// in two at a UV seam: both copies carry the same position, so both pick up the
+// same offset and the seam cannot open. At instance time a player's geometry is
+// the archetype's with its own position and normal arrays — every other
+// attribute, and the index, stay shared.
+//
+// What this buys, measured on the shipped roster: 4.1 MB of pool for 48 faces
+// (12 per archetype), against ~64 MB for the GLB-per-player version, and not
+// one extra draw call, skeleton, material or texture.
+
+interface FaceSection {
+  mesh: string;
+  count: number;
+  /** byte offset of this section's base positions (Float32, count × 3) */
+  base: number;
+  /** byte offset of this section's offsets (Int16, variants × count × 3) */
+  delta: number;
+}
+
+interface FacePoolFile {
+  name: string;
+  variants: number;
+  /** metres per int16 unit */
+  scale: number;
+  baseBytes: number;
+  /** LOD0 mesh names of the hair pool, in pick order */
+  hair: string[];
+  sections: FaceSection[];
+}
+
+/** One mesh's re-index of the pool onto the geometry that actually loaded. */
+interface FaceMap {
+  sec: FaceSection;
+  /** buffer vertex → pool vertex, -1 where the pool does not reach */
+  map: Int32Array;
+  /** buffer vertex → the lowest buffer vertex sharing its position */
+  weld: Int32Array;
+  /** triangles touching at least one mapped vertex */
+  tris: Uint32Array;
+  /** the mapped vertices, so a morph never walks the whole mesh */
+  moved: Uint32Array;
+  /** authored normal − normal re-derived from the unmoved mesh, so a zero
+   *  offset reproduces the authored shading exactly */
+  bias: Float32Array;
+  src: THREE.BufferGeometry;
+}
+
+export interface FacePool {
+  file: FacePoolFile;
+  base: Float32Array;
+  delta: Int16Array;
+}
+
+/** Quantised position key. 1e-5 m is a hundredth of a millimetre: fine enough
+ *  that two distinct vertices never collide, coarse enough that a float32
+ *  round-trip through the exporter cannot miss. */
+/** A mesh name as three's GLTFLoader will have rewritten it. */
+const saneName = (s: string): string => s.replace(/\s/g, '_').replace(/[[\].:/]/g, '');
+
+const posKey = (x: number, y: number, z: number): string =>
+  `${Math.round(x * 1e5)},${Math.round(y * 1e5)},${Math.round(z * 1e5)}`;
+
+/** FNV-1a. The per-player seed: his name, his number and his kit, so the same
+ *  man in the same shirt is the same man every kick-off. */
+export function hashSeed(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/** mulberry32 — small, fast, and the same everywhere, which is the only thing
+ *  that matters: a man's face has to survive a reload and a replay. */
+function seededRandom(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Everything about a player that is HIS and not his archetype's. */
+export interface Appearance {
+  /** index into the archetype's face pool */
+  variant: number;
+  /** the LOD0 mesh name of the haircut he keeps */
+  hair: string;
+  /** multiplied onto the archetype's baked hair colour, never replacing it —
+   *  the archetype already decided what is plausible for this man */
+  hairColor: THREE.Color;
+  skinTone: THREE.Color;
+  /** 0 = shaved this morning, 1 = did not */
+  stubble: number;
+  stubbleColor: THREE.Color;
+}
+
+/**
+ * One player's look, from his name, his number and his kit.
+ *
+ * Deterministic on purpose and in that order: the same man in the same shirt is
+ * the same man in every match, every replay and every capture, and two men with
+ * the same name in different squads are not twins.
+ */
+export function appearanceOf(data: PlayerData, kit: KitSpec, arch: Archetype): Appearance {
+  const rnd = seededRandom(hashSeed(`${data.name}|${data.num}|${kit.shirt}|${kit.shorts}`));
+  const variants = arch.faces?.file.variants ?? 1;
+  const variant = Math.min(variants - 1, Math.floor(rnd() * variants));
+  const hair = arch.hairNames.length
+    ? arch.hairNames[Math.min(arch.hairNames.length - 1, Math.floor(rnd() * arch.hairNames.length))]
+    : '';
+  // hair colour: a multiply around 1, so a blond archetype stays blond and a
+  // black-haired one cannot go ginger. Wide enough to separate two men side by
+  // side, narrow enough that nobody's hair reads as dyed.
+  const hk = 0.62 + rnd() * 0.7;
+  const hairColor = new THREE.Color(hk * (0.94 + rnd() * 0.14), hk, hk * (0.9 + rnd() * 0.12));
+  // skin tone: a tenth of a stop either side of the archetype's atlas, with a
+  // little warmth. Any wider and it stops reading as "this man" and starts
+  // reading as "the wrong skin texture".
+  const sk = 0.90 + rnd() * 0.16;
+  const skinTone = new THREE.Color(sk * (1.0 + rnd() * 0.04), sk, sk * (0.95 + rnd() * 0.07));
+  const stubble = rnd() < 0.42 ? 0 : 0.3 + rnd() * 0.65;
+  const shade = 0.55 + rnd() * 0.5;
+  const stubbleColor = new THREE.Color(0x2a2119).multiplyScalar(shade);
+  return { variant, hair, hairColor, skinTone, stubble, stubbleColor };
+}
+
+async function loadFacePool(base: string): Promise<FacePool | null> {
+  try {
+    const [jr, br] = await Promise.all([fetch(`${base}_faces.json`), fetch(`${base}_faces.bin`)]);
+    if (!jr.ok || !br.ok) return null;
+    const file = (await jr.json()) as FacePoolFile;
+    const buf = await br.arrayBuffer();
+    return {
+      file,
+      base: new Float32Array(buf, 0, file.baseBytes / 4),
+      delta: new Int16Array(buf, file.baseBytes, (buf.byteLength - file.baseBytes) / 2),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-index one pool section onto the loaded geometry, and pre-compute
+ * everything a per-player morph needs so the morph itself is a gather and an
+ * add.
+ *
+ * The normal bias is the subtle part. Re-deriving normals from face normals
+ * does NOT reproduce three's authored smooth normals exactly (the exporter's
+ * are area/angle weighted differently and the mesh is welded by position, not
+ * by index). Storing `authored − rederived` here and adding it back after every
+ * morph means a vertex whose offset happens to be zero comes out bit-identical
+ * to the archetype, so the ramp into the neck is invisible instead of being a
+ * faint shading step.
+ */
+function buildFaceMap(mesh: THREE.Mesh, pool: FacePool, sec: FaceSection): FaceMap | null {
+  const geo = mesh.geometry;
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+  const nor = geo.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  const index = geo.getIndex();
+  if (!pos || !nor || !index) return null;
+
+  const byPos = new Map<string, number>();
+  const b0 = sec.base / 4;
+  for (let i = 0; i < sec.count; i++) {
+    byPos.set(posKey(pool.base[b0 + i * 3], pool.base[b0 + i * 3 + 1], pool.base[b0 + i * 3 + 2]), i);
+  }
+
+  const n = pos.count;
+  const map = new Int32Array(n).fill(-1);
+  const weld = new Int32Array(n);
+  const first = new Map<string, number>();
+  const moved: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const k = posKey(pos.getX(i), pos.getY(i), pos.getZ(i));
+    const w = first.get(k);
+    if (w === undefined) first.set(k, i);
+    weld[i] = w ?? i;
+    const p = byPos.get(k);
+    if (p !== undefined) { map[i] = p; moved.push(i); }
+  }
+  if (!moved.length) return null;
+
+  const isMoved = new Uint8Array(n);
+  for (const i of moved) isMoved[i] = 1;
+  const tris: number[] = [];
+  for (let t = 0; t < index.count; t += 3) {
+    if (isMoved[index.getX(t)] || isMoved[index.getX(t + 1)] || isMoved[index.getX(t + 2)]) {
+      tris.push(t);
+    }
+  }
+
+  const fm: FaceMap = {
+    sec, map, weld,
+    tris: Uint32Array.from(tris),
+    moved: Uint32Array.from(moved),
+    bias: new Float32Array(moved.length * 3),
+    src: geo,
+  };
+  // rederive normals from the UNMOVED mesh and keep the difference
+  const rederived = new Float32Array(n * 3);
+  accumulateNormals(fm, pos.array as Float32Array, rederived);
+  for (let k = 0; k < moved.length; k++) {
+    const i = moved[k];
+    fm.bias[k * 3] = nor.getX(i) - rederived[i * 3];
+    fm.bias[k * 3 + 1] = nor.getY(i) - rederived[i * 3 + 1];
+    fm.bias[k * 3 + 2] = nor.getZ(i) - rederived[i * 3 + 2];
+  }
+  return fm;
+}
+
+/** Area-weighted face normals accumulated over the affected triangles and
+ *  welded by position, then normalised into `out` at every moved vertex. */
+function accumulateNormals(fm: FaceMap, positions: Float32Array, out: Float32Array): void {
+  const index = fm.src.getIndex()!;
+  const acc = new Map<number, [number, number, number]>();
+  const get = (i: number): [number, number, number] => {
+    const r = fm.weld[i];
+    let v = acc.get(r);
+    if (!v) { v = [0, 0, 0]; acc.set(r, v); }
+    return v;
+  };
+  for (const t of fm.tris) {
+    const a = index.getX(t), b = index.getX(t + 1), c = index.getX(t + 2);
+    const ax = positions[a * 3], ay = positions[a * 3 + 1], az = positions[a * 3 + 2];
+    const bx = positions[b * 3], by = positions[b * 3 + 1], bz = positions[b * 3 + 2];
+    const cx = positions[c * 3], cy = positions[c * 3 + 1], cz = positions[c * 3 + 2];
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    const nx = e1y * e2z - e1z * e2y;
+    const ny = e1z * e2x - e1x * e2z;
+    const nz = e1x * e2y - e1y * e2x;
+    for (const i of [a, b, c]) {
+      const v = get(i);
+      v[0] += nx; v[1] += ny; v[2] += nz;
+    }
+  }
+  for (const i of fm.moved) {
+    const v = acc.get(fm.weld[i]);
+    if (!v) continue;
+    const len = Math.hypot(v[0], v[1], v[2]) || 1;
+    out[i * 3] = v[0] / len;
+    out[i * 3 + 1] = v[1] / len;
+    out[i * 3 + 2] = v[2] / len;
+  }
+}
+
+/**
+ * One player's copy of one mesh: his own positions and normals, everybody
+ * else's UVs, skin weights and index buffer.
+ *
+ * The attribute sharing is the point. A face is ~4k of a ~10.7k-vertex body, so
+ * a full geometry clone would be 840 KB a player (18 MB a match) to change a
+ * quarter of one attribute. Two arrays is 260 KB.
+ */
+function morphGeometry(fm: FaceMap, pool: FacePool, variant: number): THREE.BufferGeometry {
+  const src = fm.src;
+  const srcPos = src.getAttribute('position') as THREE.BufferAttribute;
+  const srcNor = src.getAttribute('normal') as THREE.BufferAttribute;
+  const pos = new Float32Array(srcPos.array as Float32Array);
+  const nor = new Float32Array(srcNor.array as Float32Array);
+
+  const d0 = fm.sec.delta / 2 + variant * fm.sec.count * 3;
+  const s = pool.file.scale;
+  for (const i of fm.moved) {
+    const p = fm.map[i] * 3;
+    pos[i * 3] += pool.delta[d0 + p] * s;
+    pos[i * 3 + 1] += pool.delta[d0 + p + 1] * s;
+    pos[i * 3 + 2] += pool.delta[d0 + p + 2] * s;
+  }
+  accumulateNormals(fm, pos, nor);
+  for (let k = 0; k < fm.moved.length; k++) {
+    const i = fm.moved[k];
+    const x = nor[i * 3] + fm.bias[k * 3];
+    const y = nor[i * 3 + 1] + fm.bias[k * 3 + 1];
+    const z = nor[i * 3 + 2] + fm.bias[k * 3 + 2];
+    const len = Math.hypot(x, y, z) || 1;
+    nor[i * 3] = x / len; nor[i * 3 + 1] = y / len; nor[i * 3 + 2] = z / len;
+  }
+
+  const g = new THREE.BufferGeometry();
+  for (const key of Object.keys(src.attributes)) {
+    if (key !== 'position' && key !== 'normal') g.setAttribute(key, src.attributes[key]);
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  const idx = src.getIndex();
+  if (idx) g.setIndex(idx);
+  for (const grp of src.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
+  g.setDrawRange(src.drawRange.start, src.drawRange.count);
+  // a skinned mesh's bind-pose bounds never cover a posed limb anyway; the
+  // meshes are frustumCulled = false, so this only has to be non-null
+  g.boundingSphere = src.boundingSphere?.clone() ?? null;
+  g.boundingBox = src.boundingBox?.clone() ?? null;
+  return g;
 }
 
 // --------------------------------------------------------------- loading
@@ -831,6 +1449,21 @@ export interface Archetype {
    * Still null for an archetype whose garment never shipped one.
    */
   shortsNormal: THREE.Texture | null;
+  /** the per-player face offsets, or null if this archetype shipped without a
+   *  pool (in which case every player of it wears the authored face) */
+  faces: FacePool | null;
+  /** LOD0 mesh name → its re-index of the pool, built once at load */
+  faceMaps: Map<string, FaceMap>;
+  /** the hair pool's LOD0 mesh names, in pick order. A player keeps one and
+   *  the rest are dropped from his clone — see instance(). */
+  hairNames: string[];
+  /** R = lower-face coverage, G = height up the jaw. One per archetype, mixed
+   *  into the body material's shader as per-player stubble (see queueSkinShading). */
+  faceMask: THREE.CanvasTexture | null;
+  /** what-and-where in the shirt's own UV space, so the kit bake needs no
+   *  hand-measured island rectangles (see buildGarmentMap) */
+  shirtGarment: GarmentMap | null;
+  shortsGarment: GarmentMap | null;
 }
 
 export interface CharacterAssets {
@@ -881,6 +1514,9 @@ export function preloadCharacters(): Promise<CharacterAssets> {
       }));
       return levels;
     }));
+    // the face pools ride alongside, in parallel: two small files per archetype
+    // and a miss is not fatal (the archetype simply wears its authored face)
+    const pools = await Promise.all(ARCHETYPES.map((base) => loadFacePool(base)));
 
     // Fetch every row's clip in parallel, each row walking its own candidate
     // list until one resolves. A miss is a 404 and costs nothing; the
@@ -927,7 +1563,8 @@ export function preloadCharacters(): Promise<CharacterAssets> {
     }
 
     const archetypes: Archetype[] = chars
-      .map((levels, i) => prepareArchetype(ARCHETYPES[i], levels.map((l) => l?.scene ?? null)))
+      .map((levels, i) => prepareArchetype(ARCHETYPES[i], levels.map((l) => l?.scene ?? null),
+        pools[i]))
       .filter((a): a is Archetype => a !== null);
     if (!archetypes.length) throw new Error('characters: no archetype loaded');
 
@@ -1045,17 +1682,22 @@ THREE.AnimationClip | undefined {
  * detail level goes through the same pass, and levels 1 and 2 hand their
  * materials over to level 0's so all three draw with one set.
  */
-function prepareArchetype(url: string, scenes: (THREE.Group | null)[]): Archetype | null {
+function prepareArchetype(url: string, scenes: (THREE.Group | null)[],
+  pool: FacePool | null): Archetype | null {
   if (!scenes[0]) return null;
   const levels: ArchetypeLevel[] = [];
+  let li = -1;
   for (const scene of scenes) {
     if (!scene) continue;
+    li++;
     const drop: THREE.Object3D[] = [];
     let triangles = 0;
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (!mesh.isMesh) return;
       if (CULL_MESHES.test(mesh.name)) { drop.push(mesh); return; }
+      // brows and lashes survive only at the level a face is actually read on
+      if (li > 0 && FINE_MESHES.test(mesh.name)) { drop.push(mesh); return; }
       mesh.castShadow = false;   // the shadow proxy does all the casting
       mesh.receiveShadow = true;
       // a skinned mesh's bind-pose bounds do not cover a posed limb, and three
@@ -1116,7 +1758,47 @@ function prepareArchetype(url: string, scenes: (THREE.Group | null)[]): Archetyp
     triangles: levels[0].triangles, sockMask: null,
     shadowGeometry: null, shadowTriangles: 0, shortsMap: null,
     shortsNormal: null,
+    faces: pool, faceMaps: new Map(), hairNames: [], faceMask: null,
+    shirtGarment: null, shortsGarment: null,
   };
+
+  // Re-index the pool onto the geometry that actually loaded, once.
+  if (pool) {
+    // Names go through saneName() on both sides. three's GLTFLoader runs every
+    // node name through PropertyBinding.sanitizeNodeName, which STRIPS the dot —
+    // so Blender's `v_afr_mid.short02` arrives as `v_afr_midshort02` and a
+    // literal lookup finds the body (no dot in it) and nothing else. Same trap
+    // the bone lookup at the top of this file exists to work around.
+    const byName = new Map<string, THREE.Mesh>();
+    levels[0].scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh) byName.set(saneName(m.name), m);
+    });
+    let mapped = 0;
+    for (const sec of pool.file.sections) {
+      const key = saneName(sec.mesh);
+      const mesh = byName.get(key);
+      if (!mesh) { console.warn(`characters: face pool has no mesh ${sec.mesh}`); continue; }
+      const fm = buildFaceMap(mesh, pool, sec);
+      if (fm) { arch.faceMaps.set(key, fm); mapped += fm.moved.length; }
+    }
+    arch.hairNames = pool.file.hair.map(saneName).filter((h) => byName.has(h));
+    // A player wears ONE cut; the other three are dropped from his clone the
+    // moment it is made. Take them off the budget line too, or the LOD0 figure
+    // reports a man wearing four wigs at once.
+    let spare = 0;
+    for (const h of arch.hairNames.slice(1)) {
+      const g = byName.get(h)?.geometry;
+      if (!g) continue;
+      const i = g.getIndex();
+      spare += (i ? i.count : g.getAttribute('position').count) / 3;
+    }
+    levels[0].triangles = Math.round(levels[0].triangles - spare);
+    arch.triangles = levels[0].triangles;
+    console.info(`characters: ${url} face pool ${pool.file.variants} variants,`
+      + ` ${arch.faceMaps.size}/${pool.file.sections.length} meshes, ${mapped} vertices,`
+      + ` ${arch.hairNames.length} haircuts`);
+  }
   const shadow = buildShadowGeometry(levels[levels.length - 1].scene);
   arch.shadowGeometry = shadow;
   if (shadow) {
@@ -1125,6 +1807,9 @@ function prepareArchetype(url: string, scenes: (THREE.Group | null)[]): Archetyp
       (idx ? idx.count : shadow.getAttribute('position').count) / 3);
   }
   arch.sockMask = buildSockMask(arch);
+  arch.faceMask = buildFaceMask(arch);
+  arch.shirtGarment = garmentOf(arch, isShirt, shirtParts);
+  arch.shortsGarment = garmentOf(arch, isShorts, shortsParts);
   arch.shortsMap = neutralGarmentMap(arch, isShorts, 0.78);
   arch.shortsNormal = sourceMaterialOf(arch, isShorts)?.normalMap ?? null;
   return arch;
@@ -1462,47 +2147,367 @@ function heightGradient(ctx: CanvasRenderingContext2D,
   return g;
 }
 
+// ------------------------------------------------------------ face detail
+//
+// Three things separate a head that reads as a footballer from one that reads
+// as a mannequin at three metres, and none of them is triangles:
+//
+//   1. PORES. The authored skin atlas is a photograph of a face at 2048 across
+//      a whole body — about 180 texels down a cheek. That is enough for colour
+//      and nothing else, so under a hard floodlight the cheek is a perfectly
+//      smooth surface and reads as wax. A tiling micro-normal at a scale far
+//      below the atlas's puts the surface back without touching the colour.
+//   2. STUBBLE. Every one of these men shaved this morning or did not. It is
+//      the single cheapest piece of individuality a face can carry, and it is
+//      a mask and one uniform, not a texture per player.
+//   3. SCATTER. Skin is not Lambert. The red channel goes furthest through it,
+//      which is why the shadow terminator on a cheekbone is warm and soft and
+//      not a grey line. queueSkinShading() below wraps the three channels by
+//      three different amounts, which is the cheap honest version of that.
+
+/** How far up the jaw stubble reaches, as a fraction of head-bone to crown. */
+const BEARD_TOP = 0.46;
+const FACE_MASK_PX = 512;
+
 /**
- * Mix the sock into a body material. Coverage and the height ramp come out of
- * the mask; the colour, the cloth shading and the turnover band are all
- * computed here, so a team is one uniform and not a repainted skin.
+ * Paint the lower face as a MASK in the body texture's own UV space, the same
+ * way buildSockMask paints the shin: classify vertices off the MESH (the atlas
+ * cannot tell you which texels are jaw), rasterise their triangles into UV
+ * space, and let the shader decide the edge.
+ *
+ * Red is coverage, green is height up the jaw (0 under the chin, 1 at the
+ * crown). The character faces +z in these files — Blender's -y through the
+ * exporter's y-up swizzle — so the front half is simply z above the head
+ * bone's, which keeps the back of the skull out of it.
  */
-function queueSockPatch(mat: THREE.MeshStandardMaterial,
-  mask: THREE.Texture, color: THREE.Color): void {
+function buildFaceMask(arch: Archetype): THREE.CanvasTexture | null {
+  let body: THREE.SkinnedMesh | null = null;
+  arch.scene.traverse((o) => {
+    const m = o as THREE.SkinnedMesh;
+    if (!body && m.isSkinnedMesh && isBody(m)) body = m;
+  });
+  if (!body) return null;
+  const mesh: THREE.SkinnedMesh = body;
+  const pos = mesh.geometry.getAttribute('position');
+  const uv = mesh.geometry.getAttribute('uv');
+  const joints = mesh.geometry.getAttribute('skinIndex');
+  const weights = mesh.geometry.getAttribute('skinWeight');
+  const index = mesh.geometry.getIndex();
+  if (!uv || !joints || !weights) return null;
+
+  arch.scene.updateMatrixWorld(true);
+  const headBone = findBone(arch.scene, 'mixamorig:Head');
+  if (!headBone) return null;
+  const headIdx = mesh.skeleton.bones.indexOf(headBone as THREE.Bone);
+  if (headIdx < 0) return null;
+  const origin = headBone.getWorldPosition(new THREE.Vector3());
+
+  const p = new THREE.Vector3();
+  const cover = new Uint8Array(pos.count);
+  const height = new Float32Array(pos.count);
+  let crown = origin.y;
+  for (let i = 0; i < pos.count; i++) {
+    let w = 0;
+    for (let k = 0; k < 4; k++) {
+      if (joints.getComponent(i, k) === headIdx) w = Math.max(w, weights.getComponent(i, k));
+    }
+    if (w < 0.5) continue;
+    p.fromBufferAttribute(pos, i);
+    crown = Math.max(crown, p.y);
+  }
+  const span = Math.max(1e-4, crown - origin.y);
+  for (let i = 0; i < pos.count; i++) {
+    let w = 0;
+    for (let k = 0; k < 4; k++) {
+      if (joints.getComponent(i, k) === headIdx) w = Math.max(w, weights.getComponent(i, k));
+    }
+    p.fromBufferAttribute(pos, i);
+    // height runs for EVERY vertex the triangle rasteriser can reach, for the
+    // same reason the sock mask does: a triangle straddling the edge with one
+    // corner at height zero ramps backwards and paints a detached band
+    height[i] = THREE.MathUtils.clamp((p.y - origin.y) / span, 0, 1.6);
+    if (w < 0.35) continue;
+    // front half only, and never above the brow line
+    if (p.z < origin.z - 0.005) continue;
+    if (height[i] > BEARD_TOP + 0.1) continue;
+    cover[i] = 1;
+  }
+
+  const N = FACE_MASK_PX;
+  const [c, ctx] = canvas2d(N, N);
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, N, N);
+  const tri = index ? index.count / 3 : pos.count / 3;
+  let painted = 0;
+  for (let f = 0; f < tri; f++) {
+    const a = index ? index.getX(f * 3) : f * 3;
+    const b = index ? index.getX(f * 3 + 1) : f * 3 + 1;
+    const d = index ? index.getX(f * 3 + 2) : f * 3 + 2;
+    if (!cover[a] && !cover[b] && !cover[d]) continue;
+    painted++;
+    const style = heightGradient(ctx,
+      uv.getX(a) * N, uv.getY(a) * N, height[a] / (BEARD_TOP + 0.1),
+      uv.getX(b) * N, uv.getY(b) * N, height[b] / (BEARD_TOP + 0.1),
+      uv.getX(d) * N, uv.getY(d) * N, height[d] / (BEARD_TOP + 0.1));
+    ctx.fillStyle = style;
+    ctx.strokeStyle = style;
+    ctx.beginPath();
+    ctx.moveTo(uv.getX(a) * N, uv.getY(a) * N);
+    ctx.lineTo(uv.getX(b) * N, uv.getY(b) * N);
+    ctx.lineTo(uv.getX(d) * N, uv.getY(d) * N);
+    ctx.closePath();
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  if (!painted) return null;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.flipY = false;
+  return tex;
+}
+
+/**
+ * A tiling micro-normal: skin pores, baked once and shared by every player.
+ *
+ * Value noise at two octaves, differentiated into a tangent-space normal. It is
+ * deliberately tiny (256²) and tiled about twenty times across the body atlas,
+ * which puts the bumps at roughly a millimetre — below what the diffuse map can
+ * resolve, which is the whole point: it adds surface, never colour, and it
+ * cannot fight the photographed skin it sits on.
+ */
+let poreTexture: THREE.DataTexture | null = null;
+function poreNormal(): THREE.Texture {
+  if (poreTexture) return poreTexture;
+  const N = 256;
+  const h = new Float32Array(N * N);
+  const hash = (x: number, y: number): number => {
+    const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  };
+  // two periodic value-noise octaves, so the tile joins seamlessly
+  for (const [period, amp] of [[32, 0.65], [96, 0.35]] as const) {
+    const cell = N / period;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const fx = x / cell, fy = y / cell;
+        const ix = Math.floor(fx), iy = Math.floor(fy);
+        const tx = fx - ix, ty = fy - iy;
+        const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+        const m = (a: number, b: number) => ((a % period) + period) % period;
+        const v00 = hash(m(ix, period), m(iy, period));
+        const v10 = hash(m(ix + 1, period), m(iy, period));
+        const v01 = hash(m(ix, period), m(iy + 1, period));
+        const v11 = hash(m(ix + 1, period), m(iy + 1, period));
+        h[y * N + x] += amp * ((v00 * (1 - sx) + v10 * sx) * (1 - sy)
+          + (v01 * (1 - sx) + v11 * sx) * sy);
+      }
+    }
+  }
+  const data = new Uint8Array(N * N * 4);
+  const STRENGTH = 2.6;
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const l = h[y * N + ((x + N - 1) % N)];
+      const r = h[y * N + ((x + 1) % N)];
+      const u = h[((y + N - 1) % N) * N + x];
+      const d = h[((y + 1) % N) * N + x];
+      const nx = (l - r) * STRENGTH;
+      const ny = (u - d) * STRENGTH;
+      const len = Math.hypot(nx, ny, 1);
+      const o = (y * N + x) * 4;
+      data[o] = Math.round(((nx / len) * 0.5 + 0.5) * 255);
+      data[o + 1] = Math.round(((ny / len) * 0.5 + 0.5) * 255);
+      data[o + 2] = Math.round(((1 / len) * 0.5 + 0.5) * 255);
+      data[o + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(22, 22);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = 4;
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.needsUpdate = true;
+  poreTexture = tex;
+  return tex;
+}
+
+// -------------------------------------------------- the skin/hair lighting
+
+/** three's direct-diffuse line, matched by shape rather than by literal text
+ *  so a release that renames the struct member fails visibly, not silently. */
+const DIRECT_DIFFUSE =
+  /reflectedLight\.directDiffuse\s*\+=\s*irradiance\s*\*\s*BRDF_Lambert\(\s*material\.(\w+)\s*\);/;
+
+/** Per-channel wrapped diffuse: the cheap pre-integrated skin. */
+const SKIN_PARS = ((): string | null => {
+  const chunk = THREE.ShaderChunk.lights_physical_pars_fragment;
+  const m = chunk.match(DIRECT_DIFFUSE);
+  if (!m) {
+    console.warn('characters: skin-scatter anchor not found; skin stays stock-lit');
+    return null;
+  }
+  return chunk.replace(DIRECT_DIFFUSE, /* glsl */ `
+    {
+      float ss26NL = dot( geometryNormal, directLight.direction );
+      // THREE wraps, not one. Red light travels furthest through skin before it
+      // comes back out, green less, blue least — so the terminator on a cheek
+      // goes warm and soft before it goes dark, which is the only part of
+      // subsurface scattering the eye actually reads at broadcast distance.
+      vec3 ss26W = saturate( ( vec3( ss26NL ) + ss26SkinWrap ) / ( vec3( 1.0 ) + ss26SkinWrap ) );
+      vec3 ss26Lam = vec3( saturate( ss26NL ) );
+      vec3 ss26Irr = directLight.color * ( ss26Lam + ( ss26W - ss26Lam ) * ss26SkinTint );
+      reflectedLight.directDiffuse += ss26Irr * BRDF_Lambert( material.${m[1]} );
+    }
+  `);
+})();
+
+/** Kajiya-Kay along the strand: the band of light that runs across a head of
+ *  hair instead of the round plastic highlight a Blinn lobe puts there. */
+const HAIR_PARS = ((): string | null => {
+  const chunk = THREE.ShaderChunk.lights_physical_pars_fragment;
+  const m = chunk.match(DIRECT_DIFFUSE);
+  if (!m) return null;
+  return chunk.replace(DIRECT_DIFFUSE, /* glsl */ `
+    reflectedLight.directDiffuse += irradiance * BRDF_Lambert( material.${m[1]} );
+    {
+      // No tangents ship with these meshes, so the strand direction is derived:
+      // across = normal x up, strand = across x normal, i.e. the line of
+      // steepest descent over the skull — which is how a short cut lies.
+      vec3 ss26Across = normalize( cross( geometryNormal, vec3( 0.0, 1.0, 0.0 ) ) + vec3( 1e-4 ) );
+      vec3 ss26Strand = normalize( cross( ss26Across, geometryNormal ) );
+      vec3 ss26H = normalize( directLight.direction + geometryViewDir );
+      float ss26TH = dot( ss26Strand, ss26H );
+      float ss26Sin = sqrt( max( 0.0, 1.0 - ss26TH * ss26TH ) );
+      float ss26Shift = saturate( dot( geometryNormal, directLight.direction ) * 0.6 + 0.4 );
+      reflectedLight.directSpecular += directLight.color * material.diffuseColor
+        * ( ss26HairSpec * pow( ss26Sin, ss26HairExp ) * ss26Shift );
+    }
+  `);
+})();
+
+const SKIN_UNIFORMS = /* glsl */ `
+  uniform vec3 ss26SkinWrap;
+  uniform vec3 ss26SkinTint;
+  uniform float ss26SkinRim;
+`;
+
+const SKIN_RIM = /* glsl */ `
+  {
+    float ss26F = pow( 1.0 - saturate( dot( normal, geometryViewDir ) ), 4.0 );
+    float ss26Lit = saturate( dot( totalDiffuse, vec3( 0.2126, 0.7152, 0.0722 ) ) * 1.8 );
+    outgoingLight += vec3( 1.0, 0.78, 0.66 ) * ( ss26F * ss26SkinRim * ( 0.25 + 0.75 * ss26Lit ) );
+  }
+`;
+
+export interface SkinShadingOptions {
+  /** the archetype's sock mask and this team's sock colour */
+  sockMask?: THREE.Texture | null;
+  sockColor?: THREE.Color;
+  /** the archetype's lower-face mask and this player's stubble */
+  faceMask?: THREE.Texture | null;
+  stubble?: number;
+  stubbleColor?: THREE.Color;
+}
+
+/**
+ * Everything the body material does that stock MeshStandardMaterial does not:
+ * per-channel scatter, a warm rim, the team's socks and this player's stubble.
+ *
+ * It is ONE patch rather than four because they all want the same two
+ * insertion points, and because a body material is cloned per player now (the
+ * skin tone is his) — one shader variant is one program.
+ */
+function queueSkinShading(mat: THREE.MeshStandardMaterial, o: SkinShadingOptions): void {
   queueShaderPatch(mat, (shader) => {
-    shader.uniforms.ss26SockMask = { value: mask };
-    shader.uniforms.ss26SockColor = { value: color };
-    shader.uniforms.ss26SockTop = { value: SOCK_TOP };
-    shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>
+    shader.uniforms.ss26SkinWrap = { value: new THREE.Vector3(0.62, 0.34, 0.22) };
+    shader.uniforms.ss26SkinTint = { value: new THREE.Vector3(1.0, 0.62, 0.42) };
+    shader.uniforms.ss26SkinRim = { value: 0.05 };
+
+    let frag = shader.fragmentShader.replace('#include <common>',
+      `#include <common>\n${SKIN_UNIFORMS}`);
+    if (SKIN_PARS) frag = frag.replace('#include <lights_physical_pars_fragment>', SKIN_PARS);
+    frag = frag.replace('#include <opaque_fragment>', `${SKIN_RIM}\n  #include <opaque_fragment>`);
+
+    if (o.sockMask && o.sockColor) {
+      shader.uniforms.ss26SockMask = { value: o.sockMask };
+      shader.uniforms.ss26SockColor = { value: o.sockColor };
+      shader.uniforms.ss26SockTop = { value: SOCK_TOP };
+      frag = frag.replace('#include <common>', `#include <common>
         uniform sampler2D ss26SockMask;
         uniform vec3 ss26SockColor;
         uniform float ss26SockTop;`)
-      .replace('#include <map_fragment>', `#include <map_fragment>
+        .replace('#include <map_fragment>', `#include <map_fragment>
         {
           vec4 ss26Sock = texture2D( ss26SockMask, vMapUv );
-          // The mask covers the whole shin; where the sock STOPS is decided
-          // here, so the top edge is a smooth line and not a row of triangles.
-          //
-          // Height is read as g/r, not g. The rasteriser antialiases the edge
-          // of the shin island, which fades BOTH channels toward the black
-          // background together — so raw g dips at the island rim and drew a
-          // stray hairline of sock across the knee, above the cut. The ratio
-          // divides the coverage back out and is exact wherever r > 0.
+          // Height is read as g/r, not g: the rasteriser antialiases the edge
+          // of the shin island and fades BOTH channels toward the background
+          // together, so raw g dips at the rim and drew a hairline of sock
+          // across the knee. The ratio divides the coverage back out.
           float ss26H = ( ss26Sock.g / max( ss26Sock.r, 0.004 ) )
             / max( ss26SockTop, 0.001 );
           float ss26Cov = smoothstep( 0.35, 0.65, ss26Sock.r )
             * ( 1.0 - smoothstep( 0.985, 1.02, ss26H ) );
           if ( ss26Cov > 0.001 ) {
-            // cloth: a touch darker down the shin where the sock creases
             vec3 ss26C = ss26SockColor * ( 0.86 + 0.18 * ss26H );
-            // turnover band: the fold at the top of a football sock, one
-            // shade brighter and a hard edge above it
             float ss26Band = smoothstep( 0.80, 0.84, ss26H ) * ( 1.0 - smoothstep( 0.93, 0.97, ss26H ) );
             ss26C = mix( ss26C, ss26C * 1.22 + 0.04, ss26Band );
             diffuseColor.rgb = mix( diffuseColor.rgb, ss26C, ss26Cov );
           }
         }`);
+    }
+
+    // The block goes in whenever the archetype HAS a mask, even at strength
+    // zero: three keys its program cache on onBeforeCompile.toString(), which
+    // is identical for every material here, so two materials that generate
+    // different source would share one compiled program. Same source, different
+    // uniform, no collision.
+    if (o.faceMask) {
+      shader.uniforms.ss26FaceMask = { value: o.faceMask };
+      shader.uniforms.ss26Stubble = { value: o.stubble ?? 0 };
+      shader.uniforms.ss26StubbleColor = { value: o.stubbleColor ?? new THREE.Color(0x2a2119) };
+      frag = frag.replace('#include <common>', `#include <common>
+        uniform sampler2D ss26FaceMask;
+        uniform float ss26Stubble;
+        uniform vec3 ss26StubbleColor;`)
+        .replace('#include <map_fragment>', `#include <map_fragment>
+        {
+          vec4 ss26Face = texture2D( ss26FaceMask, vMapUv );
+          float ss26FH = ss26Face.g / max( ss26Face.r, 0.004 );
+          // dense along the jaw, thinning as it climbs the cheek — a beard
+          // shadow that stops in a straight line is a chinstrap
+          float ss26D = smoothstep( 0.02, 0.10, ss26FH ) * ( 1.0 - smoothstep( 0.55, 0.92, ss26FH ) );
+          float ss26Amt = smoothstep( 0.35, 0.65, ss26Face.r ) * ss26D * ss26Stubble;
+          diffuseColor.rgb = mix( diffuseColor.rgb,
+            diffuseColor.rgb * 0.45 + ss26StubbleColor * 0.25, ss26Amt );
+        }`)
+        // stubble is matte: it is the reason a chin stops catching the key
+        .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+        {
+          vec4 ss26FaceR = texture2D( ss26FaceMask, vMapUv );
+          float ss26FHR = ss26FaceR.g / max( ss26FaceR.r, 0.004 );
+          float ss26DR = smoothstep( 0.02, 0.10, ss26FHR ) * ( 1.0 - smoothstep( 0.55, 0.92, ss26FHR ) );
+          roughnessFactor = min( 1.0, roughnessFactor
+            + 0.22 * smoothstep( 0.35, 0.65, ss26FaceR.r ) * ss26DR * ss26Stubble );
+        }`);
+    }
+    shader.fragmentShader = frag;
+  });
+}
+
+/** The hair sheen, queued on one hair material. */
+function queueHairShading(mat: THREE.MeshStandardMaterial): void {
+  queueShaderPatch(mat, (shader) => {
+    shader.uniforms.ss26HairSpec = { value: 0.55 };
+    shader.uniforms.ss26HairExp = { value: 26.0 };
+    let frag = shader.fragmentShader.replace('#include <common>',
+      '#include <common>\nuniform float ss26HairSpec;\nuniform float ss26HairExp;');
+    if (HAIR_PARS) frag = frag.replace('#include <lights_physical_pars_fragment>', HAIR_PARS);
+    shader.fragmentShader = frag;
   });
 }
 
@@ -1635,12 +2640,32 @@ export class CharacterRig {
    */
   instance(data: PlayerData, kit: KitSpec): CharacterInstance {
     const arch = this.assets.archetypes[
-      // spread the faces deterministically across the squad rather than by
-      // name hash: a hash gives one team four identical faces often enough
-      // to be noticed
+      // spread the BODIES deterministically across the squad rather than by
+      // name hash: a hash gives one team four identical builds often enough
+      // to be noticed. The FACE is hashed (see look below) — there are twelve
+      // per archetype, so a collision inside one squad is a different head on
+      // a different body, not a twin.
       this.nextArchetype++ % this.assets.archetypes.length
     ];
+    const look = appearanceOf(data, kit, arch);
     const root = cloneSkeleton(arch.scene) as THREE.Group;
+
+    // His own face, and only his own haircut. Both happen on the clone, before
+    // anything is dressed: the geometry swap is cheap (two arrays), and the
+    // three cuts he is not wearing have to go before they cost a draw call.
+    const drop: THREE.Object3D[] = [];
+    root.traverse((obj) => {
+      const mesh = obj as THREE.SkinnedMesh;
+      if (!mesh.isSkinnedMesh) return;
+      const sane = saneName(mesh.name);
+      if (arch.hairNames.length && arch.hairNames.includes(sane) && sane !== look.hair) {
+        drop.push(mesh);
+        return;
+      }
+      const fm = arch.faces ? arch.faceMaps.get(sane) : undefined;
+      if (fm) mesh.geometry = morphGeometry(fm, arch.faces!, look.variant);
+    });
+    for (const d of drop) d.removeFromParent();
 
     // SkeletonUtils.clone() gives every SkinnedMesh its OWN Skeleton, and a
     // Skeleton is a bone texture: ten meshes a player, twenty-two players, two
@@ -1683,7 +2708,7 @@ export class CharacterRig {
         mesh.frustumCulled = false;
         mesh.castShadow = false;
         mesh.receiveShadow = true;
-        mesh.material = this.dress(mesh, kit, data, arch);
+        mesh.material = this.dress(mesh, kit, data, arch, look);
       }
       levels.push({ meshes });
     }
@@ -1746,31 +2771,65 @@ export class CharacterRig {
    *  material, copied once per match — except the body, which also carries the
    *  team's socks and is therefore copied per team. */
   private dress(mesh: THREE.SkinnedMesh, kit: KitSpec, data: PlayerData,
-    arch: Archetype): THREE.Material {
+    arch: Archetype, look: Appearance): THREE.Material {
     if (isShirt(mesh)) return this.shirtMaterial(kit, data, arch);
     if (isShorts(mesh)) return this.shortsMaterial(kit, arch);
     if (isShoes(mesh)) return this.bootMaterial(kit, arch);
-    return this.matchCopy(mesh.material as THREE.Material, mesh.name, kit, arch);
+    return this.matchCopy(mesh.material as THREE.Material, mesh.name, kit, arch, look);
   }
 
-  /** This match's copy of one archetype material, with the §7A.4 broadcast
-   *  skin/fabric patch queued on it. Skin wraps further and warmer (that is
-   *  what subsurface scattering looks like from ten metres); everything else
-   *  barely wraps and keeps its own colour. */
+  /**
+   * This match's copy of one archetype material.
+   *
+   * Three bands. SKIN is per PLAYER now — it carries his tone, his stubble and
+   * his team's socks — so the key has all three in it; that is twenty-two
+   * materials sharing one 2048 atlas and one compiled program, not twenty-two
+   * textures. HAIR is per player too, for the colour, and takes the strand
+   * sheen. Everything else (eyes) is one copy for the whole match.
+   */
   private matchCopy(src: THREE.Material, meshName: string, kit: KitSpec,
-    arch: Archetype): THREE.MeshStandardMaterial {
-    const skin = /body|base|head|face/i.test(`${meshName} ${src.name}`);
-    // the body wears the socks, so it is per TEAM; everything else (hair,
-    // eyes) is the same for everyone in the match
-    const key = skin ? `${src.uuid}|${kit.socks}` : src.uuid;
+    arch: Archetype, look: Appearance): THREE.MeshStandardMaterial {
+    const id = `${meshName} ${src.name}`;
+    const skin = /body|base|head|face/i.test(id);
+    const hair = /hair|afro|short0|braid|cornrow|micky|messy/i.test(id);
+    const eye = /low-poly|cornea|eyeball/i.test(id);
+    const key = skin
+      ? `${src.uuid}|${kit.socks}|${look.skinTone.getHexString()}|${look.stubble.toFixed(2)}`
+      : hair ? `${src.uuid}|${look.hairColor.getHexString()}` : src.uuid;
     const hit = this.matClones.get(key);
     if (hit) return hit;
     const copy = (src as THREE.MeshStandardMaterial).clone();
-    queueBroadcastSkin(copy, skin
-      ? { wrap: 0.42, wrapTint: 0xffbfa0, rim: 0.05, rimPower: 4.0 }
-      : { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
-    if (skin && arch.sockMask) {
-      queueSockPatch(copy, arch.sockMask, new THREE.Color(kit.socks));
+    if (skin) {
+      copy.color.multiply(look.skinTone);
+      // pores: a tiling micro-normal far below the atlas's resolution, which is
+      // what stops a floodlit cheek reading as wax. Only if the skin did not
+      // already ship one — none of them do today.
+      if (!copy.normalMap) {
+        copy.normalMap = poreNormal();
+        copy.normalScale = new THREE.Vector2(0.45, 0.45);
+      }
+      copy.customProgramCacheKey = (): string => 'ss26-skin';
+      queueSkinShading(copy, {
+        sockMask: arch.sockMask, sockColor: new THREE.Color(kit.socks),
+        faceMask: arch.faceMask, stubble: look.stubble,
+        stubbleColor: look.stubbleColor,
+      });
+    } else if (hair) {
+      copy.color.multiply(look.hairColor);
+      copy.customProgramCacheKey = (): string => 'ss26-hair';
+      queueHairShading(copy);
+      queueBroadcastSkin(copy, { wrap: 0.3, wrapTint: 0xd8cec4, rim: 0.05, rimPower: 3.2 });
+    } else if (eye) {
+      // a cornea is the only wet thing on a player and the only real highlight
+      // on a face; it is also the difference between eyes and two dark holes
+      copy.roughness = 0.07;
+      copy.metalness = 0;
+      copy.envMapIntensity = 1.6;
+      copy.customProgramCacheKey = (): string => 'ss26-eye';
+      queueBroadcastSkin(copy, { wrap: 0.1, wrapTint: 0xffffff, rim: 0.12, rimPower: 2.4 });
+    } else {
+      copy.customProgramCacheKey = (): string => 'ss26-part';
+      queueBroadcastSkin(copy, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
     }
     this.matClones.set(key, copy);
     this.owned.push(copy);
@@ -1778,97 +2837,236 @@ export class CharacterRig {
   }
 
   // ------------------------------------------------------------- kit textures
+  //
+  // A kit is now a CUT as well as two colours. TextureLab.kitLayoutFor() seeds
+  // the pattern, the band count, the collar and cuff widths, the crest shape and
+  // the sponsor off the kit itself, so two teams whose hexes happen to be close
+  // still look like two teams. Everything is painted through the archetype's
+  // garment map (buildGarmentMap), which is what lets a stripe follow the body
+  // round a sleeve seam and a squad number land upright on a garment nobody
+  // measured by hand.
 
+  /** This match's kit bakery. The match scene has its own TextureLab for the
+   *  pitch and the crowd; the characters take a second one rather than reach
+   *  into the renderer, and report their own cost on the same console channel. */
+  private lab = new TextureLab();
+  private layouts = new Map<string, KitLayout>();
+  /** REAL wall clock. The capture harness replaces performance.now with a
+   *  virtual one so a still is reproducible, and a bake budget that always
+   *  reports 0.0ms is worse than no budget at all. */
+  private kitClock = Date.now.bind(Date);
+  private kitMs = 0;
+  /**
+   * ONE garment map for the match, not one per archetype.
+   *
+   * All four archetypes wear the same authored garment, so their maps differ
+   * only by the millimetres MPFB moved a vertex to fit a wider chest — the UV
+   * islands, the classification and the panel fits are the same picture. Keying
+   * the bake on the archetype as well as the kit meant ten 1024² shirts a match
+   * instead of three, which measured 770ms of canvas work for nothing.
+   */
+  private sharedShirtMap: GarmentMap | null = null;
+  private sharedShortsMap: GarmentMap | null = null;
+
+  private shirtMap(arch: Archetype): GarmentMap | null {
+    this.sharedShirtMap ??= arch.shirtGarment;
+    return this.sharedShirtMap;
+  }
+
+  private shortsMap(arch: Archetype): GarmentMap | null {
+    this.sharedShortsMap ??= arch.shortsGarment;
+    return this.sharedShortsMap;
+  }
+
+  private layoutFor(kit: KitColors): KitLayout {
+    const key = `${kit.shirt}|${kit.shorts}|${kit.socks}`;
+    const hit = this.layouts.get(key);
+    if (hit) return hit;
+    const made = this.lab.kitLayoutFor(kit, hashSeed(key));
+    this.layouts.set(key, made);
+    return made;
+  }
 
   /**
-   * The team's shirt, painted once: the authored islands recoloured to the kit,
-   * with a contrasting collar band around both neck holes and cuffs at the
-   * sleeve lobes. Per player, this canvas is copied and his number and name are
-   * printed on the BACK island — rotated 180°, because that island is laid out
-   * upside down and mirrored (see SHIRT_UV).
+   * The team's shirt, painted once per (archetype, kit): pattern, collar, cuffs,
+   * crest and sponsor. The per-player copy on top of it carries his number and
+   * his name, which is the only part of a kit that is his.
    */
   private shirtBase(kit: KitColors, arch: Archetype): HTMLCanvasElement | null {
-    const key = `${arch.url}|${kit.shirt}`;
+    const key = `${kit.shirt}|${kit.shorts}`;
     const hit = this.kitShirtBase.get(key);
     if (hit) return hit;
-    const img = sourceImageOf(arch, isShirt);
-    if (!img) return null;
+    const map = this.shirtMap(arch);
+    if (!map) return null;
+    const t0 = this.kitClock();
+    const layout = this.layoutFor(kit);
 
-    const N = SHIRT_PX;
+    const N = map.n;
     const [c, ctx] = canvas2d(N, N);
-    // 0.14 of the authored weave survives: it is what separates "fabric" from
-    // "a coloured sticker" at broadcast distance
-    recolour(ctx, img, N, N, kit.shirt, 0.14);
+    const base = new THREE.Color(kit.shirt);
+    // the SECOND team colour, which is what a striped or hooped kit is made of.
+    // If the two hexes are too close to separate at forty metres the accent
+    // falls back to a shade of the first, because a stripe you cannot see is
+    // just a dirty shirt.
+    const other = new THREE.Color(kit.shorts);
+    const far = Math.abs(luminance(kit.shirt) - luminance(kit.shorts)) > 0.18
+      || Math.abs(base.r - other.r) + Math.abs(base.g - other.g) + Math.abs(base.b - other.b) > 0.45;
+    const accent = far ? other
+      : new THREE.Color(luminance(kit.shirt) > 0.5 ? shade(kit.shirt, -0.45) : shade(kit.shirt, 0.5));
+    const trim = new THREE.Color(
+      luminance(kit.shirt) > 0.55 ? shade(kit.shirt, -0.5) : shade(kit.shirt, 0.55));
 
-    const trim = luminance(kit.shirt) > 0.55 ? shade(kit.shirt, -0.5) : shade(kit.shirt, 0.55);
-    // collar: a ring around each neck hole
-    for (const [cx, cy] of [SHIRT_UV.backNeck, SHIRT_UV.frontNeck]) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'source-atop';
-      ctx.strokeStyle = trim;
-      ctx.lineWidth = N * 0.022;
-      ctx.beginPath();
-      ctx.arc(cx * N, cy * N, N * 0.075, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
+    const img = ctx.createImageData(N, N);
+    const out = img.data;
+    const src = map.data;
+    const bands = layout.bands;
+    for (let i = 0; i < N * N; i++) {
+      const o = i * 4;
+      if (src[o + 3] === 0) continue;
+      const across = src[o] / 255, up = src[o + 1] / 255;
+      const part = Math.round(src[o + 2] / 51) as Part;
+      let col = base;
+      switch (layout.pattern) {
+        case 'stripes':
+          if ((Math.floor(across * bands * 2) & 1) === 1) col = accent;
+          break;
+        case 'hoops':
+          if ((Math.floor(up * bands) & 1) === 1) col = accent;
+          break;
+        case 'sash':
+          if (Math.abs(((across + up) % 1) - 0.5) < 0.14) col = accent;
+          break;
+        case 'halves':
+          if (across > 0.5) col = accent;
+          break;
+        case 'shoulders':
+          if (part === Part.Sleeve || part === Part.Cuff || up > 0.82) col = accent;
+          break;
+        default:
+          break;
+      }
+      // The collar band and the cuffs are computed PER TEXEL from where the
+      // texel sits on the body, not from the triangle's class. Class is a step
+      // function on a mesh whose triangles are a centimetre across, and a
+      // collar whose edge is a row of triangle boundaries reads as a ragged
+      // zig-zag yoke across the shoulders rather than as a collar. (It did.)
+      const edge = Math.min(across, 1 - across);
+      const collarAmt = smooth(0.87, 0.95, up) * (1 - smooth(0.20, 0.30, Math.abs(across - 0.5)));
+      const cuffAmt = 1 - smooth(0.085, 0.125, edge);
+      const band = Math.max(collarAmt * layout.collar, cuffAmt * layout.cuff);
+      if (band > 0.002) col = col.clone().lerp(trim, band);
+      // cloth does not light flat: a gentle top-to-bottom ramp plus a touch of
+      // occlusion under the arms
+      const k = (1.06 - 0.22 * (1 - up)) * (1 - 0.1 * Math.max(0, 1 - Math.abs(across - 0.5) * 4));
+      out[o] = Math.min(255, col.r * 255 * k);
+      out[o + 1] = Math.min(255, col.g * 255 * k);
+      out[o + 2] = Math.min(255, col.b * 255 * k);
+      out[o + 3] = 255;
     }
-    // cuffs: the sleeve lobes run off both outer edges of each island
-    atopRect(ctx, [0.0, 0.0, 0.028, 1.0], N, N, trim);
-    atopRect(ctx, [0.536, 0.0, 0.575, 1.0], N, N, trim);
-    // a soft top-to-bottom light ramp so the shirt is not flat
-    for (const island of [SHIRT_UV.back, SHIRT_UV.front]) {
-      const g = ctx.createLinearGradient(0, island[1] * N, 0, island[3] * N);
-      g.addColorStop(0, 'rgba(255,255,255,0.10)');
-      g.addColorStop(0.5, 'rgba(255,255,255,0)');
-      g.addColorStop(1, 'rgba(0,0,0,0.16)');
-      atopRect(ctx, [0, island[1], 1, island[3]], N, N, g);
+    dilate(img, 4);
+    ctx.putImageData(img, 0, 0);
+
+    // the weave, over everything: at broadcast distance this is the difference
+    // between fabric and a coloured sticker
+    ctx.save();
+    ctx.globalAlpha = 0.34;
+    ctx.fillStyle = ctx.createPattern(this.lab.kitWeaveTile(), 'repeat')!;
+    ctx.fillRect(0, 0, N, N);
+    ctx.restore();
+
+    // crest and sponsor, placed as FRACTIONS of the panel the fit measured, so
+    // they land on the chest of whatever garment the pipeline is using
+    if (map.front) {
+      const f = map.front;
+      const ink = luminance(kit.shirt) > 0.5 ? '#141820' : '#f6f8fc';
+      panelFrame(ctx, f, false);
+      const crestPx = 0.46 * f.halfW * f.ppm;
+      const crest = this.lab.kitCrestCanvas(kit, layout, crestInitials(layout.seed));
+      ctx.drawImage(crest, -0.52 * f.halfW * f.ppm - crestPx / 2,
+        -0.62 * f.halfH * f.ppm - crestPx / 2, crestPx, crestPx);
+      ctx.fillStyle = ink;
+      ctx.strokeStyle = luminance(kit.shirt) > 0.5 ? '#f6f8fc' : '#141820';
+      ctx.lineJoin = 'round';
+      ctx.textAlign = 'center';
+      ctx.font = `bold ${Math.round(0.24 * f.halfW * f.ppm)}px Helvetica, Arial, sans-serif`;
+      ctx.lineWidth = 0.02 * f.halfW * f.ppm;
+      ctx.strokeText(layout.sponsor, 0, -0.02 * f.halfH * f.ppm);
+      ctx.fillText(layout.sponsor, 0, -0.02 * f.halfH * f.ppm);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
 
     this.kitShirtBase.set(key, c);
+    this.kitMs += this.kitClock() - t0;
+    console.info(`characters: kit bake ${layout.pattern} ${layout.bands}-band`
+      + ` "${layout.sponsor}" crest ${layout.crest} — ${this.kitMs.toFixed(1)}ms over`
+      + ` ${this.kitShirtBase.size} team shirt(s)`);
     return c;
   }
 
   private shirtMaterial(kit: KitSpec, data: PlayerData, arch: Archetype):
   THREE.MeshStandardMaterial {
-    const key = `${arch.url}|${kit.shirt}|${data.num}|${data.name}`;
+    const key = `${kit.shirt}|${kit.shorts}|${data.num}|${data.name}`;
     const hit = this.shirtMats.get(key);
     if (hit) return hit;
 
     const base = this.shirtBase(kit, arch);
-    const N = SHIRT_PX;
+    const map = this.shirtMap(arch);
+    const N = map?.n ?? SHIRT_PX;
     const [c, ctx] = canvas2d(N, N);
     if (base) ctx.drawImage(base, 0, 0);
-
-    // number + name on the back island. The island is upside down AND mirrored
-    // relative to a viewer stood behind the player, which composes to exactly a
-    // 180° rotation — so print through one.
-    const r = SHIRT_UV.back;
-    const cx = (r[0] + r[2]) / 2 * N;
-    const cy = (r[1] + r[3]) / 2 * N;
-    ctx.save();
-    ctx.globalCompositeOperation = 'source-atop';
-    ctx.translate(cx, cy);
-    ctx.rotate(Math.PI);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = luminance(kit.shirt) > 0.5 ? '#141820' : '#f6f8fc';
+    const ink = luminance(kit.shirt) > 0.5 ? '#141820' : '#f6f8fc';
+    const outline = luminance(kit.shirt) > 0.5 ? '#f6f8fc' : '#141820';
     const short = (data.name.split(' ').pop() ?? '').toUpperCase().slice(0, 12);
-    ctx.font = `bold ${Math.round(N * 0.035)}px Helvetica, Arial, sans-serif`;
-    ctx.fillText(short, 0, -N * 0.055);
-    ctx.font = `bold ${Math.round(N * 0.135)}px Helvetica, Arial, sans-serif`;
-    ctx.fillText(String(data.num), 0, N * 0.06);
-    ctx.restore();
+
+    // BACK: surname under the collar, number under it, printed through the
+    // panel's own fit — upright and the right way round on any garment.
+    // Outlined as well as filled: half the kits this roster generates are
+    // patterned, and a flat number vanishes into the stripe it lands on.
+    if (map?.back) {
+      const b = map.back;
+      panelFrame(ctx, b, true);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = ink;
+      ctx.strokeStyle = outline;
+      ctx.lineJoin = 'round';
+      ctx.font = `bold ${Math.round(0.26 * b.halfW * b.ppm)}px Helvetica, Arial, sans-serif`;
+      ctx.lineWidth = 0.022 * b.halfW * b.ppm;
+      ctx.strokeText(short, 0, -0.52 * b.halfH * b.ppm);
+      ctx.fillText(short, 0, -0.52 * b.halfH * b.ppm);
+      ctx.font = `bold ${Math.round(0.86 * b.halfW * b.ppm)}px Helvetica, Arial, sans-serif`;
+      ctx.lineWidth = 0.055 * b.halfW * b.ppm;
+      ctx.strokeText(String(data.num), 0, 0.22 * b.halfH * b.ppm);
+      ctx.fillText(String(data.num), 0, 0.22 * b.halfH * b.ppm);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+    // FRONT: the small chest number, opposite the crest
+    if (map?.front) {
+      const f = map.front;
+      panelFrame(ctx, f, false);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = ink;
+      ctx.strokeStyle = outline;
+      ctx.lineJoin = 'round';
+      ctx.font = `bold ${Math.round(0.38 * f.halfW * f.ppm)}px Helvetica, Arial, sans-serif`;
+      ctx.lineWidth = 0.03 * f.halfW * f.ppm;
+      ctx.strokeText(String(data.num), 0.55 * f.halfW * f.ppm, -0.52 * f.halfH * f.ppm);
+      ctx.fillText(String(data.num), 0.55 * f.halfW * f.ppm, -0.52 * f.halfH * f.ppm);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
 
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
     // glTF UVs have their origin at the TOP left, so a canvas painted in the
-    // same space must NOT be flipped on upload (this is the difference between
-    // a shirt and a shirt turned inside out)
+    // same space must NOT be flipped on upload
     tex.flipY = false;
     tex.anisotropy = 8;
     const mat = new THREE.MeshStandardMaterial({
-      map: tex, roughness: 0.82, metalness: 0, envMapIntensity: 0.45,
+      map: tex, roughness: 0.84, metalness: 0, envMapIntensity: 0.45,
+      normalMap: this.lab.kitWeaveNormalMap(),
+      normalScale: new THREE.Vector2(0.55, 0.55),
       alphaTest: 0.5, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide,
     });
+    mat.customProgramCacheKey = (): string => 'ss26-kit';
     queueBroadcastSkin(mat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
     this.shirtMats.set(key, mat);
     this.owned.push(mat, tex);
@@ -1876,29 +3074,64 @@ export class CharacterRig {
   }
 
   /**
-   * Shorts: the authored garment map flattened to neutral cloth (once per
-   * archetype) and MULTIPLIED by the kit colour.
-   *
-   * Multiply is how cloth takes a colour — it keeps every crease and seam the
-   * texture has, for the price of one float3 — but it only works on a map that
-   * is roughly white, and the authored shorts have been near-black denim.
-   * neutralGarmentMap() divides that out at load, so this stays one material
-   * per kit with one colour set on it, and it will keep working when the
-   * pipeline swaps the denim for a pale cloth.
+   * Shorts: the same garment map, the team's own colour and a contrast hem.
+   * Painted rather than tinted now, because a multiply onto a neutralised
+   * authored map could only ever produce one cut.
    */
   private shortsMaterial(kit: KitSpec, arch: Archetype): THREE.MeshStandardMaterial {
-    const key = `${arch.url}|${kit.shorts}`;
+    const key = `${kit.shorts}|${kit.shirt}`;
     const hit = this.shortsMats.get(key);
     if (hit) return hit;
+    const map = this.shortsMap(arch);
+    let tex: THREE.Texture | null = arch.shortsMap;
+    if (map) {
+      const t0 = this.kitClock();
+      const N = map.n;
+      const [c, ctx] = canvas2d(N, N);
+      const base = new THREE.Color(kit.shorts);
+      const trim = new THREE.Color(kit.shirt);
+      const img = ctx.createImageData(N, N);
+      const out = img.data;
+      const src = map.data;
+      for (let i = 0; i < N * N; i++) {
+        const o = i * 4;
+        if (src[o + 3] === 0) continue;
+        const up = src[o + 1] / 255;
+        // The hem band, and only the hem band. A side flash was tried and
+        // dropped: `across` is the x extent of BOTH legs, and the outer few
+        // per cent of that is a wide swath of a cylindrical surface, so a
+        // "thin stripe" came out as a wedge across the whole hip.
+        const col = up < 0.055 ? trim : base;
+        const k = 1.04 - 0.16 * (1 - up);
+        out[o] = Math.min(255, col.r * 255 * k);
+        out[o + 1] = Math.min(255, col.g * 255 * k);
+        out[o + 2] = Math.min(255, col.b * 255 * k);
+        out[o + 3] = 255;
+      }
+      dilate(img, 4);
+      ctx.putImageData(img, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle = ctx.createPattern(this.lab.kitWeaveTile(), 'repeat')!;
+      ctx.fillRect(0, 0, N, N);
+      ctx.restore();
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.flipY = false;
+      t.anisotropy = 8;
+      tex = t;
+      this.owned.push(t);
+      this.kitMs += this.kitClock() - t0;
+    }
     const mat = new THREE.MeshStandardMaterial({
-      map: arch.shortsMap, color: new THREE.Color(kit.shorts),
-      // the authored weave survives the recolour as a normal map even though
-      // the colour does not (see Archetype.shortsNormal)
-      normalMap: arch.shortsNormal,
-      normalScale: new THREE.Vector2(0.6, 0.6),
-      roughness: 0.84, metalness: 0, envMapIntensity: 0.45,
+      map: tex,
+      color: map ? 0xffffff : new THREE.Color(kit.shorts),
+      normalMap: this.lab.kitWeaveNormalMap(),
+      normalScale: new THREE.Vector2(0.5, 0.5),
+      roughness: 0.86, metalness: 0, envMapIntensity: 0.45,
       alphaTest: 0.5, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide,
     });
+    mat.customProgramCacheKey = (): string => 'ss26-kit';
     queueBroadcastSkin(mat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.06, rimPower: 3.6 });
     this.shortsMats.set(key, mat);
     this.owned.push(mat);
@@ -1908,14 +3141,20 @@ export class CharacterRig {
   /**
    * Boots and socks share one authored atlas (the trainers are a photo-scan of
    * a blue Nike, which no football team wears). The shoe is knocked back to
-   * boot-black and the sock block — a small patch in the bottom-right corner of
-   * the atlas, identical on all four archetypes — is painted the kit's sock
-   * colour on top.
+   * boot-black, the sock block is painted the kit's sock colour, and a seeded
+   * ACCENT flash goes across the upper — because twenty-two identical black
+   * boots is the one part of a broadcast frame that never happens in real
+   * football.
    */
   private bootMaterial(kit: KitSpec, arch: Archetype): THREE.MeshStandardMaterial {
-    const key = `${arch.url}|${kit.socks}`;
+    // Per KIT, not per (archetype, kit): every archetype wears the same
+    // shoes06 atlas, so keying on the archetype as well minted up to twelve
+    // 1024² boot textures a match — sixty-odd megabytes of four identical
+    // pictures. The first archetype's atlas is every archetype's atlas.
+    const key = `${kit.socks}|${kit.shirt}`;
     const hit = this.bootMats.get(key);
     if (hit) return hit;
+    const layout = this.layoutFor(kit);
     const img = sourceImageOf(arch, isShoes);
     // the authored shoes06 atlas is 1024²; painting it into a smaller canvas
     // threw away the lace and panel detail that is the only thing making a
@@ -1924,6 +3163,17 @@ export class CharacterRig {
     const [c, ctx] = canvas2d(N, N);
     if (img) recolour(ctx, img, N, N, '#191c22', 0.28);
     else { ctx.fillStyle = '#191c22'; ctx.fillRect(0, 0, N, N); }
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-atop';
+    ctx.globalAlpha = 0.85;
+    const g = ctx.createLinearGradient(0, N * 0.30, 0, N * 0.52);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(0.35, layout.bootAccent);
+    g.addColorStop(0.75, layout.bootAccent);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, N * 0.30, N * 0.775, N * 0.22);
+    ctx.restore();
     atopRect(ctx, SOCK_UV, N, N, kit.socks, 0.9);
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
@@ -1936,15 +3186,18 @@ export class CharacterRig {
       map: tex, roughness: 0.34, metalness: 0.04, envMapIntensity: 0.85,
       alphaTest: 0.5, side: THREE.FrontSide,
     });
+    mat.customProgramCacheKey = (): string => 'ss26-part';
     queueBroadcastSkin(mat, { wrap: 0.2, wrapTint: 0xf2ece6, rim: 0.08, rimPower: 3.2 });
     this.bootMats.set(key, mat);
     this.owned.push(mat, tex);
     return mat;
   }
 
-  /** Free what the rig minted. The loaded archetypes and clips are page-level
-   *  and deliberately survive the match. */
   dispose(): void {
+    this.lab.dispose();
+    this.layouts.clear();
+    this.sharedShirtMap = null;
+    this.sharedShortsMap = null;
     for (const o of this.owned) o.dispose();
     this.owned = [];
     this.shadowMat = null;
