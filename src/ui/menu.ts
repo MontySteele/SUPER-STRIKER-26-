@@ -23,6 +23,7 @@ import { TEAMS } from '../data/loader';
 import type { TeamData } from '../data/types';
 import type { DifficultyName } from '../sim/match';
 import type { TimeOfDay } from '../render/scene';
+import { setWeather, weatherSetting, WEATHER_OPTIONS, type Weather } from '../render/weather';
 import type { StadiumSize } from '../render/stadium';
 import { Tournament } from '../sim/tournament';
 import { COMMENTARY_KEY, commentaryEnabled } from '../audio/commentary';
@@ -72,6 +73,14 @@ type Screen = 'title' | 'main' | 'pickHome' | 'pickAway' | 'settings' | 'prefs';
 const HALF_OPTIONS: [string, number][] = [['4 MIN', 120], ['6 MIN', 180], ['10 MIN', 300]];
 const DIFF_OPTIONS: DifficultyName[] = ['amateur', 'pro', 'legend'];
 const TOD_OPTIONS: TimeOfDay[] = ['night', 'sunset', 'day'];
+/** §7A.4c: the second half of the dressing. KICK-OFF says WHEN, WEATHER says
+ *  what the sky is doing — and the two compose (a wet sunset is a real state,
+ *  not a fourth preset). The renderer reads the choice back through
+ *  render/weather.ts, so nothing has to be threaded into the match config. */
+const WEATHER_MENU: Weather[] = ['clear', 'overcast', 'rain', 'night'];
+
+const weatherLabel = (): string =>
+  (WEATHER_OPTIONS.find(([v]) => v === weatherSetting()) ?? ['clear', 'CLEAR'])[1];
 const STADIUM_OPTIONS: [string, StadiumSize][] = [
   ['NATIONAL 45K', 'national'], ['MEGA BOWL 80K', 'mega'], ['MUNICIPAL 18K', 'municipal'],
 ];
@@ -529,6 +538,7 @@ export class Menu {
       const rows: [string, string][] = [
         ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
         ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
+        ['WEATHER', weatherLabel()],
         ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
         ...prefs,
       ];
@@ -543,6 +553,7 @@ export class Menu {
       ['MATCH LENGTH', HALF_OPTIONS[this.halfIdx][0]],
       ['DIFFICULTY', DIFF_OPTIONS[this.diffIdx].toUpperCase()],
       ['KICK-OFF', TOD_OPTIONS[this.todIdx].toUpperCase()],
+      ['WEATHER', weatherLabel()],
       ['STADIUM', STADIUM_OPTIONS[this.stadiumIdx][0]],
       ...prefs,
     ];
@@ -557,7 +568,7 @@ export class Menu {
   /** The match-dressing subset, shown as the strip under the team grid. */
   private stripKeys(): string[] {
     const have = new Set(this.settingsRows().map((r) => r[0]));
-    return ['PLAYERS', 'MATCH LENGTH', 'DIFFICULTY', 'KICK-OFF', 'STADIUM']
+    return ['PLAYERS', 'MATCH LENGTH', 'DIFFICULTY', 'KICK-OFF', 'WEATHER', 'STADIUM']
       .filter((k) => have.has(k));
   }
 
@@ -589,6 +600,10 @@ export class Menu {
     if (key === 'MATCH LENGTH') this.halfIdx = (this.halfIdx + d + HALF_OPTIONS.length) % HALF_OPTIONS.length;
     if (key === 'DIFFICULTY') this.diffIdx = (this.diffIdx + d + DIFF_OPTIONS.length) % DIFF_OPTIONS.length;
     if (key === 'KICK-OFF') this.todIdx = (this.todIdx + d + TOD_OPTIONS.length) % TOD_OPTIONS.length;
+    if (key === 'WEATHER') {
+      const i = WEATHER_MENU.indexOf(weatherSetting());
+      setWeather(WEATHER_MENU[(i + d + WEATHER_MENU.length) % WEATHER_MENU.length]);
+    }
     if (key === 'STADIUM') this.stadiumIdx = (this.stadiumIdx + d + STADIUM_OPTIONS.length) % STADIUM_OPTIONS.length;
     if (key === 'COMMENTARY') {
       try {

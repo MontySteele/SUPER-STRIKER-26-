@@ -37,6 +37,14 @@ export interface QualityProfile {
   grade: boolean;
   /** PMREM sky environment on scene.environment */
   env: boolean;
+  /**
+   * §7A.6b screen-space AO strength, 0 = the pass is never built. It is a
+   * FRACTION rather than a flag because MEDIUM wants the grounding without the
+   * crease shading — the same depth pass, applied at half the amount, which is
+   * free where turning it off entirely would put MEDIUM's players back on top
+   * of the grass instead of in it.
+   */
+  ao: number;
   /** shell layers in the turf (§7A.3b, render/grass.ts); 0 = no shell turf */
   grassShells: number;
   /** metres from the lens at which the shells have faded back into the plane */
@@ -60,6 +68,8 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
     // see effectiveSamples() — at pixel ratio 2 this is spent as 0 and SMAA
     // carries the edges alone. The 4 is what a 1x display gets.
     samples: 4, bloomScale: 1, aa: 'smaa', grade: true, env: true,
+    // §7A.6b: half-res, 8 taps, applied inside the grade. ~0.35ms at DPR 2.
+    ao: 0.85,
     // §7A.3b. Both numbers were set by measurement, not by taste — see the
     // table in render/grass.ts. Shells are priced per SCREEN PIXEL COVERED,
     // so the radius is the expensive dial and the layer count is the cheap
@@ -76,12 +86,15 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
   medium: {
     level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024,
     samples: 0, bloomScale: 0.5, aa: 'fxaa', grade: false, env: true,
+    ao: 0.55,
     grassShells: 5, grassRadius: 18,
     divots: 16,
   },
   retro: {
     level: 'retro', retro: true, cascades: 0, shadowMapSize: 2048,
     samples: 0, bloomScale: 1, aa: 'none', grade: true, env: false,
+    // RETRO has no depth texture and no AO pass: it is the v1.1 chain
+    ao: 0,
     // RETRO is the v1.1 renderer on purpose; it had a flat pitch and keeps one
     grassShells: 0, grassRadius: 0,
     // ...and a pitch that never remembers a tackle, for the same reason

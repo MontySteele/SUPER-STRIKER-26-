@@ -20,6 +20,7 @@ import { PITCH_MARGIN, TextureLab, paintMarkings } from './TextureLab';
 import { GrassField, grassPlaneAo } from './grass';
 import { queueShaderPatch } from './materials';
 import type { QualityProfile } from './quality';
+import { weatherProfile } from './weather';
 
 /** Mowing bands across the pitch length. 16 bands over 105m ≈ 6.5m each,
  *  which is what a real gang mower leaves. */
@@ -85,10 +86,30 @@ THREE.MeshStandardMaterial {
     metalness: 0,
   });
 
+  const wx = weatherProfile();
+  if (wx.wet > 0) {
+    // wet turf is DARKER and SMOOTHER before any shader gets involved: water
+    // fills the gaps between the blades, so less light scatters back out and
+    // more of it reflects off a near-flat film
+    // 0.18, not 0.30: a wet pitch is a DARK GREEN pitch. Take a third off the
+    // albedo as well and the hemisphere fill is all that is left, which is
+    // blue — and a blue pitch reads as a swimming pool, not as turf.
+    // ...and it stays GREEN while it does it. A flat scalar takes the blue
+    // channel down by as much as the green, which under a blue hemisphere
+    // fill leaves a teal pitch — the swimming-pool look. Take more off blue
+    // than off green and it reads as soaked turf.
+    mat.color.setRGB(1 - 0.20 * wx.wet, 1 - 0.14 * wx.wet, 1 - 0.28 * wx.wet);
+    mat.roughness = 0.9 - 0.26 * wx.wet;
+  }
+
   queueShaderPatch(mat, (shader) => {
     shader.uniforms.ss26Detail = { value: maps.detail };
     shader.uniforms.ss26DetailRepeat = { value: maps.repeat.clone() };
     shader.uniforms.ss26StripeK = { value: Math.PI / STRIPE_PERIOD };
+    shader.uniforms.ss26Wet = { value: wx.wet };
+    shader.uniforms.ss26HalfPitch = {
+      value: new THREE.Vector2(HALF_L, PITCH_WIDTH / 2),
+    };
     // §7A.3b: where the shell turf is standing, this plane IS the shaded floor
     // under it — see grassPlaneAo()
     const ao = grassPlaneAo(profile);
@@ -108,6 +129,8 @@ THREE.MeshStandardMaterial {
       uniform vec2 ss26DetailRepeat;
       uniform float ss26StripeK;
       uniform vec3 ss26GrassAo;
+      uniform float ss26Wet;
+      uniform vec2 ss26HalfPitch;
 
       // -1 in one band, +1 in the next. The crossing width is derivative-
       // driven: crisp where a band is metres of screen (the near half of a
@@ -120,6 +143,66 @@ THREE.MeshStandardMaterial {
         float w = max( fwidth( s ) * 1.2, 0.012 );
         return smoothstep( -w, w, s ) * 2.0 - 1.0;
       }
+
+      // ---------------------------------------------------------- §7A.3d
+      // MACRO VARIATION AND WEAR, ANALYTICALLY.
+      //
+      // Both of these used to live in the baked macro albedo, at ±3% and three
+      // radial blobs. From the tele cam at 40m that map is being sampled six
+      // mip levels down, and six mips of a ±3% field is a flat colour — which
+      // is exactly the "reads as flat paint" this is fixing. Worse, the fix of
+      // simply turning the bake up cannot work: the wear that survives to mip
+      // 6 is wear that is a brown smear at mip 0.
+      //
+      // So it is evaluated PER PIXEL from world position instead. An analytic
+      // field has no mip chain, so a 12-metre blotch is a 12-metre blotch at
+      // 4m and at 90m, and the stripes, the wear paths and the mowing sheen
+      // are all still there when the camera is in the gantry. It costs ~20 ALU
+      // on a shader that is already doing three texture fetches.
+      float ss26Hash2( vec2 p ) {
+        p = fract( p * vec2( 0.3183099, 0.3678794 ) );
+        p += dot( p, p + 19.19 );
+        return fract( p.x * p.y * 95.4337 );
+      }
+
+      float ss26Noise2( vec2 p ) {
+        vec2 i = floor( p ), f = fract( p );
+        vec2 u = f * f * ( 3.0 - 2.0 * f );
+        return mix(
+          mix( ss26Hash2( i ), ss26Hash2( i + vec2( 1.0, 0.0 ) ), u.x ),
+          mix( ss26Hash2( i + vec2( 0.0, 1.0 ) ), ss26Hash2( i + vec2( 1.0, 1.0 ) ), u.x ), u.y );
+      }
+
+      /** How worn this square metre of turf is, 0..1. */
+      float ss26Wear( vec2 w ) {
+        float n = ss26Noise2( w * 0.075 ) * 0.66 + ss26Noise2( w * 0.31 ) * 0.34;
+        float wear = 0.0;
+        // the two goalmouths: an ellipse a keeper's area wide, scuffed to bare
+        // earth in the middle of the six-yard box
+        for ( int s = 0; s < 2; s++ ) {
+          float sx = s == 0 ? -1.0 : 1.0;
+          vec2 d = ( w - vec2( sx * ( ss26HalfPitch.x - 1.0 ), 0.0 ) ) / vec2( 7.5, 11.0 );
+          wear = max( wear, 0.72 * pow( max( 1.0 - length( d ) * ( 0.82 + n * 0.45 ), 0.0 ), 1.5 ) );
+        }
+        // the penalty spots, which are a patch of dirt on any pitch in March
+        for ( int s = 0; s < 2; s++ ) {
+          float sx = s == 0 ? -1.0 : 1.0;
+          float d = length( ( w - vec2( sx * ( ss26HalfPitch.x - 11.0 ), 0.0 ) ) / 2.2 );
+          wear = max( wear, 0.5 * pow( max( 1.0 - d, 0.0 ), 1.2 ) );
+        }
+        // the centre circle: the kickoff scuff, plus the ring the circle
+        // itself gets walked round
+        float cd = length( w / vec2( 6.0, 6.0 ) );
+        wear = max( wear, 0.30 * pow( max( 1.0 - cd * ( 0.9 + n * 0.4 ), 0.0 ), 1.4 ) );
+        float ring = abs( length( w ) - 9.15 );
+        wear = max( wear, 0.16 * ( 1.0 - smoothstep( 0.0, 2.4, ring ) ) * ( 0.55 + n * 0.9 ) );
+        // the linesmen's paths: two worn strips a metre inside each touchline,
+        // eaten into by the same noise so they are a path and not a stripe
+        float tl = min( abs( abs( w.y ) - ( ss26HalfPitch.y - 1.1 ) ), 6.0 );
+        wear = max( wear, 0.20 * ( 1.0 - smoothstep( 0.0, 1.8, tl ) )
+          * smoothstep( 0.15, 0.75, n ) );
+        return clamp( wear, 0.0, 1.0 );
+      }
     `);
 
     // detail albedo (the same height field the normal map came from) + the
@@ -130,6 +213,29 @@ THREE.MeshStandardMaterial {
       {
         vec3 ss26Det = texture2D( ss26Detail, vMapUv * ss26DetailRepeat ).rgb;
         diffuseColor.rgb *= ss26Det;
+
+        // §7A.3d macro variation. Three octaves at 13m, 3.2m and 1.1m, ±9% —
+        // three times what the bake carried, and it can afford to be, because
+        // it is applied at pixel scale and nothing ever averages it away.
+        // This is the difference between "a green rectangle" and "turf".
+        {
+          vec2 ss26W = ss26WorldPos.xz;
+          float ss26M = ss26Noise2( ss26W * 0.077 ) * 0.62
+                      + ss26Noise2( ss26W * 0.31 ) * 0.26
+                      + ss26Noise2( ss26W * 0.9 ) * 0.12;
+          // brightness AND hue: a lusher patch of a pitch is not a lighter
+          // green, it is a BLUER, deeper one, and a thin patch is yellower.
+          // Varying only the value gives a pitch that reads as one colour with
+          // a cloud shadow on it, which is precisely the flat-paint failure.
+          diffuseColor.rgb *= vec3( 1.0, 1.0, 1.0 )
+            + ( ss26M - 0.5 ) * vec3( 0.20, 0.18, 0.09 ) * 0.9;
+          // ...and the wear, toward bare earth. Warmer, lighter and much less
+          // saturated than grass — the hue shift is what the eye reads as
+          // "dirt", not the brightness.
+          float ss26Wr = ss26Wear( ss26W );
+          diffuseColor.rgb = mix( diffuseColor.rgb,
+            diffuseColor.rgb * vec3( 1.85, 1.26, 0.86 ), ss26Wr * 0.52 );
+        }
 
         float ss26Ph = ss26StripePhase();
         vec3 ss26V = normalize( cameraPosition - ss26WorldPos );
@@ -142,10 +248,14 @@ THREE.MeshStandardMaterial {
         // seen end-on is a wall of sunlit blade tips; seen from behind it is a
         // wall of shaded blade backs.
         float ss26Into = -ss26V.x * ss26Ph;
-        // ~3% flat (which is all a helicopter shot needs, because the normal
-        // lean below carries it there) plus up to ~8% raking, which is the
-        // only half of the effect that survives a shaded pitch
-        diffuseColor.rgb *= 1.0 + ss26Ph * 0.030 + ss26Into * ss26Graze * 0.085;
+        // §7A.3d. The flat term went 3% -> 5.5% and the raking term 8.5% ->
+        // 13%. The old numbers were tuned against the near shells, which carry
+        // the stripe as real geometry inside 30m; past that the shells are
+        // gone and 3% of albedo is all there is, which is why the tele cam saw
+        // paint. A broadcast tele shot of a striped pitch is nearer 10% band
+        // to band, and the whole point of the mowing is that you can see it
+        // from the gantry.
+        diffuseColor.rgb *= 1.0 + ss26Ph * 0.050 + ss26Into * ss26Graze * 0.10;
 
         // the floor of the shell turf: inside the turf's radius the only part
         // of this plane anyone can see is the gaps BETWEEN the blades, and
@@ -171,9 +281,42 @@ THREE.MeshStandardMaterial {
       #include <roughnessmap_fragment>
       {
         vec3 ss26Vr = normalize( cameraPosition - ss26WorldPos );
-        float ss26Sheen = pow( 1.0 - abs( ss26Vr.y ), 3.0 );
+        // Two sheens now, and the second one is §7A.3d's whole answer to "the
+        // tele cam sees paint".
+        //
+        // The cubed term is the KNEE-HEIGHT one: absent from a helicopter
+        // shot, full strength along the deck. The tele cam sits at 20m and
+        // sees the far touchline at about 25° off the ground — pow(.,3) of
+        // that is 0.07, i.e. nothing, which is why a 40m pitch had no sheen at
+        // all. The squared term is a much broader lobe that is still there at
+        // broadcast height, and it is MODULATED BY THE MOWING PHASE rather
+        // than applied flat: bands leaning toward the lens go smoother and
+        // catch the key, bands leaning away go rougher. That difference IS the
+        // stripe at distance, and unlike an albedo delta it is a lighting
+        // effect, so it survives into the shade and strengthens in the wet.
+        float ss26Rake = 1.0 - abs( ss26Vr.y );
+        float ss26Sheen = pow( ss26Rake, 3.0 );
+        float ss26Broad = ss26Rake * ss26Rake;
+        float ss26Into2 = -ss26Vr.x * ss26StripePhase();
         roughnessFactor = clamp(
-          roughnessFactor - ss26StripePhase() * 0.12 - ss26Sheen * 0.26, 0.10, 1.0 );
+          roughnessFactor
+            - ss26StripePhase() * 0.12
+            - ss26Sheen * 0.26
+            // 0.085, not the 0.16 this started at. A grazing key on a
+            // roughness-0.36 band is a gold BAR, not a mowing stripe: at
+            // knee height the broad lobe is already at full strength, so the
+            // whole dial has to be sized for the low-sun shot and not for the
+            // tele cam that cannot see it.
+            - ss26Broad * ss26Into2 * ( 0.070 + ss26Wet * 0.10 )
+            // wet turf is a film of water: the lobe tightens everywhere, and
+            // hardest where the view rakes along it
+            - ss26Wet * ( 0.16 + ss26Broad * 0.16 ),
+          // DRY grass floors at 0.30. It is a mat of broken blades: it has a
+          // sheen and it has never had a highlight, and letting the terms
+          // above stack down to 0.10 turns the sunset sky's own reflection
+          // into a gold bar lying across the mowing bands. Only water gets to
+          // go glossy.
+          mix( 0.30, 0.10, ss26Wet ), 1.0 );
       }
     `);
 

@@ -18,6 +18,8 @@ import { SkinnedPlayerMesh, actionClipReport } from './skinnedPlayer';
 import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
 import { CameraDirector, type CamMode, type ModeOptions } from './camera';
+import { Rain } from './rain';
+import { effectiveTimeOfDay, weatherProfile } from './weather';
 import { HALF_L, SIM_DT } from '../sim/constants';
 
 /**
@@ -201,10 +203,17 @@ export class GameRenderer {
    *  is the v1.1 pitch and did not have them. */
   private divots: Divots | null = null;
   private handsTmp = new THREE.Vector3();
+  /** §7A.4c: only ever non-null when the weather is wet */
+  private rain: Rain | null = null;
 
-  constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
+  constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDayIn: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
-    this.sceneMgr = new SceneManager(canvas, timeOfDay);
+    this.sceneMgr = new SceneManager(canvas, timeOfDayIn);
+    // §7A.4c. SceneManager resolves this for itself; everything DOWNSTREAM of
+    // it — the crowd bake, the seat shading, the capsule impostor tints — has
+    // to agree, or a floodlit match gets a daylight crowd in it.
+    const timeOfDay = this.sceneMgr.profile.retro
+      ? timeOfDayIn : effectiveTimeOfDay(timeOfDayIn);
 
     // §7A.3: one lab per match, seeded, disposed with the match. Everything
     // textured below draws its maps from it, so the whole scene is a pure
@@ -297,6 +306,15 @@ export class GameRenderer {
     // after this point (confetti, the ball trail, the star rings) is
     // unlit/basic and deliberately stays out of it.
     this.sceneMgr.atmos.register(this.sceneMgr.scene);
+
+    // §7A.4c weather: one instanced, camera-relative, seeded particle system,
+    // built last because it is unlit and additive and must stay OUT of the
+    // CSM registration pass above.
+    const wx = weatherProfile();
+    if (wx.rain > 0 && !this.sceneMgr.profile.retro) {
+      this.rain = new Rain(this.sceneMgr.scene, this.lab.stream(0x2a17),
+        wx.rain, timeOfDay === 'night' ? 0xdce8ff : 0xc6d4e4);
+    }
     // ...but the >60m impostors are unlit billboards, and their material is
     // only minted when a player first crosses the threshold. Registering them
     // would be a no-op (registerMaterial ignores anything unlit) — the reason
@@ -1017,14 +1035,61 @@ export class GameRenderer {
 
     this.stadium.update(dtReal);
     this.cam.update(dtReal, ballX, ballY, ballZ);
+    // the curtain rides on the camera, so it is stepped AFTER the director has
+    // moved the rig and before anything draws
+    this.rain?.update(dtReal, this.sceneMgr.camera);
     if (!this.skipDraw) {
       this.updateLOD();
+      this.syncLens();
       // §7A.7: frame pressure buys back pixels, never features. Only the
       // animated path feeds this — advanceNoDraw and renderStill must stay
       // bit-identical run to run for the capture contract.
       this.sceneMgr.adaptPixelRatio(dtReal);
       this.sceneMgr.render();
     }
+  }
+
+  /**
+   * §7A.6c — the LENS, once per drawn frame.
+   *
+   * Two jobs, both of which have to happen after the camera has been posed
+   * (by the director OR by a pinned capture pose) and before the draw: keep
+   * the rain curtain centred on the lens, and decide whether this frame has a
+   * focal plane at all.
+   *
+   * DOF_MODES is the whole policy. A broadcast tele lens covering a football
+   * match is a long lens stopped well down — the near touchline and the far
+   * stand are both acceptably sharp, and defocusing either is the single
+   * fastest way to make a match look like a game instead of like television.
+   * The CLOSE rigs are the opposite: a scorer 3.8m from the lens on a 36°
+   * field of view has a depth of field measured in centimetres, and a
+   * celebration with the whole crowd in focus behind it is the tell-tale of a
+   * render. So: cutscenes, the celebration rig, the penalty and goal-line
+   * cams and the crowd cutaway get a lens; open play never does.
+   */
+  private syncLens(): void {
+    const camera = this.sceneMgr.camera;
+    if (this.rain) this.rain.update(0, camera);
+    const mode = this.cam.mode;
+    const close = mode === 'celebration' || mode === 'penalty' || mode === 'goalLine'
+      || mode === 'cine' || mode === 'crowd' || mode === 'external';
+    if (!close) {
+      this.sceneMgr.setDepthOfField(0, 10);
+      return;
+    }
+    // Focus on what the shot is OF. The celebration and cutscene rigs are
+    // pointed at a man (cam.subject, which the presentation layer moves); the
+    // dead-ball rigs are pointed at the ball.
+    const subj = this.cam.subject;
+    const useSubject = (mode === 'celebration' || mode === 'external' || mode === 'crowd')
+      && subj.lengthSq() > 1e-6;
+    const target = useSubject ? subj : this.ballMesh.root.position;
+    const dist = camera.position.distanceTo(target);
+    // the focal ZONE scales with the distance, the way a real one does: a
+    // third of the subject distance is roughly an f/4 lens at these focal
+    // lengths, and it keeps a whole sprinting player sharp rather than just
+    // his shirt number
+    this.sceneMgr.setDepthOfField(1, dist, Math.max(1.6, dist * 0.34));
   }
 
   // ------------------------------------------------------ capture harness
@@ -1067,6 +1132,7 @@ export class GameRenderer {
     // have to be re-picked before the counters are read or the still reports
     // triangles for a camera that isn't drawing it
     this.updateLOD();
+    this.syncLens();
 
     // one composer.render() is many gl draws — autoReset would leave us
     // reading only the last pass
@@ -1089,6 +1155,7 @@ export class GameRenderer {
    */
   renderStillLive(): { drawCalls: number; triangles: number } {
     this.updateLOD();
+    this.syncLens();
     const info = this.sceneMgr.renderer.info;
     const prevAutoReset = info.autoReset;
     info.autoReset = false;
@@ -1105,6 +1172,8 @@ export class GameRenderer {
     this.clearTrail();
     this.divots?.dispose();
     this.divots = null;
+    this.rain?.dispose();
+    this.rain = null;
     // the scene traversal in SceneManager frees whatever is attached to the
     // scene; the rig's shared geometries and the lab's texture caches are held
     // outside it and have to be freed by hand or a tournament strands them

@@ -32,7 +32,8 @@ import * as THREE from 'three';
 import { HALF_L, HALF_W } from '../sim/constants';
 import type { MatchEvent } from '../sim/matchEvents';
 import { Crowd, CROWD_DETAIL, type CrowdBlock, type CrowdReaction } from './crowd';
-import { applyShaderPatches, queueShaderPatch } from './materials';
+import { applyShaderPatches, queueShaderPatch, SHADOW_LAYER } from './materials';
+import { floodlightsLit } from './weather';
 import { FACADE_TILE_M, TERRACE_TILE_M, TextureLab } from './TextureLab';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
@@ -169,6 +170,28 @@ export class Stadium {
   private panes: Piece[] = [];
   /** lamp cells in the floodlight heads, ditto */
   private lamps: Piece[] = [];
+  /**
+   * §7A.4b — THE ROOF SHADOW.
+   *
+   * The bowl used to cast nothing, on the argument that "the structure that
+   * would throw a shadow anywhere the camera looks is 25m above the pitch and
+   * the sun is never low enough for it to reach". That is arithmetically
+   * wrong. The 'day' key sits at 26° of elevation, so a roof lip 23.5m up
+   * throws its line 48m along the ground — and the near touchline's roof lip
+   * is 22m outside the touchline, which lands the line at z ≈ +22, a third of
+   * the way across the pitch. That missing line is most of why the picture
+   * reads as "rendered, not filmed": a real late-afternoon broadcast is half
+   * sunlit grass and half roof shade, and the players cross the boundary.
+   *
+   * These are PROXIES, not the real roofs: four unit boxes in one
+   * InstancedMesh, on SHADOW_LAYER and nothing else, so the game camera never
+   * draws them and the cascades pay one draw call each. Casting off the real
+   * roof meshes would be four draws per cascade for the same silhouette; the
+   * trusses and columns under the roof are deliberately NOT casters, because
+   * at 48m of throw a 0.34m truss is a ~1-texel stripe that only ever reads as
+   * shadow-map aliasing.
+   */
+  private casters: Piece[] = [];
 
   /**
    * `hdrLamps` drives the floodlight heads' and the LED boards' emissive
@@ -181,6 +204,11 @@ export class Stadium {
     public size: StadiumSize = 'national', private hdrLamps = true,
     private profile?: QualityProfile, homeShirt = '#c8ccd4', awayShirt = '#8a93a8') {
     const night = tod === 'night';
+    // §7A.4c: the LAMPS are not the same question as the TIME. A wet Tuesday
+    // afternoon has the floodlights on and daylight in the stands, and the
+    // crowd bake, the seat shading and the impostor tints all still want
+    // 'day'. `night` dresses the bowl; `lampsLit` switches the rig on.
+    const lampsLit = floodlightsLit(tod);
     this.crowd = new Crowd(
       lab.crowdRng(), tod,
       CROWD_DETAIL[this.profile?.level ?? 'high'],
@@ -189,8 +217,8 @@ export class Stadium {
     this.buildBowl(scene, night, homeShirt, awayShirt);
     this.buildTunnel(scene, night);
     this.buildDugouts(scene, homeShirt, awayShirt);
-    this.buildFloodlights(scene, night);
-    this.buildAdBoards(scene, night);
+    this.buildFloodlights(scene, lampsLit);
+    this.buildAdBoards(scene, lampsLit);
     this.buildCornerFlags(scene);
     this.flushStructure(scene);
     const b = this.crowd.budget;
@@ -224,10 +252,9 @@ export class Stadium {
     if (list.length === 0) { geo.dispose(); mat.dispose(); return null; }
     const inst = new THREE.InstancedMesh(geo, mat, list.length);
     inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-    // The bowl never casts into the cascades: the structure that would throw a
-    // shadow anywhere the camera looks is 25m above the pitch and the sun is
-    // never low enough for it to reach, so this is a shadow pass paid for
-    // nothing. Receiving is off for the same reason instance shade is baked.
+    // The DRAWN bowl never casts into the cascades — see `casters` above for
+    // the proxy that does. Receiving is off for the same reason instance shade
+    // is baked.
     inst.castShadow = false;
     inst.receiveShadow = false;
     for (let i = 0; i < list.length; i++) {
@@ -253,12 +280,40 @@ export class Stadium {
       new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }));
     this.emit(scene, this.lamps, new THREE.BoxGeometry(1, 1, 1),
       new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }));
+    this.flushCasters(scene);
     if (boxes) {
       console.info(`stadium: ${this.pieces.length} structure + ${this.panes.length} panes`
         + ` + ${this.lamps.length} lamps = ${boxes} instances`
         + ` (${this.pieces.length * 12 + this.panes.length * 2 + this.lamps.length * 12} tris,`
         + ' 3 calls)');
     }
+  }
+
+  /**
+   * The shadow-caster proxy (see `casters`). One InstancedMesh whose layer mask
+   * is SHADOW_LAYER and nothing else, which is the project's standing
+   * convention for "drawn by the cascades, invisible to the game camera" — the
+   * same one the skinned players' shadow proxies use, so SceneManager.
+   * prepareShadowCasters() already knows what to do with it.
+   */
+  private flushCasters(scene: THREE.Scene): void {
+    if (this.retro || this.casters.length === 0) return;
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    // never shaded, never seen: the depth material is all that is ever drawn
+    const mat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const inst = new THREE.InstancedMesh(geo, mat, this.casters.length);
+    inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    for (let i = 0; i < this.casters.length; i++) inst.setMatrixAt(i, this.casters[i].m);
+    inst.instanceMatrix.needsUpdate = true;
+    inst.castShadow = true;
+    inst.receiveShadow = false;
+    // a 130m roof is never usefully culled against a cascade that covers the
+    // play area, and the bounding sphere of four stands is the whole bowl
+    inst.frustumCulled = false;
+    inst.layers.set(SHADOW_LAYER);
+    inst.computeBoundingSphere();
+    scene.add(inst);
+    console.info(`stadium: ${this.casters.length} roof shadow casters (1 call/cascade)`);
   }
 
   private get retro(): boolean {
@@ -525,6 +580,13 @@ export class Stadium {
       const roof = new THREE.Mesh(new THREE.BoxGeometry(s.len, 0.8, 13), roofMat);
       roof.position.set(0, spec.roofY, depth - 7);
       stand.add(roof);
+      // ...and its shadow (§7A.4b). The proxy runs from the roof lip all the
+      // way back to the outside wall, so nothing leaks between the slab's back
+      // edge and the facade at a low sun — the box is never seen, only its
+      // silhouette, so it costs nothing to make it the whole lid.
+      const lidD = 13 + (depth + 0.9 - (depth - 0.5));
+      this.piece(frame, 0, spec.roofY, depth - 7 + (lidD - 13) / 2,
+        s.len, 0.8, lidD, 0x000000, 1, this.casters);
       // Back wall — the only part of this building anyone sees from OUTSIDE,
       // which is the establishing shot's whole job. Precast panels and
       // stairwell glazing, tiled from the one facade bake.
@@ -969,7 +1031,9 @@ export class Stadium {
 
   // ------------------------------------------------------------ floodlights
 
-  private buildFloodlights(scene: THREE.Scene, night: boolean): void {
+  /** `lit` is floodlightsLit(), NOT "is it night" — see the constructor. */
+  private buildFloodlights(scene: THREE.Scene, lit: boolean): void {
+    const night = lit;
     const poleMat = new THREE.MeshPhongMaterial({ color: 0x3a4150 });
     const headMat = new THREE.MeshBasicMaterial({
       color: night ? 0xffffff : 0xd8dde8,
@@ -1071,7 +1135,8 @@ export class Stadium {
    * hand three back.
    */
   private buildFloodlightHead(head: THREE.Mesh, px: number, pz: number,
-    h: number, night: boolean): void {
+    h: number, lit: boolean): void {
+    const night = lit;
     const frame = new THREE.Matrix4().compose(
       head.position, head.quaternion, new THREE.Vector3(1, 1, 1));
     // the frame: dark, and a little larger than the lamps it carries
@@ -1122,7 +1187,8 @@ export class Stadium {
 
   // -------------------------------------------------------------- ad boards
 
-  private buildAdBoards(scene: THREE.Scene, night: boolean): void {
+  private buildAdBoards(scene: THREE.Scene, lit: boolean): void {
+    const night = lit;
     // one board segment per message, ringed around the pitch
     const H = 1.0;
     const segments: { x: number; z: number; rotY: number; w: number }[] = [];

@@ -374,7 +374,23 @@ man is a foul, from behind is a card.
 ## Match settings
 
 4 / 6 / 10 minute matches, three difficulties (Amateur / Pro / Legend — the CPU
-thinks better, the game never cheats physics), and three kickoff times.
+thinks better, the game never cheats physics), three kickoff times and four
+kinds of **WEATHER**.
+
+Weather is a lighting state, not a particle filter (§7A.4c, `src/render/weather.ts`).
+**CLEAR** is the sun you already know. **OVERCAST** collapses the key to a third
+and goes neutral, nearly doubles the sky fill, softens the stand shadow to a
+smudge and brings the fog wall in — the cloud deck becomes the light source.
+**RAIN** does all of that harder, switches the floodlights on against daylight,
+hangs one instanced camera-relative curtain of streaks in front of the lens and
+soaks the pitch (darker albedo, tighter specular lobe, a hard grazing sheen down
+the mowing bands). **FLOODLIT** forces the night rig whatever the kickoff time
+says. It composes with the kickoff time rather than replacing it, so a wet
+sunset is a real state and not a fourth hand-tuned preset.
+
+Set it in the match-setup strip, or with `?weather=clear|overcast|rain|night` on
+any entry point (the capture harness reads the same names from a shot's
+`"weather"` field).
 
 **GRAPHICS** picks the renderer: **HIGH** is the full stack (3 shadow cascades,
 MSAA + SMAA, HDR bloom, colour grade, PMREM sky). **MEDIUM** keeps the lighting

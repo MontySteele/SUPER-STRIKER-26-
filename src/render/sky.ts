@@ -31,6 +31,31 @@ export interface SkyPreset {
    * is how you end up with a flat pastel sky and no glow anywhere.
    */
   gain?: number;
+
+  // ------------------------------------------------------------- the deck
+  // §7A.4c. A flat gradient is the single most "this is a render" thing left
+  // in a wide shot: every real sky has SCALE in it, and scale comes from
+  // clouds getting smaller and flatter as they run to the horizon.
+  //
+  // The deck is a plane at a fixed height, sampled by ray-marching nothing at
+  // all: the view direction is intersected with y = CLOUD_H analytically, and
+  // the resulting ground-plane coordinate is fed to a 4-octave value-noise
+  // FBM. That gives true perspective foreshortening — the cells crowd
+  // together toward the horizon on their own — for the cost of ~20 ALU and no
+  // texture at all. The noise is a HASH of the seeded offset below, so a
+  // capture of the same shot is the same sky, pixel for pixel, forever.
+
+  /** 0 = clear, 1 = solid lid */
+  cloud?: number;
+  /** contrast of the deck: <1 soft stratus, >2 hard-edged cumulus */
+  cloudSharp?: number;
+  /** lit tops */
+  cloudColor?: number;
+  /** shaded bases — this is where an overcast's mood actually lives */
+  cloudShadow?: number;
+  /** metres per noise cell at the deck, and the seeded world offset */
+  cloudScale?: number;
+  cloudOffset?: [number, number];
 }
 
 const VERT = /* glsl */ `
@@ -51,7 +76,39 @@ const FRAG = /* glsl */ `
   uniform float sunSize;
   uniform float haze;
   uniform float gain;
+  uniform float cloud;
+  uniform float cloudSharp;
+  uniform vec3 cloudColor;
+  uniform vec3 cloudShadow;
+  uniform float cloudScale;
+  uniform vec2 cloudOffset;
   varying vec3 vDir;
+
+  // ---- value noise. Deterministic, seeded only through cloudOffset.
+  float ss26Hash(vec2 p) {
+    p = fract(p * vec2(0.3183099, 0.3678794));
+    p += dot(p, p + 19.19);
+    return fract(p.x * p.y * 95.4337);
+  }
+
+  float ss26Noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(
+      mix(ss26Hash(i), ss26Hash(i + vec2(1.0, 0.0)), u.x),
+      mix(ss26Hash(i + vec2(0.0, 1.0)), ss26Hash(i + vec2(1.0, 1.0)), u.x), u.y);
+  }
+
+  float ss26Fbm(vec2 p) {
+    float a = 0.5, s = 0.0;
+    for (int i = 0; i < 4; i++) {
+      s += a * ss26Noise(p);
+      p = p * 2.03 + 11.7;
+      a *= 0.5;
+    }
+    return s;
+  }
 
   void main() {
     vec3 d = normalize(vDir);
@@ -88,6 +145,39 @@ const FRAG = /* glsl */ `
     float wide = pow(max(cosA, 0.0), 9.0);
     c += sunColor * (disc * sunIntensity + tight * sunIntensity * 0.35 + wide * 0.28);
 
+    // ---- the cloud deck (see SkyPreset) ----
+    // Intersect the view ray with a plane 1 unit up. The 1/h is the whole
+    // perspective: at h = 0.9 (straight up) a cell is one unit across, at
+    // h = 0.05 (just over the roof line) it is twenty, so the deck runs away
+    // to the horizon by itself.
+    if (cloud > 0.001 && h > 0.0) {
+      vec2 pl = (d.xz / max(h, 0.012)) * cloudScale + cloudOffset;
+      // A 4-octave FBM with amplitudes 1/2..1/16 sums to at most 0.9375 and
+      // sits around 0.47, so the raw value covers barely a fifth of [0,1] —
+      // thresholding it directly is how you end up with three wisps and call
+      // it a sky. Normalise, then stretch the contrast so the deck actually
+      // has edges, and only then threshold.
+      float n = clamp((ss26Fbm(pl) * 1.0667 - 0.5) * 2.4 + 0.5, 0.0, 1.0);
+      // the cloud uniform slides the threshold: 0 is a clear day, 1 is a lid.
+      float thr = mix(0.80, 0.02, cloud);
+      float cover = smoothstep(thr, thr + 0.22, n);
+      // second, finer octave set for the ragged edge, gated on the first so
+      // the wisps only ever appear where there is cloud to be ragged
+      cover *= 0.72 + 0.28 * smoothstep(0.32, 0.78, ss26Fbm(pl * 3.1 + 5.0));
+      cover = pow(clamp(cover, 0.0, 1.0), max(cloudSharp, 0.05));
+      // Clouds do not exist at the horizon line — they run INTO it. Fading
+      // the deck out across the bottom 7° both hides the plane's own
+      // singularity and is what a real sky does.
+      cover *= smoothstep(0.0, 0.12, h);
+      // shading: a fourth octave stands in for the self-shadowing that makes
+      // a cumulus a solid object and a stratus a flat sheet
+      float lit = smoothstep(0.30, 0.74, ss26Fbm(pl * 1.7 - 3.0));
+      vec3 body = mix(cloudShadow, cloudColor, lit);
+      // ...and the sun still rims whatever is in front of it
+      body += sunColor * wide * 0.5 * (1.0 - lit) * step(0.01, sunIntensity);
+      c = mix(c, body * gain, cover);
+    }
+
     gl_FragColor = vec4(c, 1.0);
   }
 `;
@@ -104,6 +194,16 @@ export function makeSkyMaterial(p: SkyPreset): THREE.ShaderMaterial {
       sunSize: { value: p.sunSize },
       haze: { value: p.haze },
       gain: { value: p.gain ?? 1 },
+      cloud: { value: p.cloud ?? 0 },
+      cloudSharp: { value: p.cloudSharp ?? 1.6 },
+      cloudColor: { value: new THREE.Color(p.cloudColor ?? 0xf2f6fb) },
+      cloudShadow: { value: new THREE.Color(p.cloudShadow ?? 0x8fa3ba) },
+      // 0.42 cells per unit of (xz/y) puts a fair-weather cumulus at roughly
+      // the angular size one actually is from a stadium bowl
+      cloudScale: { value: p.cloudScale ?? 0.42 },
+      cloudOffset: {
+        value: new THREE.Vector2(...(p.cloudOffset ?? [17.31, 42.07])),
+      },
     },
     vertexShader: VERT,
     fragmentShader: FRAG,

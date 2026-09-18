@@ -3,20 +3,25 @@
 // the pass chain.
 //
 // HIGH / MEDIUM chain (one tone-map, in the grade):
-//   scene → [half-float RT, MSAA only at pixel ratio < 1.75]
-//         → UnrealBloom(threshold 1.3, strength 0.38)
-//         → TonemapGrade (ACES + split-tone + sharpen + vignette)
+//   scene → [half-float RT + DepthTexture, MSAA only at pixel ratio < 1.75]
+//         → DepthAO (half-res, 8 taps, writes no colour)
+//         → UnrealBloom(per-preset threshold/strength)
+//         → GradePass — ACES, AO, bokeh, aberration, lift/gain/contrast,
+//                       split-tone, sharpen, vignette, dither: ONE pass
 //         → SMAA → OutputPass(sRGB)                      … HIGH
 //         → OutputPass(sRGB) → FXAA                      … MEDIUM
 //
 // RETRO chain is the v1.1 stack, untouched: renderer-level ACES, bloom on the
-// tone-mapped image, the old contrast/saturation grade, OutputPass.
+// tone-mapped image, the old contrast/saturation grade, OutputPass. No depth
+// texture, no AO, no lens.
 //
-// GTAO was evaluated and cut. The scene is an open pitch under a single key —
-// the only thing worth occluding is the contact between a boot and the grass,
-// and the CSM cascades already put a real shadow there. A depth+normal prepass
-// for that is the worst frame-time trade in the whole chain, so it goes first,
-// exactly as §7A.6 says.
+// GTAO was evaluated and cut, and still is: three's GTAOPass and SSAOPass both
+// build a normal G-buffer by re-rendering the whole scene through an override
+// material, which is a second pass over 1.4k objects and 22 skinned rigs for
+// one screen-space effect. What replaced it (render/ao.ts) needs no prepass at
+// all — the composer's target now carries a real DepthTexture, so the geometry
+// pass that was already happening leaves the AO (and the grade's depth of
+// field) everything they need. That is ONE half-res fullscreen draw.
 
 import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
@@ -26,9 +31,10 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
 import { Atmosphere } from './Atmosphere';
+import { DepthAOPass } from './ao';
 import type { GrassBall, GrassField } from './grass';
 import { SHADOW_LAYER, setMaxAnisotropy } from './materials';
-import { RetroGradeShader, ScaledBloomPass, TonemapGradeShader } from './postFX';
+import { GradePass, RetroGradeShader, ScaledBloomPass, TonemapGradeShader } from './postFX';
 import {
   effectiveSamples, qualityProfile, qualitySetting,
   type QualityLevel, type QualityProfile,
@@ -137,6 +143,8 @@ export class SceneManager {
   readonly profile: QualityProfile;
   private bloom: ScaledBloomPass;
   private gradePass: ShaderPass;
+  /** §7A.6b — null on RETRO and on any level whose profile says aoStrength 0 */
+  private aoPass: DepthAOPass | null = null;
 
   private basePixelRatio: number;
   private ratioIdx = 0;
@@ -222,16 +230,44 @@ export class SceneManager {
       // is a pixel-ratio decision, not a quality-level one: on a 1x display it
       // cleans the geometry edges SMAA cannot (goal netting), and at 2x it
       // costs half the frame rate for edges that are already sub-pixel.
+      // §7A.6b: a real DepthTexture on the HDR target, so the AO pass and the
+      // grade's depth of field can both work from the geometry pass that was
+      // already happening instead of re-rendering the scene into a G-buffer.
+      // EffectComposer's renderTarget2 is a structural CLONE of this one, so
+      // it gets its own depth texture and the two never alias — which matters,
+      // because the pass chain's swap count is odd and the buffer the
+      // RenderPass draws into therefore alternates frame to frame.
+      const depthTexture = new THREE.DepthTexture(1, 1);
+      // Depth+stencil, and `stencilBuffer: true` below to go with it. These
+      // two have to AGREE. When the target is multisampled — which it is at
+      // pixel ratio 1, i.e. on an external monitor and in the capture harness
+      // — three allocates the MSAA depth attachment as DEPTH_COMPONENT24 or
+      // DEPTH24_STENCIL8 purely from `stencilBuffer`, and then blits it into
+      // this texture. A DEPTH24_STENCIL8 texture behind a DEPTH_COMPONENT24
+      // renderbuffer is "Depth/stencil buffer format combination not allowed
+      // for blit", every frame, and the whole composite comes out black.
+      depthTexture.format = THREE.DepthStencilFormat;
+      depthTexture.type = THREE.UnsignedInt248Type;
       const rt = new THREE.WebGLRenderTarget(1, 1, {
         type: THREE.HalfFloatType,
         // not profile.samples: MSAA is priced per device pixel, and on a
         // Retina panel the 4x half-float resolve alone costs more than the
         // entire rest of the frame (see effectiveSamples)
         samples: effectiveSamples(this.profile, this.basePixelRatio),
+        depthTexture,
+        stencilBuffer: true,
       });
       rt.texture.name = 'SS26.hdr';
       this.composer = new EffectComposer(this.renderer, rt);
       this.composer.addPass(new RenderPass(this.scene, this.camera));
+
+      // AO first, straight off the depth the RenderPass just wrote. It adds no
+      // colour pass of its own — the grade blurs and applies it.
+      if (this.profile.ao > 0) {
+        this.aoPass = new DepthAOPass(this.camera);
+        this.aoPass.setIntensity(1.0);
+        this.composer.addPass(this.aoPass);
+      }
 
       // Restraint (§7A.6). The threshold sits just ABOVE where a white shirt
       // in full key lands (~1.0 linear), because a white kit is the one thing
@@ -239,12 +275,38 @@ export class SceneManager {
       // is the exact "grey halo around the players" the spec is hunting.
       // What is left above the line is what should bloom: floodlight heads,
       // the sun disc and horizon, and the ball's specular.
-      this.bloom = new ScaledBloomPass(size.clone(), 0.38, 0.55, 1.3, this.profile.bloomScale);
+      // strength/threshold come from the preset now (§7A.6c): an overcast sky
+      // has nothing above the threshold in it and wants a lower one, and a
+      // sunset wants more of the glow it has earned
+      const g = this.atmos.grade;
+      this.bloom = new ScaledBloomPass(size.clone(),
+        g?.bloomStrength ?? 0.38, 0.55, g?.bloomThreshold ?? 1.3,
+        this.profile.bloomScale);
       this.composer.addPass(this.bloom);
 
-      this.gradePass = new ShaderPass(TonemapGradeShader);
+      this.gradePass = new GradePass();
       this.gradePass.uniforms.exposure.value = this.atmos.exposure;
       this.gradePass.uniforms.gradeAmount.value = this.profile.grade ? 1 : 0;
+      this.gradePass.uniforms.cameraRange.value.set(this.camera.near, this.camera.far);
+      if (g) {
+        const u = this.gradePass.uniforms;
+        u.contrast.value = g.contrast;
+        u.lift.value.copy(g.lift);
+        u.gain.value.copy(g.gain);
+        u.saturation.value = g.saturation;
+        u.vignette.value = g.vignette;
+        // MEDIUM is "the lighting model, minus the expensive half": the
+        // aberration is a two-tap lens affectation and goes with the grade it
+        // belongs to. AO does NOT — grounding a player in the turf is the
+        // lighting model.
+        u.chroma.value = this.profile.grade ? g.chroma : 0;
+        u.shadowTint.value.copy(g.shadowTint);
+        u.highlightTint.value.copy(g.highlightTint);
+      }
+      if (this.aoPass) {
+        this.gradePass.uniforms.tAO.value = this.aoPass.texture;
+        this.gradePass.uniforms.aoAmount.value = this.profile.ao;
+      }
       // A light sharpen only where it is paid for: SMAA is an edge-aware
       // reconstruction and leaves the image slightly soft, which at DPR 2 on a
       // Retina panel reads as "not quite in focus". FXAA (MEDIUM) is already a
@@ -506,12 +568,39 @@ export class SceneManager {
     this.atmos.onCameraChange();
   }
 
-  /** Keep the sharpen's taps one DEVICE pixel apart whatever the buffer is. */
+  /** Keep the sharpen's taps one DEVICE pixel apart — and the AO blur's taps
+   *  one AO texel apart — whatever the buffer is. */
   private syncTexel(): void {
     const t = this.gradePass.uniforms.texel;
     if (!t) return;
     const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
     t.value.set(1 / Math.max(size.x, 1), 1 / Math.max(size.y, 1));
+    const ao = this.aoPass;
+    const at = this.gradePass.uniforms.aoTexel;
+    if (ao && at) {
+      at.value.set(1 / Math.max(ao.target.width, 1), 1 / Math.max(ao.target.height, 1));
+    }
+  }
+
+  /**
+   * §7A.6c — depth of field, for CLOSE CAMERAS ONLY.
+   *
+   * The camera director owns the decision (see GameRenderer.syncLens): a
+   * cutscene, a celebration, a penalty, a keeper cam or a walkout gets a lens
+   * with a focal plane on its subject; the tele cam never does, because a
+   * broadcast long lens covering a football match is stopped down and
+   * everything from the near touchline to the far stand is acceptably sharp.
+   * Defocusing it is the single fastest way to make a game look like a game.
+   *
+   * `amount` 0 turns the whole block off — the uniform branch costs one
+   * compare on a frame that is not using it.
+   */
+  setDepthOfField(amount: number, focusMetres: number, rangeMetres = 3.5): void {
+    const u = this.gradePass.uniforms;
+    if (!u.dofAmount) return;    // RETRO's grade has no lens
+    u.dofAmount.value = this.profile.retro ? 0 : amount;
+    u.dofFocus.value = focusMetres;
+    u.dofRange.value = rangeMetres;
   }
 
   /** The drawing buffer the GPU is actually filling, in device pixels. */

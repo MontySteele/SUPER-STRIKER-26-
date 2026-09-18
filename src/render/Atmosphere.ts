@@ -24,6 +24,50 @@ import { Sky, type SkyPreset } from './sky';
 import { SHADOW_LAYER, applyShaderPatches } from './materials';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
+import { effectiveTimeOfDay, weatherProfile, type WeatherProfile } from './weather';
+
+/**
+ * The broadcast grade (§7A.6c), per preset.
+ *
+ * The old chain tone-mapped and then applied one fixed split-tone to every
+ * scene in the game, which is why day, sunset and night all read as the same
+ * lighting with three colour swaps. A grade belongs to a LOOK: a day match is
+ * a clean, slightly cool print with the contrast in the midtones; a sunset is
+ * a warm, heavily-vignetted one; a floodlit night is high-contrast, low
+ * saturation and blue in the lift. These travel with the preset for the same
+ * reason the fog colour does.
+ *
+ * lift/gain are the ASC-CDL pair, applied AFTER the tone-map in display space
+ * — a lift is "how far off black the blacks sit", which is a print property,
+ * not a scene one, and doing it in linear light just changes the exposure.
+ */
+export interface GradeSettings {
+  exposure: number;
+  contrast: number;
+  lift: THREE.Vector3;
+  gain: THREE.Vector3;
+  saturation: number;
+  vignette: number;
+  /** transverse chromatic aberration at the frame edge, in pixels */
+  chroma: number;
+  shadowTint: THREE.Vector3;
+  highlightTint: THREE.Vector3;
+  bloomStrength: number;
+  bloomThreshold: number;
+}
+
+interface GradePreset {
+  contrast: number;
+  lift: [number, number, number];
+  gain: [number, number, number];
+  saturation: number;
+  vignette: number;
+  chroma: number;
+  shadowTint: [number, number, number];
+  highlightTint: [number, number, number];
+  bloomStrength: number;
+  bloomThreshold: number;
+}
 
 interface Preset {
   sky: SkyPreset;
@@ -45,6 +89,16 @@ interface Preset {
   envIntensity: number;
   /** grade-pass exposure — ACES moved downstream, so this is the only dial */
   exposure: number;
+  /**
+   * How much direct light a SHADOWED fragment keeps, 0..1 (§7A.4b). Real
+   * broadcast shade is not the absence of the sun, it is the sun replaced by
+   * the sky — and now that the roof throws its line across a third of the
+   * pitch, a shadow that goes to pure hemisphere fill reads as a hole. three
+   * spells this the other way round (LightShadow.intensity is the fraction
+   * REMOVED), which is converted on the way in.
+   */
+  shadowLift: number;
+  grade: GradePreset;
 }
 
 const dir = (x: number, y: number, z: number): THREE.Vector3 =>
@@ -76,14 +130,34 @@ const PRESETS: Record<TimeOfDay, Preset> = {
       zenith: 0x2f6ec4, horizon: 0x9dc0e0, ground: 0x2c3a28,
       sun: 0xfff1d4, sunIntensity: 22, sunSize: 0.035, haze: 0.55,
       sunDir: dir(-0.62, 0.44, 0.65), gain: 1.35,
+      // fair-weather cumulus, small and high: the deck is what gives a wide
+      // shot its sense of how big the bowl is
+      cloud: 0.30, cloudSharp: 2.4,
+      cloudColor: 0xf6f9ff, cloudShadow: 0x9db2cb,
+      cloudScale: 1.6, cloudOffset: [17.31, 42.07],
     },
     sunDir: dir(-0.62, 0.44, 0.65),
     keyColor: 0xfff0d8, keyIntensity: 2.5,
-    hemiSky: 0x9cc4f2, hemiGround: 0x3d6b33, hemiIntensity: 0.42,
+    // The fill went up with the roof shadow (§7A.4b). Before it, nothing on
+    // the pitch was ever out of the key and the hemisphere was only doing the
+    // undersides; now a third of the pitch is lit BY IT, and 0.42 left that
+    // third looking like a power cut.
+    hemiSky: 0x9cc4f2, hemiGround: 0x3d6b33, hemiIntensity: 0.56,
     bounceColor: 0xffd9a8, bounceIntensity: 0.3, bounceDir: dir(0.7, 0.22, -0.6),
     fog: 0xb9d0e6, fogNear: 260, fogFar: 820,
-    envIntensity: 0.3,
+    envIntensity: 0.38,
     exposure: 1.15,
+    shadowLift: 0.26,
+    grade: {
+      contrast: 1.045,
+      // a print lift: the blacks sit a little off zero and a little blue,
+      // which is most of what separates "filmed" from "rendered"
+      lift: [0.004, 0.007, 0.014],
+      gain: [1.025, 1.0, 0.978],
+      saturation: 1.07, vignette: 0.17, chroma: 0.35,
+      shadowTint: [0.93, 1.0, 1.07], highlightTint: [1.05, 1.0, 0.94],
+      bloomStrength: 0.40, bloomThreshold: 1.2,
+    },
   },
   sunset: {
     sky: {
@@ -92,6 +166,12 @@ const PRESETS: Record<TimeOfDay, Preset> = {
       // frame on the bloom-check shot; 30 blew half the pitch out with it
       sun: 0xffc07a, sunIntensity: 15, sunSize: 0.04, haze: 0.7,
       sunDir: dir(-0.85, 0.3, 0.43), gain: 1.5,
+      // more of them, and lit from underneath: a low sun turns the bases of
+      // the deck the colour of the horizon band, which is the entire reason
+      // anyone photographs a sunset
+      cloud: 0.34, cloudSharp: 1.8,
+      cloudColor: 0xffd3a4, cloudShadow: 0xb08476,
+      cloudScale: 1.35, cloudOffset: [88.5, 11.9],
     },
     // ~17° elevation: still a long-shadow late-afternoon key, but not the 9°
     // that left a horizontal pitch taking 16% of the sun and the mowing
@@ -101,13 +181,36 @@ const PRESETS: Record<TimeOfDay, Preset> = {
     // the fill at dusk is the HALF of the sky the sun isn't in, which is
     // violet-blue. A warm fill under a warm key is what made the old sunset
     // read as one flat orange wash with grey shadows in it.
-    hemiSky: 0x93a8dd, hemiGround: 0x3c4a2c, hemiIntensity: 0.4,
+    hemiSky: 0x93a8dd, hemiGround: 0x3c4a2c, hemiIntensity: 0.52,
     bounceColor: 0xffcf9a, bounceIntensity: 0.3, bounceDir: dir(0.85, 0.3, -0.4),
     fog: 0x6b4a4e, fogNear: 220, fogFar: 720,
-    envIntensity: 0.26,
+    envIntensity: 0.32,
     // the low key still rakes the grass at a grazing angle here; much above
     // 1.1 and the sunlit half of the pitch clips to a flat cream sheet
     exposure: 1.05,
+    // A 17.5-degree sun puts the west stand's roof line at x = -11: SIXTY PER
+    // CENT of the pitch is in its shade, which is correct (it is why evening
+    // kick-offs look the way they do) and is also why this preset needs by far
+    // the biggest lift in the rig. At 0.24 the whole foreground of the
+    // low-sun shot went to near-black with the sunset sky's grazing reflection
+    // sitting on top of it in gold bands — an oil slick, not a pitch.
+    shadowLift: 0.55,
+    grade: {
+      // MUCH gentler than it started. The first pass at this preset ran
+      // contrast 1.11 with a 0.24 vignette on a scene whose midtones already
+      // sit at 0.2, and a contrast pivot is a MULTIPLIER on the distance from
+      // the pivot: 1.11 about 0.435 takes a 0.10 pixel to 0.063, i.e. it eats
+      // a third of everything already in shadow. On a low-sun shot, where
+      // most of the frame is exactly that, the pitch went black and the sky's
+      // grazing reflection was the only thing left on it. A print grade for a
+      // dim scene lives in the LIFT, not in the contrast.
+      contrast: 1.035,
+      lift: [0.012, 0.010, 0.020],
+      gain: [1.035, 1.0, 0.965],
+      saturation: 1.08, vignette: 0.18, chroma: 0.5,
+      shadowTint: [0.92, 0.99, 1.09], highlightTint: [1.06, 1.0, 0.92],
+      bloomStrength: 0.42, bloomThreshold: 1.2,
+    },
   },
   night: {
     // no sun: the key IS the floodlight rig, high and cool, and the "sky"
@@ -116,16 +219,86 @@ const PRESETS: Record<TimeOfDay, Preset> = {
       zenith: 0x03060f, horizon: 0x0e1c31, ground: 0x05080d,
       sun: 0xc8d8ff, sunIntensity: 1.4, sunSize: 0.012, haze: 0.4,
       sunDir: dir(0.4, 0.5, -0.7), gain: 1.0,
+      // a thin deck, lit from BELOW by the bowl — the orange underglow over a
+      // floodlit ground, which is the one cue that says "night match" from
+      // outside the stadium
+      cloud: 0.22, cloudSharp: 2.0,
+      cloudColor: 0x2c3a58, cloudShadow: 0x0d1424,
+      cloudScale: 1.15, cloudOffset: [5.02, 71.44],
     },
     sunDir: dir(-0.3, 0.9, 0.32),
     keyColor: 0xf0f5ff, keyIntensity: 2.9,
-    hemiSky: 0x24334f, hemiGround: 0x1a2c1c, hemiIntensity: 0.42,
+    hemiSky: 0x24334f, hemiGround: 0x1a2c1c, hemiIntensity: 0.44,
     bounceColor: 0xffe2b8, bounceIntensity: 0.2, bounceDir: dir(0.5, 0.5, -0.7),
     fog: 0x070c18, fogNear: 190, fogFar: 580,
     envIntensity: 0.5,
     exposure: 1.35,
+    // the floodlight rig is four banks, so nothing under it is ever fully
+    // shadowed — a single-source blackout is what makes a night render look
+    // like a moon landing
+    shadowLift: 0.30,
+    grade: {
+      contrast: 1.06,
+      lift: [0.003, 0.006, 0.015],
+      gain: [0.985, 1.0, 1.045],
+      saturation: 1.03, vignette: 0.22, chroma: 0.45,
+      shadowTint: [0.90, 0.97, 1.14], highlightTint: [1.02, 1.0, 0.99],
+      bloomStrength: 0.46, bloomThreshold: 1.25,
+    },
   },
 };
+
+/**
+ * Lay a weather over a time-of-day preset (§7A.4c). Nothing here invents a
+ * value — every field is the preset's own, bent by a ratio from
+ * WeatherProfile — which is what keeps "sunset in the rain" a real lighting
+ * state rather than a fourth hand-tuned preset nobody maintains.
+ */
+function applyWeather(p: Preset, w: WeatherProfile): Preset {
+  if (w.id === 'clear' || w.id === 'night') {
+    return { ...p, shadowLift: Math.max(p.shadowLift, w.shadowLift * 0.9) };
+  }
+  const mix = (hex: number, towards: number, t: number): number =>
+    new THREE.Color(hex).lerp(new THREE.Color(towards), t).getHex();
+  // Overcast daylight is 6500K and flat; the key keeps its own colour only in
+  // proportion to how much of it is left.
+  const OVERCAST_WHITE = 0xdfe6ef;
+  return {
+    ...p,
+    sky: {
+      ...p.sky,
+      sunIntensity: p.sky.sunIntensity * w.skySun,
+      gain: (p.sky.gain ?? 1) * w.skyGain,
+      haze: Math.min(1.2, p.sky.haze * 1.25),
+      cloud: w.cloud,
+      cloudSharp: w.cloudSharp,
+      // the deck goes the colour of the fog, because under a solid lid the
+      // deck IS the fog's light source
+      cloudColor: mix(p.sky.cloudColor ?? 0xf2f6fb, w.fogTint, w.fogGrey * 0.8),
+      cloudShadow: mix(p.sky.cloudShadow ?? 0x8fa3ba, 0x555f6b, w.fogGrey * 0.7),
+    },
+    keyColor: mix(p.keyColor, OVERCAST_WHITE, w.keyGrey),
+    keyIntensity: p.keyIntensity * w.key,
+    hemiSky: mix(p.hemiSky, w.fogTint, w.fogGrey * 0.6),
+    hemiIntensity: p.hemiIntensity * w.hemi,
+    bounceIntensity: p.bounceIntensity * (0.4 + 0.6 * w.key),
+    fog: mix(p.fog, w.fogTint, w.fogGrey),
+    fogNear: p.fogNear * w.fogNear,
+    fogFar: p.fogFar * w.fogFar,
+    envIntensity: p.envIntensity * w.env,
+    exposure: p.exposure * w.exposure,
+    shadowLift: Math.max(p.shadowLift, w.shadowLift),
+    grade: {
+      ...p.grade,
+      contrast: p.grade.contrast * (1 + w.fogGrey * 0.05),
+      saturation: p.grade.saturation * (1 - w.fogGrey * 0.22),
+      vignette: p.grade.vignette + w.fogGrey * 0.05,
+      // a flat sky has nothing above the bloom threshold in it, so the lamps
+      // and the white kits are all that is left to glow — let them
+      bloomThreshold: p.grade.bloomThreshold - w.fogGrey * 0.25,
+    },
+  };
+}
 
 /** The v1.1 rig, preserved verbatim for the RETRO level (§7A.7). */
 interface RetroPreset {
@@ -161,6 +334,14 @@ const CSM_MAX_FAR = 170;
 export class Atmosphere {
   /** grade-pass exposure this preset wants */
   readonly exposure: number;
+  /** the whole broadcast grade this preset+weather wants (§7A.6c). Null on
+   *  RETRO, which keeps the v1.1 grade verbatim. */
+  readonly grade: GradeSettings | null = null;
+  /** the weather this rig was built for — leaf modules read it from here so
+   *  there is one answer per scene, not one per call site */
+  readonly weather: WeatherProfile;
+  /** the time of day the scene is actually dressed for (weather=night wins) */
+  readonly tod: TimeOfDay;
 
   private hemi: THREE.HemisphereLight;
   private bounce: THREE.PointLight | null = null;
@@ -177,9 +358,14 @@ export class Atmosphere {
     private scene: THREE.Scene,
     private camera: THREE.PerspectiveCamera,
     renderer: THREE.WebGLRenderer,
-    tod: TimeOfDay,
+    todIn: TimeOfDay,
     private profile: QualityProfile,
   ) {
+    this.weather = weatherProfile();
+    // RETRO is the v1.1 rig and has no weather: it gets the time of day it
+    // asked for, unbent, because that look is a feature (§7A.7).
+    const tod = profile.retro ? todIn : effectiveTimeOfDay(todIn);
+    this.tod = tod;
     if (profile.retro) {
       const p = RETRO_PRESETS[tod];
       this.exposure = p.exposure;
@@ -207,8 +393,22 @@ export class Atmosphere {
       return;
     }
 
-    const p = PRESETS[tod];
+    const p = applyWeather(PRESETS[tod], this.weather);
     this.exposure = p.exposure;
+    const g = p.grade;
+    this.grade = {
+      exposure: p.exposure,
+      contrast: g.contrast,
+      lift: new THREE.Vector3(...g.lift),
+      gain: new THREE.Vector3(...g.gain),
+      saturation: g.saturation,
+      vignette: g.vignette,
+      chroma: g.chroma,
+      shadowTint: new THREE.Vector3(...g.shadowTint),
+      highlightTint: new THREE.Vector3(...g.highlightTint),
+      bloomStrength: g.bloomStrength,
+      bloomThreshold: g.bloomThreshold,
+    };
 
     this.hemi = new THREE.HemisphereLight(p.hemiSky, p.hemiGround, p.hemiIntensity);
     scene.add(this.hemi);
@@ -267,7 +467,13 @@ export class Atmosphere {
       // contact, same softness class.
       const fine = profile.shadowMapSize >= 2048;
       light.shadow.normalBias = fine ? 0.018 : 0.035;
-      light.shadow.radius = fine ? 3.0 : 2.2;
+      // ...plus the weather's own softening. An overcast shadow is a wide,
+      // shallow smudge and a rain shadow barely exists; both are the SAME
+      // five Vogel taps, spread further apart.
+      light.shadow.radius = (fine ? 3.0 : 2.2) + this.weather.shadowSoft;
+      // three counts this the other way round: `intensity` is how much light
+      // the shadow REMOVES. See Preset.shadowLift.
+      light.shadow.intensity = 1 - p.shadowLift;
     }
 
     if (profile.env) {

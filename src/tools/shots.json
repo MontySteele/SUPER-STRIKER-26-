@@ -481,6 +481,55 @@
       "timeOfDay": "day",
       "stadium": "national",
       "cam": { "pos": [14, 7.5, -22], "look": [2, 12, -56], "fov": 36 }
+    },
+
+    {
+      "name": "weather_overcast",
+      "note": "WEATHER (§7A.4c). tele_midfield's seed, frame and director camera exactly, under a solid cloud deck: the key collapses to a third and goes neutral, the fill nearly doubles, the roof shadow goes soft and shallow and the fog wall comes in. Diff it against tele_midfield — same pixels of geometry, entirely different light.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "weather": "overcast",
+      "stadium": "national",
+      "cam": "director"
+    },
+    {
+      "name": "weather_rain",
+      "note": "WEATHER. tele_midfield again, in rain: floodlights lit against daylight, the instanced camera-relative streaks, and the WET pitch — darker albedo, roughness down and a hard grazing sheen along the mowing bands. The wet-turf and particle-budget shot.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "weather": "rain",
+      "stadium": "national",
+      "cam": "director"
+    },
+    {
+      "name": "weather_night_floodlit",
+      "note": "WEATHER. tele_midfield's seed/frame/camera with weather=night, which forces the floodlit rig whatever the shot's timeOfDay says. The lamp cells, the flares and the night grade on the everyday broadcast framing rather than on the establishing crane.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "weather": "night",
+      "stadium": "national",
+      "cam": "director"
+    },
+    {
+      "name": "weather_clear_sky",
+      "note": "SKY (§7A.4c). A high corner of the national bowl tipped up at the cloud deck, so the procedural (seeded) clouds, their perspective foreshortening toward the horizon and the horizon band itself are the subject rather than an edge of the frame.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "weather": "clear",
+      "stadium": "national",
+      "cam": { "pos": [96, 30, 92], "look": [0, 46, 0], "fov": 46 }
     }
   ]
 }

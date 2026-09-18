@@ -15,6 +15,7 @@ import { Presentation } from '../present/director';
 import type { CamMode } from '../render/camera';
 import { preloadCharacters } from '../render/characterAssets';
 import { forceQuality, type QualityLevel } from '../render/quality';
+import { forceWeather, type Weather } from '../render/weather';
 import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
 import { SIM_DT } from '../sim/constants';
@@ -100,6 +101,12 @@ export interface ShotSpec {
   /** sim ticks to advance before the still is taken */
   frames: number;
   timeOfDay: TimeOfDay;
+  /**
+   * §7A.4c. Omitted = 'clear', which is what every pre-weather shot in the
+   * contract means and must keep meaning — a shot that silently inherited the
+   * browser profile's last weather would not be a baseline.
+   */
+  weather?: Weather;
   stadium: StadiumSize;
   /**
    * A pinned pose, or `"director"` to shoot from wherever the CameraDirector
@@ -269,6 +276,13 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
     const level = override === 'high' || override === 'medium' || override === 'retro'
       ? override : shot.quality ?? 'high';
     forceQuality(level);
+    // ...and the same rule for the weather: the shot's own, or an ad-hoc
+    // `&weather=` for a look at one the contract doesn't ask for.
+    const wOverride = new URLSearchParams(location.search).get('weather');
+    const weather: Weather = wOverride === 'clear' || wOverride === 'overcast'
+      || wOverride === 'rain' || wOverride === 'night'
+      ? wOverride : shot.weather ?? 'clear';
+    forceWeather(weather);
 
     // `?players=skinned` swaps the capsules for the authored characters. The
     // GLBs have to be in hand BEFORE the renderer is constructed or it falls
