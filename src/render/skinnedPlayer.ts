@@ -38,7 +38,7 @@
 import * as THREE from 'three';
 import type { PlayerData } from '../data/types';
 import type { ActionAnim } from '../sim/player';
-import { LOCO_CHAIN, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
+import { findBone, LOCO_CHAIN, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
   type ClipId, type PreparedClip } from './characterAssets';
 import type { KitSpec } from './playerMesh';
 
@@ -300,6 +300,7 @@ interface LocoEntry {
  *  which local axis runs down the bone. Survives any rig that keeps the Mixamo
  *  names but not its axes. */
 const _q = new THREE.Quaternion();
+const _v = new THREE.Vector3();
 const _pq = new THREE.Quaternion();
 function rotateBoneWorld(bone: THREE.Object3D, axis: THREE.Vector3, angle: number): void {
   if (Math.abs(angle) < 1e-4) return;
@@ -367,6 +368,8 @@ export class SkinnedPlayerMesh {
   private twist = 0;
   /** seconds of shield posture still owed after the sim's anim lapsed */
   private shieldHold = 0;
+  /** the two hand bones, looked up once on first use (see handsMidpoint) */
+  private hands: [THREE.Object3D, THREE.Object3D] | null | undefined;
   private actYaw = 0;
   private breathe: number;
 
@@ -598,6 +601,26 @@ export class SkinnedPlayerMesh {
    * Split out so an actor being driven by a script gets exactly the same
    * breathing, damping and bone overlay as one being driven by the match.
    */
+  /**
+   * World-space midpoint of the two hands as the mixer last posed them.
+   */
+  handsMidpoint(out: THREE.Vector3): boolean {
+    if (this.hands === undefined) {
+      const l = findBone(this.root, 'mixamorig:LeftHand');
+      const r = findBone(this.root, 'mixamorig:RightHand');
+      this.hands = l && r ? [l, r] : null;
+    }
+    if (!this.hands) return false;
+    // walk each hand's ancestor chain so this is right even on a frame that
+    // has not been drawn yet (the capture harness steps many ticks per draw)
+    this.hands[0].updateWorldMatrix(true, false);
+    this.hands[1].updateWorldMatrix(true, false);
+    out.setFromMatrixPosition(this.hands[0].matrixWorld);
+    _v.setFromMatrixPosition(this.hands[1].matrixWorld);
+    out.add(_v).multiplyScalar(0.5);
+    return true;
+  }
+
   private finish(dt: number, pose: Pose): void {
     // ---- tick
     let ticked = true;

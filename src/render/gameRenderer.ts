@@ -46,6 +46,10 @@ export interface PlayerView {
   /** §6.3 keeper state, for a pipeline that can use it. Outfielders get null;
    *  the capsule path does not implement this at all. */
   setKeeperState?(state: string | null, lateral: number, clip?: string | null): void;
+  /** World-space midpoint of the two hands, for drawing a HELD ball in the
+   *  gloves rather than at the sim's fixed chest offset. False when the
+   *  pipeline has no hands to speak of (capsules). */
+  handsMidpoint?(out: THREE.Vector3): boolean;
   update(dt: number, x: number, y: number, z: number, facing: number, speed: number,
     anim: ActionAnim, animT: number): void;
   dispose(): void;
@@ -196,6 +200,7 @@ export class GameRenderer {
   /** §7A.3c: the marks slide tackles leave on the turf. Null at RETRO, which
    *  is the v1.1 pitch and did not have them. */
   private divots: Divots | null = null;
+  private handsTmp = new THREE.Vector3();
 
   constructor(canvas: HTMLCanvasElement, private match: Match, timeOfDay: TimeOfDay,
     stadiumSize: StadiumSize = 'national') {
@@ -930,6 +935,22 @@ export class GameRenderer {
       ballX = this.prevBall[0] + (this.currBall[0] - this.prevBall[0]) * alpha;
       ballY = this.prevBall[1] + (this.currBall[1] - this.prevBall[1]) * alpha;
       ballZ = this.prevBall[2] + (this.currBall[2] - this.prevBall[2]) * alpha;
+      // A keeper holding the ball: the sim parks it half a metre ahead of him
+      // at chest height, which is where the CAPSULE's hands were. The skinned
+      // keeper's gloves are wherever his clip put them — low over a collect,
+      // at the hip in the hold idle — so the ball goes where the gloves are.
+      // Gameplay still reads the sim's position; only the picture moves.
+      for (const brain of this.match.keepers) {
+        if (brain.state !== 'hold') continue;
+        const i = this.match.allPlayers.indexOf(brain.keeper);
+        const view = i >= 0 ? this.playerMeshes[i] : undefined;
+        if (!view?.handsMidpoint?.(this.handsTmp)) continue;
+        const f = brain.keeper.facing;
+        // a hand's width forward so it sits in the palms, not on the wrists
+        ballX = this.handsTmp.x + Math.cos(f) * 0.10;
+        ballY = this.handsTmp.z + Math.sin(f) * 0.10;
+        ballZ = Math.max(this.handsTmp.y, 0.11);
+      }
       this.ballMesh.update(ballX, ballY, ballZ);
       if (this.trailPts.length) this.clearTrail();
       this.feedPlayContext(ballX, ballY);
