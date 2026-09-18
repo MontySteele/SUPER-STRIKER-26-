@@ -1156,7 +1156,10 @@ export class TextureLab {
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
       // a rake is seen at a grazing angle from every camera in the game
-      tex.anisotropy = maxAnisotropy();
+      // 4, not the max: the terrace is the biggest grazing-angle surface in
+      // the bowl and 16x on it cost ~2 ms/frame under the tele cam for a seat
+      // stripe nobody can resolve past the near tier
+      tex.anisotropy = Math.min(4, maxAnisotropy());
       return tex;
     });
   }
