@@ -206,6 +206,19 @@ export const SHELL_TILE_M = 0.5;
 // ~13%, which is the density that reads as turf rather than as a hairbrush.
 const SHELL_BLADES = 6000;
 
+// ------------------------------------------------------------- the bowl
+//
+// Metres of stand one tile of each stadium map covers. They are exported
+// because the tile only lines up with anything if the geometry sets `repeat`
+// from the same number the bake laid the tile out with — an aisle every 10m
+// and a precast panel 1.5m wide are facts about the STADIUM, not about the
+// canvas, and a hardcoded 10 in two files is how they stop agreeing.
+
+/** Width of one terrace tile: 18 seats at ~0.5m plus a ~0.94m aisle. */
+export const TERRACE_TILE_M = 10;
+/** Side of one facade tile: 8 precast panels across, 4 storeys up. */
+export const FACADE_TILE_M = 12;
+
 export class TextureLab {
   private field: NoiseField;
   /** kit / crowd bakes draw from their own stream, so adding a pitch octave
@@ -251,6 +264,17 @@ export class TextureLab {
    *  bowl is a pure function of the lab seed. */
   crowdRng(): RNG {
     return this.dressRng;
+  }
+
+  /**
+   * A FRESH stream off the lab seed, for callers that want determinism without
+   * joining the dressing queue. Anything that draws from crowdRng() shifts
+   * every kit and every fan drawn after it, so a new decoration — a band of
+   * executive windows, say — either gets its own salt here or silently
+   * reshuffles the whole bowl the day it is added.
+   */
+  stream(salt: number): RNG {
+    return new RNG(this.seed ^ salt);
   }
 
   /** Per-map bake times + the total, against the §7A.3 2s budget. */
@@ -1031,6 +1055,164 @@ export class TextureLab {
       // itself at the seam, which reads as two divots end to end
       tex.wrapS = THREE.ClampToEdgeWrapping;
       tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    });
+  }
+
+  /**
+   * ONE ROW of a terrace, tiled up the rake and along the stand (§7A.5).
+   *
+   * The tile is exactly one seat row deep and TERRACE_TILE_M of stand wide,
+   * which is what lets stadium.ts set `repeat.y` to the crowd's own row count:
+   * a seat then lands under every figure instead of near it, and the fans read
+   * as sitting IN the terrace rather than on a slab painted to look like one.
+   *
+   * Three things carry the read at broadcast distance, in this order: the dark
+   * band across the back of every row (the riser in its own shade — this is
+   * the per-row AO, and it is the whole illusion of steps on a flat plane),
+   * the vertical gaps between seat backs, and the aisle, which is a stair
+   * because the tile repeats and the tread/riser pair repeats with it.
+   *
+   * Seeded per seat: a little lightness jitter and the odd folded-up seat, so
+   * a 130m stand is not one colour swatch stretched thirteen times.
+   */
+  terraceSeats(seatHex: string): THREE.CanvasTexture {
+    return this.cached(`seats|${seatHex}`, 'terrace seats', () => {
+      const W = 1024, H = 128;
+      const [c, ctx] = canvas2d(W, H);
+      // its OWN stream: drawing from dressRng here would reshuffle every kit
+      // and every fan in the game the first time a stand changed colour
+      const rng = new RNG(this.seed ^ 0x5ea70a15);
+      const seat = new THREE.Color(seatHex);
+      const css = (col: THREE.Color, k: number): string =>
+        `rgb(${Math.round(clamp01(col.r * k) * 255)},`
+        + `${Math.round(clamp01(col.g * k) * 255)},`
+        + `${Math.round(clamp01(col.b * k) * 255)})`;
+
+      // canvas TOP is v=1, and the terrace plane's +v points at the pitch —
+      // so y=0 here is the FRONT (low) edge of the row and y=H the back (high)
+      const TREAD = 26;      // concrete in front of the seat
+      const SEAT_T = 30, SEAT_B = 94;
+      const AISLE = 96;      // ~0.94m of the 10m tile
+      const SEATS = 18;
+      const seatW = (W - AISLE) / SEATS;
+
+      ctx.fillStyle = '#4b515c';
+      ctx.fillRect(0, 0, W, H);
+      // the nosing: the lit front lip of this row's tread
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      ctx.fillRect(0, 0, W, 4);
+      ctx.fillStyle = 'rgba(0,0,0,0.10)';
+      ctx.fillRect(0, 4, W, TREAD - 4);
+
+      // the aisle is a flight of stairs: one tread + one riser per tile
+      ctx.fillStyle = '#5d646f';
+      ctx.fillRect(0, 0, AISLE, H);
+      ctx.fillStyle = 'rgba(255,255,255,0.13)';
+      ctx.fillRect(0, 2, AISLE, 30);
+      ctx.fillStyle = 'rgba(0,0,0,0.18)';
+      ctx.fillRect(AISLE - 3, 0, 3, H);
+
+      for (let i = 0; i < SEATS; i++) {
+        const x0 = AISLE + i * seatW;
+        const k = rng.range(0.86, 1.12);
+        // a folded-up / missing seat every twenty-odd: the stand is used
+        const empty = rng.next() < 0.05;
+        if (empty) {
+          ctx.fillStyle = 'rgba(0,0,0,0.42)';
+          ctx.fillRect(x0 + 3, SEAT_T + 14, seatW - 6, SEAT_B - SEAT_T - 14);
+          continue;
+        }
+        ctx.fillStyle = css(seat, k);
+        ctx.fillRect(x0 + 3, SEAT_T, seatW - 6, SEAT_B - SEAT_T);
+        // the moulded top edge catches the sky, the base sits in its own shade
+        ctx.fillStyle = css(seat, k * 1.26);
+        ctx.fillRect(x0 + 3, SEAT_T, seatW - 6, 7);
+        ctx.fillStyle = css(seat, k * 0.55);
+        ctx.fillRect(x0 + 3, SEAT_B - 11, seatW - 6, 11);
+        // the shadow one seat casts into the gap beside it
+        ctx.fillStyle = 'rgba(0,0,0,0.38)';
+        ctx.fillRect(x0 + seatW - 5, SEAT_T + 2, 2, SEAT_B - SEAT_T - 2);
+      }
+
+      // THE per-row AO: the riser behind this row, in the shade of the row
+      // above it. Everything above is detail; this is what makes it a step.
+      const ao = ctx.createLinearGradient(0, SEAT_B - 6, 0, H);
+      ao.addColorStop(0, 'rgba(0,0,0,0.10)');
+      ao.addColorStop(0.55, 'rgba(0,0,0,0.46)');
+      ao.addColorStop(1, 'rgba(0,0,0,0.72)');
+      ctx.fillStyle = ao;
+      ctx.fillRect(0, SEAT_B - 6, W, H - SEAT_B + 6);
+
+      // seeded grime, so the tile does not read as a repeated stamp
+      for (let i = 0; i < 260; i++) {
+        const x = rng.next() * W, y = rng.next() * H;
+        ctx.fillStyle = rng.next() < 0.5 ? 'rgba(0,0,0,0.10)' : 'rgba(255,255,255,0.05)';
+        ctx.fillRect(x, y, rng.range(2, 9), rng.range(1, 4));
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      // a rake is seen at a grazing angle from every camera in the game
+      tex.anisotropy = maxAnisotropy();
+      return tex;
+    });
+  }
+
+  /**
+   * The concrete outside of a stand: precast panel joints, floor bands and
+   * stairwell glazing. The back walls and the exterior pilasters wear it, and
+   * it is the only thing between the establishing shot and four black slabs.
+   * One tile covers FACADE_TILE_M square.
+   */
+  standFacade(): THREE.CanvasTexture {
+    return this.cached('facade', 'stand facade', () => {
+      const N = 512;
+      const [c, ctx] = canvas2d(N, N);
+      const rng = new RNG(this.seed ^ 0x0fac1de5);
+      ctx.fillStyle = '#39404d';
+      ctx.fillRect(0, 0, N, N);
+
+      // precast panels: 8 columns, 4 floors over the tile
+      const PW = N / 8, PH = N / 4;
+      for (let fy = 0; fy < 4; fy++) {
+        for (let fx = 0; fx < 8; fx++) {
+          const x = fx * PW, y = fy * PH;
+          ctx.fillStyle = `rgba(255,255,255,${rng.range(0.01, 0.055).toFixed(3)})`;
+          ctx.fillRect(x, y, PW, PH);
+          // panel joint: a dark shadow line with a lit lip under it
+          ctx.fillStyle = 'rgba(0,0,0,0.42)';
+          ctx.fillRect(x, y, 2, PH);
+          ctx.fillRect(x, y, PW, 3);
+          ctx.fillStyle = 'rgba(255,255,255,0.09)';
+          ctx.fillRect(x + 2, y + 3, PW - 2, 2);
+        }
+        // the floor band: a deeper recess every storey, with glazing in it
+        const by = fy * PH + PH * 0.30;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, by, N, PH * 0.26);
+        for (let w = 0; w < 16; w++) {
+          const x = w * (N / 16) + 4;
+          ctx.fillStyle = `rgba(14,18,26,${rng.range(0.55, 0.9).toFixed(2)})`;
+          ctx.fillRect(x, by + 3, N / 16 - 9, PH * 0.26 - 6);
+          ctx.fillStyle = 'rgba(150,175,205,0.10)';
+          ctx.fillRect(x, by + 3, N / 16 - 9, 3);
+        }
+      }
+      // weather: streaks running down from the bands
+      for (let i = 0; i < 90; i++) {
+        const x = rng.next() * N;
+        const y = rng.next() * N;
+        ctx.fillStyle = `rgba(0,0,0,${rng.range(0.03, 0.10).toFixed(3)})`;
+        ctx.fillRect(x, y, rng.range(1, 4), rng.range(8, 48));
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.anisotropy = Math.min(4, maxAnisotropy());
       return tex;
     });
   }

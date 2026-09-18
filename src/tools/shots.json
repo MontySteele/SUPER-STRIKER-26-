@@ -470,6 +470,17 @@
       "timeOfDay": "day",
       "stadium": "national",
       "cam": { "pos": [20, 3.0, -37], "look": [14, 4.6, -50], "fov": 36 }
+    },
+    {
+      "name": "stand_broadcast",
+      "note": "STADIUM. One whole stand from the pitch at broadcast height — ~25 m off the far touchline's front wall, 7.5 m up, framing front wall, both rakes, the roof line and the underside of the roof in one shot. This is the built-structure shot: terrace steps, fascia, trusses, columns and vomitories all read here and nowhere else. Fixed pose, daylight, nothing about it depends on the sim.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": { "pos": [14, 7.5, -22], "look": [2, 12, -56], "fov": 36 }
     }
   ]
 }

@@ -15,6 +15,15 @@
 // keep the cards, because at 40m up a card is exactly as good and a hundredth
 // of the cost.
 //
+// v1.5 is the BOWL AROUND the crowd, which had the same problem one layer out:
+// a stand made of people standing on a black slab under a black slab is still
+// a photograph of a stadium. So the terrace is now rows of seats with the step
+// shadow baked per row (TextureLab.terraceSeats, tiled at the crowd's own row
+// pitch so a seat lands under every figure), the roof has a soffit, trusses, a
+// fascia and columns, the masts have real heads, the stands have vomitories,
+// railings and a gantry, and the Mega Bowl has a band of executive glazing
+// that lights up at night. All of it is ONE instanced draw call — see Piece.
+//
 // Everything animated here is driven by the dt the renderer hands down, which
 // under capture is the harness's fixed virtual step — so a still is still a
 // pure function of its shot spec.
@@ -24,7 +33,7 @@ import { HALF_L, HALF_W } from '../sim/constants';
 import type { MatchEvent } from '../sim/matchEvents';
 import { Crowd, CROWD_DETAIL, type CrowdBlock, type CrowdReaction } from './crowd';
 import { applyShaderPatches, queueShaderPatch } from './materials';
-import { TextureLab } from './TextureLab';
+import { FACADE_TILE_M, TERRACE_TILE_M, TextureLab } from './TextureLab';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
 
@@ -75,6 +84,36 @@ const CARD_H = 1.75;
 /** The players' tunnel, cut into the front of the far touchline's lower tier.
  *  The block is taller than the opening because it has to hold the terrace up
  *  — which is why it interrupts the first few rows of seats. */
+/**
+ * §7A.5b — THE BUILT BOWL.
+ *
+ * Every hard surface added in v1.5 (roof trusses, the fascia, columns,
+ * pilasters, vomitory slots, railings, the gantry, the floodlight lattice and
+ * the Mega Bowl's tier lip) is a UNIT BOX in ONE InstancedMesh, tinted per
+ * instance. That is the whole budget trick: a stadium's structure is a few
+ * hundred boxes, and a few hundred boxes drawn one at a time is four hundred
+ * draw calls, which is the entire frame. Drawn as instances it is ONE, and the
+ * shade each piece sits in is baked into its instance colour the same way the
+ * crowd bakes its own — a truss under a roof is dark because it is under a
+ * roof, not because a light says so.
+ *
+ * Positions are built in STAND-LOCAL space (pitch toward -z, tiers rising
+ * toward +z) and multiplied by the stand's own frame on the way in, so the
+ * code reads the way the stand is drawn and the mesh still lives in the scene.
+ */
+interface Piece { m: THREE.Matrix4; c: THREE.Color; }
+
+/** Metres between roof cross-trusses, roof columns, exterior pilasters and
+ *  front-rail posts. Spacings, not counts: a 96m end and a 130m touchline get
+ *  the same rhythm, which is what stops the ends reading as a different
+ *  building. */
+const TRUSS_STEP = 5.5;
+const COLUMN_STEP = 11;
+const PILASTER_STEP = 8;
+const RAIL_POST_STEP = 3;
+/** Vomitory slots land on every other terrace aisle. */
+const VOM_STEP = TERRACE_TILE_M * 2;
+
 const TUNNEL_HALF_W = 3.4;
 const TUNNEL_H = 2.6;
 const TUNNEL_BLOCK_H = 3.5;
@@ -114,12 +153,22 @@ export class Stadium {
   /** virtual seconds since kick-off, driving every sway in the bowl */
   private clock = 0;
   private swayUniforms: { value: number }[] = [];
+  /** One per mast, carrying the head's position and aim. Since v1.5 the head
+   *  is a lattice of instances rather than a slab, so outside RETRO this mesh
+   *  is an invisible LOCATOR — the flares hang off its transform. */
   floodlightHeads: THREE.Mesh[] = [];
   /** The 3D crowd. Always constructed; inert (`live === false`) on RETRO. */
   readonly crowd: Crowd;
   /** billboard cards actually laid out, for the budget line */
   private cardCount = 0;
   private cardCalls = 0;
+  /** §7A.5b: every structural box in the bowl, drawn as one InstancedMesh */
+  private pieces: Piece[] = [];
+  /** the Mega Bowl's executive glazing — its own mesh because the panes are
+   *  unlit and, at night, overbright enough for the bloom to find them */
+  private panes: Piece[] = [];
+  /** lamp cells in the floodlight heads, ditto */
+  private lamps: Piece[] = [];
 
   /**
    * `hdrLamps` drives the floodlight heads' and the LED boards' emissive
@@ -137,16 +186,79 @@ export class Stadium {
       CROWD_DETAIL[this.profile?.level ?? 'high'],
       new THREE.Color(homeShirt), new THREE.Color(awayShirt),
     );
-    this.buildBowl(scene, night, homeShirt);
+    this.buildBowl(scene, night, homeShirt, awayShirt);
     this.buildTunnel(scene, night);
     this.buildDugouts(scene, homeShirt, awayShirt);
     this.buildFloodlights(scene, night);
     this.buildAdBoards(scene, night);
     this.buildCornerFlags(scene);
+    this.flushStructure(scene);
     const b = this.crowd.budget;
     console.info(`crowd: ${b.figures} 3D figures (${b.triangles} tris, ${b.drawCalls} calls)`
       + ` + ${this.cardCount} billboard cards (${this.cardCount * 2} tris,`
       + ` ${this.cardCalls} calls) — ${b.triangles + this.cardCount * 2} tris total`);
+  }
+
+  // ------------------------------------------------------------- structure
+
+  /**
+   * Place one unit box inside a stand's frame. `shade` is the fraction of the
+   * surface colour the piece keeps — the roof's underside is the same concrete
+   * as its top, it is simply never lit, and a 0.3 here is cheaper and steadier
+   * than trying to get a shadow map to say so from 40 metres up.
+   */
+  private piece(frame: THREE.Matrix4, x: number, y: number, z: number,
+    sx: number, sy: number, sz: number, hex: number, shade = 1,
+    into: Piece[] = this.pieces, rot?: THREE.Quaternion): void {
+    const m = new THREE.Matrix4().compose(
+      new THREE.Vector3(x, y, z),
+      rot ?? new THREE.Quaternion(),
+      new THREE.Vector3(sx, sy, sz),
+    );
+    into.push({ m: m.premultiply(frame), c: new THREE.Color(hex).multiplyScalar(shade) });
+  }
+
+  /** Emit one InstancedMesh from an accumulator, or nothing if it is empty. */
+  private emit(scene: THREE.Scene, list: Piece[], geo: THREE.BufferGeometry,
+    mat: THREE.Material): THREE.InstancedMesh | null {
+    if (list.length === 0) { geo.dispose(); mat.dispose(); return null; }
+    const inst = new THREE.InstancedMesh(geo, mat, list.length);
+    inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    // The bowl never casts into the cascades: the structure that would throw a
+    // shadow anywhere the camera looks is 25m above the pitch and the sun is
+    // never low enough for it to reach, so this is a shadow pass paid for
+    // nothing. Receiving is off for the same reason instance shade is baked.
+    inst.castShadow = false;
+    inst.receiveShadow = false;
+    for (let i = 0; i < list.length; i++) {
+      inst.setMatrixAt(i, list[i].m);
+      inst.setColorAt(i, list[i].c);
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    inst.computeBoundingSphere();
+    scene.add(inst);
+    return inst;
+  }
+
+  /**
+   * One draw call for the whole bowl's structure, one for its glazing, one for
+   * its lamps. Called once, after every builder has had its say.
+   */
+  private flushStructure(scene: THREE.Scene): void {
+    const boxes = this.pieces.length + this.panes.length + this.lamps.length;
+    this.emit(scene, this.pieces, new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 12 }));
+    this.emit(scene, this.panes, new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }));
+    this.emit(scene, this.lamps, new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, fog: true }));
+    if (boxes) {
+      console.info(`stadium: ${this.pieces.length} structure + ${this.panes.length} panes`
+        + ` + ${this.lamps.length} lamps = ${boxes} instances`
+        + ` (${this.pieces.length * 12 + this.panes.length * 2 + this.lamps.length * 12} tris,`
+        + ' 3 calls)');
+    }
   }
 
   private get retro(): boolean {
@@ -292,14 +404,19 @@ export class Stadium {
     this.cardCalls += 1;
   }
 
-  private buildBowl(scene: THREE.Scene, night: boolean, homeShirt: string): void {
+  private buildBowl(scene: THREE.Scene, night: boolean,
+    homeShirt: string, awayShirt: string): void {
     const concreteMat = new THREE.MeshPhongMaterial({ color: 0x2e3440 });
     const roofMat = new THREE.MeshPhongMaterial({ color: 0x454e5e, shininess: 30 });
-    // the back of the bowl behind the cards, so a gap between two cards shows
-    // stadium shadow and not sky
-    const voidMat = new THREE.MeshBasicMaterial({ color: night ? 0x0a0d14 : 0x171d27 });
     const crowdMat = this.retro ? null : this.crowdMaterial(night);
     const home = new THREE.Color(homeShirt);
+    // Club seat plastic, not club shirt: a stand full of shirt-saturated seats
+    // reads as a paint chip. Half-way to slate is where it stops being a swatch
+    // and starts being twenty thousand moulded chairs.
+    const plastic = (hex: string): string =>
+      `#${new THREE.Color(hex).lerp(new THREE.Color(0x39404e), 0.46).getHexString()}`;
+    const homeSeat = plastic(homeShirt);
+    const awaySeat = plastic(awayShirt);
 
     // One stand per side, built in local space with the pitch toward -z and
     // the tiers rising away toward +z, then rotated into place.
@@ -331,17 +448,33 @@ export class Stadium {
     ];
 
     const spec = SIZES[this.size];
+    const facade = this.retro ? null : this.lab.standFacade();
     stands.forEach((s, standIdx) => {
       const stand = new THREE.Group();
       const tiers = spec.tiers;
       const acc: CardAcc = { pos: [], rot: [], phase: [], col: [] };
+      // the stand's own frame, for the structural instances (§7A.5b)
+      const frame = new THREE.Matrix4().makeRotationY(s.rotY).setPosition(s.cx, 0, s.cz);
+      // whose colours this end wears. alle 1 = home support, 0 = away.
+      const seatHex = (s.alle0 + s.alle1) / 2 >= 0.5 ? homeSeat : awaySeat;
+      const tierDepth: number[] = [];
       let depth = 0;
       tiers.forEach((t, tierIdx) => {
         const theta = Math.atan2(t.rise, t.run);
         const rakeLen = Math.hypot(t.rise, t.run);
+        tierDepth.push(depth);
         if (crowdMat) {
-          // the terrace itself, dark, under the crowd
-          const floor = new THREE.Mesh(new THREE.PlaneGeometry(s.len, rakeLen), voidMat);
+          // The terrace itself: rows of seats, stepped, under the crowd. The
+          // texture is one ROW tall, so repeat.y is literally the row count —
+          // and for the tier with real people in it that count is the crowd's
+          // own, which is what puts a seat under every figure instead of a
+          // seat pattern behind them.
+          const rows = tierIdx === 0 && this.crowd.live
+            ? this.crowdRows(s.detail, rakeLen)
+            : Math.max(2, Math.floor(rakeLen / CARD_STEP_Y));
+          const floor = new THREE.Mesh(
+            this.terraceGeometry(s.len, rakeLen, tierIdx, tiers.length, night),
+            this.terraceMaterial(seatHex, s.len, rows, standIdx * 0.137));
           floor.rotation.x = -Math.PI / 2 - theta;
           floor.position.set(0, t.y0 + t.rise / 2, depth + t.run / 2);
           stand.add(floor);
@@ -392,10 +525,23 @@ export class Stadium {
       const roof = new THREE.Mesh(new THREE.BoxGeometry(s.len, 0.8, 13), roofMat);
       roof.position.set(0, spec.roofY, depth - 7);
       stand.add(roof);
-      // back wall
-      const back = new THREE.Mesh(new THREE.BoxGeometry(s.len, spec.roofY - 0.5, 1), concreteMat);
-      back.position.set(0, (spec.roofY - 0.5) / 2, depth + 0.4);
+      // Back wall — the only part of this building anyone sees from OUTSIDE,
+      // which is the establishing shot's whole job. Precast panels and
+      // stairwell glazing, tiled from the one facade bake.
+      const backH = spec.roofY - 0.5;
+      const back = new THREE.Mesh(new THREE.BoxGeometry(s.len, backH, 1),
+        facade ? this.facadeMaterial(facade, s.len, backH) : concreteMat);
+      back.position.set(0, backH / 2, depth + 0.4);
       stand.add(back);
+
+      if (!this.retro) {
+        this.buildRoofStructure(frame, s.len, spec.roofY, depth, standIdx === 1);
+        this.buildStandStructure(frame, s.len, spec.roofY, depth, tiers, tierDepth, s.gaps);
+        if (this.size === 'mega' && tiers.length >= 3) {
+          this.buildExecutiveBand(frame, s.len, tierDepth[2], night,
+            tiers[1].y0 + tiers[1].rise);
+        }
+      }
 
       // a few team flags in the lower tier of the two long stands (§7A.5)
       if (crowdMat && standIdx < 2) {
@@ -406,6 +552,237 @@ export class Stadium {
       stand.rotation.y = s.rotY;
       scene.add(stand);
     });
+  }
+
+  // ----------------------------------------------------------- the terrace
+
+  /**
+   * Rows of seats on THIS rake, matching crowd.seat()'s arithmetic exactly.
+   * Duplicated on purpose and duplicated small: the alternative is the crowd
+   * publishing its layout, and the layout is one line of arithmetic that the
+   * detail knob already makes per-stand.
+   */
+  private crowdRows(detail: number, rakeLen: number): number {
+    const det = CROWD_DETAIL[this.profile?.level ?? 'high'];
+    if (det.stepUp <= 0) return Math.max(2, Math.floor(rakeLen / CARD_STEP_Y));
+    const stepUp = det.stepUp / Math.max(0.5, Math.min(1, detail + 0.35));
+    return Math.max(1, Math.floor(rakeLen / stepUp));
+  }
+
+  /**
+   * The terrace plane, with the rake's depth gradient in its vertex colours.
+   *
+   * The seat texture carries the AO WITHIN a row (the riser in the shade of
+   * the row above). This carries the AO ALONG the rake: the front row is in
+   * daylight, the back rows are twenty metres under a roof, and the upper
+   * tiers are further under it again. Eight segments is enough for a gradient
+   * and costs fourteen triangles.
+   */
+  private terraceGeometry(len: number, rakeLen: number, tierIdx: number,
+    tierCount: number, night: boolean): THREE.PlaneGeometry {
+    const geo = new THREE.PlaneGeometry(len, rakeLen, 1, 8);
+    const pos = geo.attributes.position;
+    const col = new Float32Array(pos.count * 3);
+    // the plane's local +y points at the pitch once it is raked into place, so
+    // v = 1 is the FRONT of the tier and v = 0 the back, under the roof
+    const deep = 1 - (tierIdx / Math.max(1, tierCount - 1)) * 0.30;
+    const base = (night ? 0.44 : 0.98) * deep;
+    for (let i = 0; i < pos.count; i++) {
+      const v = (pos.getY(i) + rakeLen / 2) / rakeLen;
+      const k = base * (0.40 + 0.60 * v * v);
+      col[i * 3] = k; col[i * 3 + 1] = k; col[i * 3 + 2] = k * 1.03;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    return geo;
+  }
+
+  /**
+   * One rake's seat material. Unlit, like the crowd cards and for the same
+   * reason (§7A.4): the time of day is already baked into the vertex gradient
+   * above, and a lit terrace at night is a terrace that has to be re-tuned
+   * every time the key moves.
+   */
+  private terraceMaterial(seatHex: string, len: number, rows: number,
+    phase: number): THREE.MeshBasicMaterial {
+    const map = this.lab.terraceSeats(seatHex).clone();
+    map.needsUpdate = true;
+    map.repeat.set(len / TERRACE_TILE_M, rows);
+    // shift the aisles stand to stand, so the four sides of the bowl are not
+    // one stand shown four times
+    map.offset.set(phase, 0);
+    return new THREE.MeshBasicMaterial({ map, vertexColors: true, fog: true });
+  }
+
+  /** Back-wall concrete, tiled from the facade bake. */
+  private facadeMaterial(tex: THREE.Texture, len: number, h: number): THREE.MeshPhongMaterial {
+    const map = tex.clone();
+    map.needsUpdate = true;
+    map.repeat.set(len / FACADE_TILE_M, h / FACADE_TILE_M);
+    return new THREE.MeshPhongMaterial({ map, color: 0xb6bdc9, shininess: 6 });
+  }
+
+  // --------------------------------------------------------- roof structure
+
+  /**
+   * What is under a stadium roof: a dark soffit, cross-trusses every few
+   * metres, three purlins running the length, and — the piece that does more
+   * work than the rest of them together — a bright fascia along the front
+   * edge. A roof with a lit edge band reads as a roof from 150m; the same roof
+   * without one reads as a slab of night sky.
+   */
+  private buildRoofStructure(frame: THREE.Matrix4, len: number, roofY: number,
+    depth: number, gantry: boolean): void {
+    const zMid = depth - 7;      // the roof slab's own centre
+    const zFront = depth - 13.5; // its pitch-side edge
+    // soffit: the ceiling the trusses hang off
+    this.piece(frame, 0, roofY - 0.47, zMid, len, 0.12, 12.6, 0x3d4453, 0.34);
+    // cross-trusses
+    const nT = Math.max(2, Math.round(len / TRUSS_STEP));
+    for (let i = 0; i < nT; i++) {
+      const x = -len / 2 + (i + 0.5) * (len / nT);
+      this.piece(frame, x, roofY - 0.98, zMid, 0.34, 0.78, 12.4, 0x6a7384, 0.46);
+      // the diagonal that makes it a truss and not a joist
+      this.piece(frame, x, roofY - 1.30, zMid, 0.2, 0.2, 12.4, 0x6a7384, 0.34);
+    }
+    // purlins running the length of the stand
+    for (const dz of [-4.6, 0, 4.6]) {
+      this.piece(frame, 0, roofY - 1.42, zMid + dz, len, 0.3, 0.3, 0x6a7384, 0.42);
+    }
+    // the fascia band and the shadow line under it
+    this.piece(frame, 0, roofY - 0.1, zFront - 0.3, len, 1.3, 0.6, 0xa2abbb, 1.0);
+    this.piece(frame, 0, roofY - 0.92, zFront - 0.22, len, 0.4, 0.44, 0x2b313d, 0.6);
+    // a capping cornice along the back, so the outside has a top edge
+    this.piece(frame, 0, roofY + 0.5, depth + 0.5, len, 0.55, 1.9, 0x79828f, 1.0);
+
+    if (!gantry) return;
+    // The broadcast gantry, slung under the roof of the stand the tele camera
+    // looks AT — which is where a real one hangs and, not coincidentally,
+    // the only place the tele camera can ever see it.
+    const gy = roofY - 4.6, gz = zFront + 2.2;
+    this.piece(frame, 0, gy, gz, 7.2, 0.26, 2.6, 0x7b8494, 0.78);
+    this.piece(frame, 0, gy + 0.62, gz - 1.25, 7.2, 0.07, 0.07, 0xb9c1cd, 0.9);
+    for (const sx of [-1, 1]) {
+      this.piece(frame, sx * 3.3, gy + 2.3, gz, 0.16, 4.5, 0.16, 0x666f7e, 0.6);
+      this.piece(frame, sx * 3.3, gy + 0.62, gz - 1.25, 0.07, 1.2, 0.07, 0xb9c1cd, 0.9);
+    }
+    // the camera itself: a dark box on a head, which is all anyone ever sees
+    this.piece(frame, 1.1, gy + 0.55, gz - 1.5, 0.9, 0.5, 1.3, 0x12161d, 1.0);
+  }
+
+  // -------------------------------------------------------- stand structure
+
+  /**
+   * Columns, exterior pilasters, vomitory slots and the front rail — the four
+   * things that stop a rake being a ramp with people on it.
+   */
+  private buildStandStructure(frame: THREE.Matrix4, len: number, roofY: number,
+    depth: number, tiers: TierSpec[], tierDepth: number[],
+    gaps?: [number, number][]): void {
+    const blocked = (x: number): boolean =>
+      !!gaps?.some(([a, b]) => x > a - 1 && x < b + 1);
+
+    // roof columns, in the gap between the top rake and the back wall
+    const nC = Math.max(2, Math.round(len / COLUMN_STEP));
+    for (let i = 0; i < nC; i++) {
+      const x = -len / 2 + (i + 0.5) * (len / nC);
+      this.piece(frame, x, (roofY - 0.6) / 2 + 0.6, depth - 1.0,
+        0.62, roofY - 1.2, 0.62, 0x5c6473, 0.5);
+    }
+    // exterior pilasters: the relief that turns the outside of the bowl from
+    // a slab into a building
+    const nP = Math.max(2, Math.round(len / PILASTER_STEP));
+    for (let i = 0; i < nP; i++) {
+      const x = -len / 2 + (i + 0.5) * (len / nP);
+      this.piece(frame, x, (roofY - 0.9) / 2, depth + 1.1,
+        1.05, roofY - 0.9, 0.75, 0x767f8f, 0.55);
+    }
+    // Vomitories: the dark slots the stand empties through, cut into the front
+    // wall of the SECOND tier — where the aisles in the terrace below them run
+    // out of terrace, and the one such wall any camera in the game can see.
+    for (let ti = 1; ti < Math.min(2, tiers.length); ti++) {
+      const t = tiers[ti];
+      const below = tiers[ti - 1];
+      const y0 = below.y0 + below.rise;        // the concourse floor behind
+      const y1 = t.y0 + 0.2;                   // the top of this tier's wall
+      if (y1 - y0 < 0.8) continue;
+      const nV = Math.max(2, Math.round(len / VOM_STEP));
+      for (let i = 0; i < nV; i++) {
+        const x = -len / 2 + (i + 0.5) * (len / nV);
+        if (blocked(x)) continue;
+        this.piece(frame, x, (y0 + y1) / 2, tierDepth[ti] - 0.34,
+          2.9, y1 - y0, 0.85, 0x05070b, 1.0);
+        // the lit lintel over the mouth — a slot with a bright lip reads as a
+        // hole in a wall; the same slot without one reads as a black sticker
+        this.piece(frame, x, y1 + 0.12, tierDepth[ti] - 0.62,
+          3.3, 0.24, 0.5, 0xaab2c0, 0.55);
+      }
+    }
+    // The perimeter rail at the front of the near tier. Segmented so the
+    // tunnel mouth stays a mouth.
+    const railY = tiers[0].y0 + 0.75;
+    const nR = Math.max(4, Math.round(len / RAIL_POST_STEP));
+    for (let i = 0; i < nR; i++) {
+      const x = -len / 2 + (i + 0.5) * (len / nR);
+      if (blocked(x)) continue;
+      this.piece(frame, x, railY - 0.28, -0.45, 0.075, 0.56, 0.075, 0xc8cfda, 0.95);
+      // the rail itself, one short span per post: cheaper than a boolean and
+      // it lets the tunnel gap fall out of the same test
+      this.piece(frame, x, railY, -0.45, len / nR, 0.085, 0.085, 0xd6dce6, 1.0);
+    }
+  }
+
+  // ------------------------------------------------------- executive boxes
+
+  /**
+   * MEGA only (§7.1's 80k bowl): the overhanging lip of the third tier and the
+   * band of executive boxes tucked under it. At night the glazing is the one
+   * warm line across the top of the bowl, which is what an 80,000-seat ground
+   * looks like on television and what a 45,000-seat one does not.
+   */
+  private buildExecutiveBand(frame: THREE.Matrix4, len: number,
+    depth: number, night: boolean, prevTop: number): void {
+    // Where the band can physically go. The tier below fills everything up to
+    // `prevTop`, and the tier above starts at `depth` — so the boxes have to
+    // CANTILEVER forward, out over the back rows of the tier below, which is
+    // exactly what they do in a real ground. Buried flush with the third
+    // tier's front wall (the first attempt) they are behind twenty rows of
+    // seats and nobody ever sees a single lit window.
+    const y0 = prevTop + 0.25;
+    const y1 = y0 + 2.5;
+    const zC = depth - 1.7;    // 3.4m of overhang
+    this.piece(frame, 0, (y0 + y1) / 2, zC, len, y1 - y0, 3.4, 0x141922, 1.0);
+    // the third tier's leading edge, sitting on top of the band
+    this.piece(frame, 0, y1 + 0.6, zC - 0.2, len, 1.2, 4.2, 0x8f98a7, 1.0);
+    // and the shadow the overhang throws on the rows underneath it
+    this.piece(frame, 0, y0 - 0.2, zC, len, 0.4, 3.4, 0x11151c, 0.7);
+
+    const rng = this.lab.stream(0xb0c5e5);
+    const step = 3.6;
+    const n = Math.max(2, Math.round(len / step));
+    // the panes face the pitch, i.e. local -z, and a PlaneGeometry faces +z
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+    const warm = new THREE.Color();
+    for (let i = 0; i < n; i++) {
+      const x = -len / 2 + (i + 0.5) * (len / n);
+      if (night) {
+        // not every box is sold: a band of identical lit windows is an office
+        // block, and a band with a few dark ones is a stadium
+        const on = rng.next() > 0.22;
+        const k = on ? rng.range(0.95, 1.5) : rng.range(0.10, 0.18);
+        // linear space: with the HDR chain these have to clear the 1.3 bloom
+        // threshold to glow at all, and the hex path would sRGB-decode them
+        if (this.hdrLamps) warm.setRGB(k * 1.5, k * 1.28, k * 0.92, THREE.LinearSRGBColorSpace);
+        else warm.setRGB(k * 0.9, k * 0.82, k * 0.64, THREE.LinearSRGBColorSpace);
+      } else {
+        // daylight: glass is a dark mirror of the sky, with a little variance
+        warm.setHex(0x2b3648).multiplyScalar(rng.range(0.8, 1.25));
+      }
+      const m = new THREE.Matrix4().compose(
+        new THREE.Vector3(x, (y0 + y1) / 2, zC - 1.76), q,
+        new THREE.Vector3(len / n - 0.7, 1.8, 1),
+      );
+      this.panes.push({ m: m.premultiply(frame), c: warm.clone() });
+    }
   }
 
   /** Instanced waving flags held up in the lower tier, home-kit tinted. */
@@ -643,12 +1020,26 @@ export class Stadium {
       const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 1.1, h, 8), poleMat);
       pole.position.set(px, h / 2, pz);
       scene.add(pole);
-      // bank of lamps angled at the pitch — MeshBasicMaterial so bloom catches it
-      const head = new THREE.Mesh(new THREE.BoxGeometry(7, 4.5, 0.8), headMat);
+
+      // The head. v1.4 was one 7x4.5 white slab: at 150m that is a lamp, and
+      // at 60m — which is where the establishing shot and every corner replay
+      // put it — it is a glowing domino. A real head is a dark steel frame
+      // carrying a GRID of lamps, and the gaps between the lamps are what give
+      // the bloom its shape instead of a rectangle.
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1), headMat);
       head.position.set(px * 0.965, h + 0.5, pz * 0.95);
       head.lookAt(0, 0, 0);
+      head.visible = false;   // a locator, not a mesh: the lamps are instanced
       this.floodlightHeads.push(head);
       scene.add(head);
+      if (!this.retro) this.buildFloodlightHead(head, px, pz, h, night);
+      else {
+        // RETRO keeps v1.1's single slab, and keeps it drawn
+        head.geometry.dispose();
+        head.geometry = new THREE.BoxGeometry(7, 4.5, 0.8);
+        head.visible = true;
+      }
+
       if (flareMat) {
         const flare = new THREE.Sprite(flareMat);
         flare.position.copy(head.position);
@@ -667,6 +1058,64 @@ export class Stadium {
         // 15:1 — long enough to be a lens artefact and not a lit cloud
         streak.scale.set(96, 6.4, 1);
         scene.add(streak);
+      }
+    }
+  }
+
+  /**
+   * One floodlight head, built in the head's own frame: a steel backing frame,
+   * a cross-braced lattice behind it, the outrigger arms back to the mast, and
+   * a 6x3 grid of lamp cells. The cells go in their own overbright instanced
+   * mesh; everything else joins the bowl's structure mesh, so four heads cost
+   * one extra draw call between them and the four slab meshes they replace
+   * hand three back.
+   */
+  private buildFloodlightHead(head: THREE.Mesh, px: number, pz: number,
+    h: number, night: boolean): void {
+    const frame = new THREE.Matrix4().compose(
+      head.position, head.quaternion, new THREE.Vector3(1, 1, 1));
+    // the frame: dark, and a little larger than the lamps it carries
+    this.piece(frame, 0, 0, -0.35, 7.4, 4.9, 0.45, 0x2a3040, 0.85);
+    // lattice bracing across the back of it
+    for (const gx of [-2.4, 0, 2.4]) {
+      this.piece(frame, gx, 0, -0.85, 0.22, 5.1, 0.7, 0x424b5c, 0.8);
+    }
+    for (const gy of [-1.9, 1.9]) {
+      this.piece(frame, 0, gy, -0.85, 7.6, 0.22, 0.7, 0x424b5c, 0.8);
+    }
+    // the outriggers back to the mast head, and the mast's own top lattice
+    for (const sx of [-1, 1]) {
+      this.piece(frame, sx * 2.6, -2.2, -1.5, 0.2, 2.6, 2.2, 0x424b5c, 0.7);
+    }
+    const mast = new THREE.Matrix4().setPosition(px, 0, pz);
+    for (let i = 0; i < 5; i++) {
+      const y = h - 11 + i * 2.6;
+      this.piece(mast, 0, y, 0, 3.0, 0.2, 0.2, 0x424b5c, 0.75);
+      this.piece(mast, 0, y + 1.3, 0, 0.2, 0.2, 3.0, 0x424b5c, 0.75);
+    }
+    for (const sx of [-1, 1]) {
+      this.piece(mast, sx * 1.4, h - 5.5, 0, 0.22, 11.5, 0.22, 0x4d566a, 0.8);
+    }
+
+    // The lamps. Overbright in LINEAR space so the §7A.6 bloom (threshold 1.3)
+    // actually finds them; the outer cells are dimmed a little, which is what
+    // stops a 6x3 grid reading as one rectangle again.
+    const col = new THREE.Color();
+    const rng = this.lab.stream(0x1a3b7 + Math.round(px + pz));
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 6; c++) {
+        const lx = (c - 2.5) * 1.12;
+        const ly = (r - 1) * 1.45;
+        const edge = 1 - (Math.abs(c - 2.5) / 2.5) * 0.18 - Math.abs(r - 1) * 0.07;
+        const k = (night ? 4.6 : 1.3) * edge * rng.range(0.94, 1.06);
+        if (this.hdrLamps) col.setRGB(k, k, k * (night ? 1.02 : 1.05), THREE.LinearSRGBColorSpace);
+        else col.setRGB(1, 1, 1);
+        const m = new THREE.Matrix4().compose(
+          new THREE.Vector3(lx, ly, 0.02),
+          new THREE.Quaternion(),
+          new THREE.Vector3(0.95, 1.25, 0.22),
+        );
+        this.lamps.push({ m: m.premultiply(frame), c: col.clone() });
       }
     }
   }
