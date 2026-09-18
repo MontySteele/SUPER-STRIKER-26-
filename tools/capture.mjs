@@ -9,6 +9,7 @@
 //   npm run capture -- --shots midfield_wide,celebration_closeup
 //   npm run capture -- --out /tmp/before --url http://localhost:5173
 //   npm run capture -- --players skinned  # authored characters, not capsules
+//   npm run capture -- --fps 0            # skip the throughput loop (same pixels)
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -86,7 +87,14 @@ try {
       // --players skinned | capsule: which player pipeline the shot draws.
       // Same rules as --quality — an ad-hoc override, not a new baseline.
       const pl = typeof args.players === 'string' ? `&players=${encodeURIComponent(args.players)}` : '';
-      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}${pl}`,
+      // --fps 0 skips the page's 60-redraw throughput measurement (see the
+      // `&fps=0` note in src/tools/capture.ts). It changes NO pixel — the still
+      // is drawn exactly the same way — it only drops the timing loop, which
+      // under software rasterization is most of a wide shot's wall clock. The
+      // stats line then reports 0 fps, so a run taken this way is a framing /
+      // asset check and never a performance baseline.
+      const fp = String(args.fps) === '0' ? '&fps=0' : '';
+      await page.goto(`${base}/index.html?capture=${encodeURIComponent(shot.name)}${q}${pl}${fp}`,
         { waitUntil: 'load' });
       await page.waitForFunction(() => window.__ss26Capture?.ready === true,
         null, { timeout: SHOT_TIMEOUT_MS });

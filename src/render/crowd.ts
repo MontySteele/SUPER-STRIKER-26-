@@ -5,10 +5,23 @@
 // photograph: it has no silhouette, it cannot put its arms up, and the moment
 // the touchline cam drops to knee height the front row reads as wallpaper.
 //
-// So the tier nearest the pitch is now made of PEOPLE. One 62-triangle figure
-// — legs, torso, head, two arms and a scarf that only exists when it is held
-// overhead — instanced once per stand, with everything that makes a crowd a
-// crowd done on the GPU:
+// So the tier nearest the pitch is now made of PEOPLE. One 116-triangle figure
+// — two legs, torso, head, two arms and a scarf that only exists when it is
+// held overhead — instanced once per stand, with everything that makes a crowd
+// a crowd done on the GPU:
+//
+// v1.4 rebuilt that figure. The v1.3 one was six boxes, and six boxes is a
+// silhouette no resolution can save: a cube head, a slab chest and two
+// rectangles for arms read as a coloured box at every distance a broadcast
+// camera uses. The parts are swept tubes now — a domed head with a jaw and a
+// crown, a six-sided torso widest at the shoulders, two tapered legs with
+// daylight between them — which is 1.8x the triangles for TWO THIRDS of the
+// vertices, because a ring shares its vertices and a box does not. Vertices,
+// not triangles, are what a 3,500-instance crowd actually pays for, so the
+// figure got better AND cheaper on the axis that binds. On top of that: baked
+// per-vertex occlusion so a figure has depth in its own rows, a club accent
+// per instance (a scarf at the collar, a hat) kept separate from the coat, and
+// a permanent low-amplitude idle so a quiet stand never freezes solid.
 //
 //   • per-instance phase, so no two fans are on the same beat;
 //   • per-instance allegiance, so the home end can erupt while the away end
@@ -50,89 +63,250 @@ const PART_ARM_R = 4;
 const PART_SCARF = 5;
 
 /** Shoulder pivot, in the figure's local metres. Mirrored by the shader. */
-const SHOULDER_X = 0.255;
+const SHOULDER_X = 0.242;
 const SHOULDER_Y = 1.40;
 /** How far the whole upper body drops when a fan is sitting down. */
 const SIT_DROP = 0.36;
 
 /**
- * Append an axis-aligned box to the growing arrays. Hand-rolled rather than
- * BoxGeometry+merge because we need a per-vertex part id anyway, and a box is
- * twelve triangles of arithmetic.
+ * One cross-section of a body part. Parts are SWEPT TUBES now rather than
+ * boxes, and that is the whole trick of the v1.4 figure: a ring costs `sides`
+ * vertices and buys `sides` quads of silhouette, where a box spends four
+ * vertices per face and buys a corner.
  */
-function pushBox(
-  pos: number[], nrm: number[], part: number[], idx: number[],
-  cx: number, cy: number, cz: number, sx: number, sy: number, sz: number, id: number,
-): void {
-  const c = [cx, cy, cz];
-  const h = [sx / 2, sy / 2, sz / 2];
-  // One entry per face: the axis the normal points along, its sign, and the
-  // two tangent axes that sweep the quad. The tangent pair is chosen so that
-  // u x v == +n — get that backwards and half the box is back-facing, which on
-  // a FrontSide material is a fan with no chest.
-  const faces: [number, number, number, number][] = [
-    [0, 1, 1, 2], [0, -1, 1, 2],
-    [1, 1, 2, 0], [1, -1, 2, 0],
-    [2, 1, 0, 1], [2, -1, 0, 1],
-  ];
-  for (const [na, ns, ua, va] of faces) {
-    const base = pos.length / 3;
-    for (const [su, sv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
-      const v3 = [c[0], c[1], c[2]];
-      v3[na] += ns * h[na];
-      // wind the +normal faces one way and the -normal faces the other, so
-      // every triangle is front-facing from outside the box
-      v3[ua] += su * ns * h[ua];
-      v3[va] += sv * h[va];
-      pos.push(v3[0], v3[1], v3[2]);
-      const n3 = [0, 0, 0];
-      n3[na] = ns;
-      nrm.push(n3[0], n3[1], n3[2]);
-      part.push(id);
-    }
-    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
-  }
+interface Ring {
+  y: number;
+  /** half-width along x and half-depth along z — an ellipse, not a circle */
+  rx: number; rz: number;
+  /** lateral offset of the whole ring (the two legs, the two arms) */
+  cx?: number;
+  /** baked ambient occlusion. 1 = open to the sky, 0.4 = buried in the row */
+  ao: number;
 }
 
-/** A single-quad panel in the XY plane facing +z (the scarf). */
-function pushQuad(
-  pos: number[], nrm: number[], part: number[], idx: number[],
-  cx: number, cy: number, cz: number, w: number, h: number, id: number,
-): void {
-  const base = pos.length / 3;
-  for (const [su, sv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
-    pos.push(cx + su * w / 2, cy + sv * h / 2, cz);
-    nrm.push(0, 0, 1);
-    part.push(id);
-  }
-  idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+interface TubeOpts {
+  sides: number;
+  /** angular offset in radians. 0 puts a FACE toward +z on an even side count,
+   *  which is what gives the torso a flat chest and rounded flanks. */
+  phase?: number;
+  /** collapse the top into one point at this y — the crown of a head */
+  apexTop?: number;
+  apexAO?: number;
+  /** flat polygon caps, fanned off vertex 0, so `sides - 2` triangles */
+  capTop?: boolean;
+  capBottom?: boolean;
 }
 
 /**
- * The fan. 62 triangles, origin between the feet, facing +z (i.e. toward the
- * pitch once the instance is turned round). Deliberately blocky: at the range
- * a stand is ever seen from, a rounded limb costs triangles and buys nothing —
- * what reads is the silhouette and whether the arms are up.
+ * Sweep a closed profile and append it to the growing arrays. Vertices are
+ * SHARED around the ring and between rings, which is what pays for the extra
+ * silhouette: the v1.3 box fan was 62 triangles across 148 vertices, this one
+ * is 116 triangles across 103. Nearly twice the triangles for two thirds of the
+ * vertex shader invocations — and the vertex shader is where a crowd costs.
+ */
+function pushTube(
+  pos: number[], nrm: number[], part: number[], occ: number[], idx: number[],
+  rings: Ring[], id: number, o: TubeOpts,
+): void {
+  const sides = o.sides;
+  const phase = o.phase ?? 0;
+  const base = pos.length / 3;
+  const n = rings.length;
+  // the apex counts as a zero-radius ring purely so the last real ring's
+  // normal knows to lean in toward it
+  const prof = rings.map((r) => ({ y: r.y, r: (r.rx + r.rz) * 0.5 }));
+  if (o.apexTop !== undefined) prof.push({ y: o.apexTop, r: 0 });
+
+  for (let i = 0; i < n; i++) {
+    const r = rings[i];
+    const a = prof[Math.max(0, i - 1)], b = prof[Math.min(prof.length - 1, i + 1)];
+    const dr = b.r - a.r, dy = b.y - a.y;
+    const pl = Math.hypot(dr, dy) || 1;
+    // in the (radius, y) plane the outward normal of the profile is (dy, -dr)
+    const nr = dy / pl, ny = -dr / pl;
+    for (let s = 0; s < sides; s++) {
+      const ang = phase + (s / sides) * Math.PI * 2;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      pos.push((r.cx ?? 0) + ca * r.rx, r.y, sa * r.rz);
+      // The outward normal of an ELLIPSE is the gradient (cos/rx, sin/rz), not
+      // the radius direction. Get that wrong on a 0.25 x 0.13 torso and the
+      // chest lights like a cylinder — every fan in the stand with the same
+      // bright band down the middle, which is exactly the "it's a texture"
+      // tell the whole file is trying to avoid.
+      let hx = ca / Math.max(1e-4, r.rx), hz = sa / Math.max(1e-4, r.rz);
+      const hl = Math.hypot(hx, hz) || 1;
+      hx /= hl; hz /= hl;
+      const vx = hx * nr, vz = hz * nr;
+      const vl = Math.hypot(vx, ny, vz) || 1;
+      nrm.push(vx / vl, ny / vl, vz / vl);
+      part.push(id);
+      occ.push(r.ao);
+    }
+  }
+  for (let i = 0; i < n - 1; i++) {
+    for (let s = 0; s < sides; s++) {
+      const s2 = (s + 1) % sides;
+      const a0 = base + i * sides + s, a1 = base + i * sides + s2;
+      const b0 = base + (i + 1) * sides + s, b1 = base + (i + 1) * sides + s2;
+      idx.push(a0, b0, b1, a0, b1, a1);
+    }
+  }
+  const top = base + (n - 1) * sides;
+  if (o.apexTop !== undefined) {
+    const apex = pos.length / 3;
+    pos.push(0, o.apexTop, 0);
+    nrm.push(0, 1, 0);
+    part.push(id);
+    occ.push(o.apexAO ?? rings[n - 1].ao);
+    for (let s = 0; s < sides; s++) idx.push(apex, top + ((s + 1) % sides), top + s);
+  } else if (o.capTop) {
+    pushCap(pos, nrm, part, occ, idx, rings[n - 1], sides, phase, id, 1);
+  }
+  if (o.capBottom) {
+    pushCap(pos, nrm, part, occ, idx, rings[0], sides, phase, id, -1);
+  }
+}
+
+/**
+ * A flat polygon lid on a ring. It gets its OWN vertices rather than reusing
+ * the ring's: the side wall's normals point outward and, on a flaring profile,
+ * slightly DOWN, so a cap that borrows them shades its top surface as if it
+ * were facing the floor. On the torso that surface is the shoulders, which
+ * under a floodlight rig pointing almost straight down is the brightest thing
+ * on a fan — borrowing the wall's normals there put the whole night crowd's
+ * shoulders in shadow. `sides - 2` triangles, fanned off vertex 0.
+ */
+function pushCap(
+  pos: number[], nrm: number[], part: number[], occ: number[], idx: number[],
+  r: Ring, sides: number, phase: number, id: number, dir: 1 | -1,
+): void {
+  const base = pos.length / 3;
+  for (let s = 0; s < sides; s++) {
+    const ang = phase + (s / sides) * Math.PI * 2;
+    pos.push((r.cx ?? 0) + Math.cos(ang) * r.rx, r.y, Math.sin(ang) * r.rz);
+    nrm.push(0, dir, 0);
+    part.push(id);
+    occ.push(r.ao);
+  }
+  for (let s = 1; s < sides - 1; s++) {
+    if (dir > 0) idx.push(base, base + s + 1, base + s);
+    else idx.push(base, base + s, base + s + 1);
+  }
+}
+
+/** The held-up scarf: a four-column strip, so the shader has something to flap. */
+function pushScarf(
+  pos: number[], nrm: number[], part: number[], occ: number[], idx: number[],
+): void {
+  const COLS = 3, W = 1.04, H = 0.19, Z = 0.13;
+  const base = pos.length / 3;
+  for (let c = 0; c <= COLS; c++) {
+    const x = -W / 2 + (W * c) / COLS;
+    for (const sv of [-1, 1]) {
+      pos.push(x, SHOULDER_Y + sv * H / 2, Z);
+      nrm.push(0, 0, 1);
+      part.push(PART_SCARF);
+      occ.push(1.06);
+    }
+  }
+  for (let c = 0; c < COLS; c++) {
+    const a = base + c * 2, b = a + 1, d = a + 2, e = a + 3;
+    idx.push(a, d, e, a, e, b);
+  }
+}
+
+/**
+ * The fan. 116 triangles across 103 vertices, origin between the feet, facing
+ * +z (i.e. toward the pitch once the instance is turned round).
+ *
+ * v1.4: the boxes are gone. What the owner saw from a broadcast camera was not
+ * low resolution, it was six cuboids — a slab chest, a cube head and two
+ * rectangles for arms, which is a silhouette no number of pixels can rescue.
+ * So: an eight-sided head that domes into a crown, a six-sided torso widest at
+ * the shoulders and tapered to the hips, TWO tapered legs with daylight between
+ * them, and arms that thin toward the wrist. The gap between the ankles is
+ * worth more at 15 m than anything that happens above the waist.
+ *
+ * Every part id, both shoulder pivots and the y/z span the seated-lap morph
+ * folds are unchanged, so the pose GLSL below — the arm raise, the sit, the
+ * Mexican wave — is untouched contract.
  */
 export function buildFanGeometry(): THREE.BufferGeometry {
-  const pos: number[] = [], nrm: number[] = [], part: number[] = [], idx: number[] = [];
-  pushBox(pos, nrm, part, idx, 0, 0.41, 0, 0.34, 0.82, 0.24, PART_LEGS);
-  pushBox(pos, nrm, part, idx, 0, 1.11, 0, 0.48, 0.60, 0.26, PART_TORSO);
-  pushBox(pos, nrm, part, idx, 0, 1.545, 0.005, 0.22, 0.25, 0.21, PART_HEAD);
-  pushBox(pos, nrm, part, idx, -SHOULDER_X, 1.11, 0, 0.115, 0.60, 0.15, PART_ARM_L);
-  pushBox(pos, nrm, part, idx, SHOULDER_X, 1.11, 0, 0.115, 0.60, 0.15, PART_ARM_R);
-  pushQuad(pos, nrm, part, idx, 0, SHOULDER_Y, 0.13, 1.0, 0.18, PART_SCARF);
+  const pos: number[] = [], nrm: number[] = [], part: number[] = [],
+    occ: number[] = [], idx: number[] = [];
+
+  // Legs: two of them, spanning y 0..0.84 and z ±0.10 — the span the shader's
+  // seated-lap morph folds, so sitting down still works unchanged. No sole cap:
+  // the only camera that could see one is under the terrace.
+  for (const sx of [-1, 1]) {
+    pushTube(pos, nrm, part, occ, idx, [
+      { y: 0.00, rx: 0.083, rz: 0.101, cx: sx * 0.090, ao: 0.58 },
+      { y: 0.84, rx: 0.112, rz: 0.127, cx: sx * 0.090, ao: 0.80 },
+    ], PART_LEGS, { sides: 4, phase: Math.PI / 4 });
+  }
+
+  // Torso: six-sided, flat chest and back. 0.46 m across the coat and 0.65 m
+  // across the shoulders once the sleeves are on, which is ~85% of the 0.80 m
+  // seat pitch — a sold-out stand is a near-continuous wall of shoulders, and
+  // an anatomically slim figure left it reading half empty with terrace showing
+  // between every fan. The RIBCAGE is still narrower than the shoulder line and
+  // the ARMS still make up the rest, because that is what gives a sleeve a
+  // silhouette to be seen against.
+  //
+  // The hem is at 0.62, well below the crotch, so the coat — not two separate
+  // legs — is what the eye reads down to mid-thigh. Standing that closes the
+  // daylight between the legs; seated (upper body drops 0.36, the lap lands at
+  // ~0.46) the hem at 0.26 still covers the join.
+  //
+  // Four rings: the widest is the shoulder line at 1.31 and the one above it
+  // pulls back in toward the neck, so the shoulders slope. That top ring also
+  // gives the shader's scarf band one 9 cm strip to land in, instead of a
+  // gradient half way down the chest that read as a printed card.
+  pushTube(pos, nrm, part, occ, idx, [
+    { y: 0.620, rx: 0.196, rz: 0.140, ao: 0.70 },
+    { y: 1.060, rx: 0.212, rz: 0.152, ao: 0.86 },
+    { y: 1.300, rx: 0.232, rz: 0.158, ao: 0.96 },
+    // the collar sits ABOVE the arm pivot: a top ring level with the shoulders
+    // left 7 cm of bare neck standing out of the coat on every fan in the
+    // ground, which from the front row is a stand full of tortoises
+    { y: 1.425, rx: 0.174, rz: 0.130, ao: 1.00 },
+  ], PART_TORSO, { sides: 6, capTop: true, capBottom: true });
+
+  // Head: neck, jaw, crown, dome. Two rings gave a cone — a party hat on a
+  // rectangle — because a neck straight to a point IS a cone. The crown ring
+  // pulling back in above the jaw is the whole difference between a head and a
+  // traffic bollard, and it costs six triangles.
+  pushTube(pos, nrm, part, occ, idx, [
+    { y: 1.360, rx: 0.056, rz: 0.054, ao: 0.76 },
+    { y: 1.450, rx: 0.098, rz: 0.094, ao: 0.98 },
+    { y: 1.548, rx: 0.090, rz: 0.088, ao: 1.04 },
+  ], PART_HEAD, { sides: 6, apexTop: 1.596, apexAO: 1.08 });
+
+  // Arms: tapered to the wrist, grazing the torso all the way down and standing
+  // 7 cm proud of it, which is the whole shoulder line. The AO is a good deal
+  // darker than the chest's on purpose — an arm hanging against a body is in
+  // that body's shadow, and that difference is the only thing separating a
+  // sleeve from the coat it is touching when both are the same colour.
+  for (const [side, id] of [[-1, PART_ARM_L], [1, PART_ARM_R]] as const) {
+    pushTube(pos, nrm, part, occ, idx, [
+      { y: 0.840, rx: 0.056, rz: 0.060, cx: side * SHOULDER_X, ao: 0.70 },
+      { y: 1.375, rx: 0.080, rz: 0.088, cx: side * SHOULDER_X, ao: 0.90 },
+    ], id, { sides: 4, phase: Math.PI / 4, capBottom: true });
+  }
+
+  pushScarf(pos, nrm, part, occ, idx);
 
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
   g.setAttribute('aPart', new THREE.Float32BufferAttribute(part, 1));
+  g.setAttribute('aAO', new THREE.Float32BufferAttribute(occ, 1));
   g.setIndex(idx);
   return g;
 }
 
 /** Triangles in one fan. Published so the stadium can print its own budget. */
-export const FAN_TRIS = 62;
+export const FAN_TRIS = 116;
 
 // ---------------------------------------------------------------- lighting
 
@@ -325,8 +499,10 @@ export class Crowd {
         .replace('#include <common>', /* glsl */`
           #include <common>
           attribute float aPart;
+          attribute float aAO;   // baked per-vertex occlusion, 1 = open sky
           attribute vec4 aFan;   // phase, lap coordinate, allegiance, seated
           attribute vec3 aSkin;
+          attribute vec4 aTrim;  // club accent rgb, + a 0..1 dressing roll
           uniform float uTime;
           uniform float uExcite;
           uniform vec2  uWave;
@@ -417,15 +593,20 @@ export class Crowd {
           }
 
           if ( isScarf > 0.5 ) {
-            // A scarf exists only while it is held overhead. Roughly a quarter
-            // of the ground owns one; the rest collapse the quad to a point,
-            // which rasterises nothing and costs no branch on the GPU.
-            float show = step( 0.74, rnd2 ) * smoothstep( 0.42, 0.85, armUp );
+            // A scarf exists only while it is held overhead, and only for the
+            // fans who own one (the same aTrim roll that puts a club colour
+            // round their neck). The rest collapse the strip to a point, which
+            // rasterises nothing and costs no branch on the GPU.
+            float show = step( 0.55, aTrim.w ) * smoothstep( 0.42, 0.85, armUp );
             vec3 hand = vec3( 0.0, -0.52, 0.0 );
             hand = vec3( hand.x, hand.y * ca - hand.z * sa, hand.y * sa + hand.z * ca );
             vec3 c = vec3( 0.0, shoulderY + hand.y, hand.z );
+            // cloth: the free ends flap hardest, the middle is pinned by two
+            // fists, so the amplitude goes with x^2 and travels along the strip
+            float fl = p.x * p.x * ( 0.30 + 0.45 * uExcite )
+              * sin( t * 5.2 + ph * 31.0 + p.x * 4.1 );
             vec3 spread = c + vec3( p.x * ( 0.62 + armUp * 0.2 ),
-              ( p.y - ${SHOULDER_Y.toFixed(3)} ) * 0.9, 0.0 );
+              ( p.y - ${SHOULDER_Y.toFixed(3)} ) * 0.9 + fl * 0.22, fl );
             p = mix( c, spread, show );
           }
 
@@ -436,24 +617,80 @@ export class Crowd {
           p.z += sad * 0.14 * upf * ( 1.0 - isLeg );
           p.y -= sad * 0.05 * upf;
 
+          // ---- idle ----
+          // Nobody in a stand is ever still. Two slow, per-instance, mutually
+          // prime oscillations — a shift of weight and a turn of the trunk —
+          // keep a 12%-excitement crowd from freezing into a photograph
+          // between events, for four sin() and no extra uniform.
+          float notLeg = 1.0 - isLeg;
+          float tw = sin( t * ( 0.31 + 0.27 * rnd ) + ph * 39.0 )
+            * ( 0.085 + 0.20 * energy ) * notLeg * upf;
+          float ct2 = cos( tw ), st2 = sin( tw );
+          p.xz = vec2( p.x * ct2 + p.z * st2, -p.x * st2 + p.z * ct2 );
+          p.x += sin( t * ( 0.43 + 0.24 * rnd2 ) + ph * 17.0 )
+            * ( 0.014 + 0.028 * energy ) * upf;
+          p.y += sin( t * 1.25 + ph * 23.0 ) * 0.006 * notLeg;
+
           vec3 transformed = p;
 
           // ---- shading: hemisphere + one key, per vertex, unlit material ----
-          vec3 nn = normalize( mat3( instanceMatrix ) * normal );
-          vec3 amb = mix( uGround, uSky, nn.y * 0.5 + 0.5 );
-          vec3 shade = amb + uKey * max( dot( nn, uKeyDir ), 0.0 );
+          // the trunk twist goes through the normal too, so the idle reads as a
+          // shimmer of changing shading across a stand and not just as motion
+          vec3 n0 = normal;
+          n0.xz = vec2( n0.x * ct2 + n0.z * st2, -n0.x * st2 + n0.z * ct2 );
+          vec3 nn = normalize( mat3( instanceMatrix ) * n0 );
+          // Baked occlusion. It sits on the AMBIENT term (mostly) because that
+          // is physically what a packed row takes away: the hips and shins of
+          // the man in front of you see no sky at all, his shoulders and head
+          // see all of it. This is the single biggest "these are solid bodies
+          // in rows" cue in the file, and it is one multiply.
+          vec3 amb = mix( uGround, uSky, nn.y * 0.5 + 0.5 ) * aAO;
+          vec3 shade = amb
+            + uKey * max( dot( nn, uKeyDir ), 0.0 ) * mix( 0.55, 1.0, aAO );
 
-          vec3 shirt = vColor.rgb;
-          // trousers/jeans: half the ground in something near-black, half in a
-          // dark version of whatever they are wearing up top
-          vec3 dark = mix( vec3( 0.030, 0.033, 0.042 ), shirt * 0.26, step( 0.55, rnd ) );
-          vec3 pc = shirt;
+          vec3 body   = vColor.rgb;   // the outer garment (instanceColor)
+          vec3 accent = aTrim.rgb;    // the club colour: scarf, hat, collar
+          float dress = aTrim.w;
+
+          // Legwear. Three families plus "matching the coat" — a stand in one
+          // shade of trouser is a stand of mannequins, and legs are half the
+          // figure from any camera that is below the front row.
+          float lr = fract( ph * 91.7 + 0.11 );
+          vec3 legc = mix( vec3( 0.026, 0.031, 0.045 ),
+            vec3( 0.034, 0.050, 0.086 ), step( 0.40, lr ) );
+          legc = mix( legc, vec3( 0.072, 0.068, 0.058 ), step( 0.74, lr ) );
+          legc = mix( legc, body * 0.30, step( 0.86, rnd ) );
+
+          vec3 pc = body;
           pc = mix( pc, aSkin, isHead );
-          pc = mix( pc, dark, isLeg );
-          pc = mix( pc, shirt * 1.3 + 0.04, isScarf );
-          // bare forearms — taken from the UNANIMATED position so a raised arm
-          // does not change colour on the way up
-          pc = mix( pc, aSkin, isArm * smoothstep( 1.16, 0.94, position.y ) * 0.85 );
+          pc = mix( pc, legc, isLeg );
+
+          // A scarf round the NECK: the torso's collar ring plus the base of
+          // the skull. One band of club colour under the chin says "home end"
+          // from 40 m, where a replica shirt is four pixels of nothing.
+          float worn = step( 0.55, dress );
+          // 1.425 is the torso's collar RING, so this lands in one strip
+          // instead of fading half way down the chest.
+          float band = max(
+            smoothstep( 1.33, 1.42, position.y ) * ( 1.0 - isHead ) * ( 1.0 - isArm ),
+            smoothstep( 1.45, 1.36, position.y ) * isHead );
+          pc = mix( pc, accent, worn * band * 0.88 );
+          // and a bobble hat on some of the ones who aren't wearing a scarf
+          pc = mix( pc, accent * 0.75,
+            step( dress, 0.26 ) * isHead * smoothstep( 1.46, 1.545, position.y ) );
+
+          // the held-up scarf is two-tone along its length, like every one ever
+          // sold outside a ground
+          pc = mix( pc,
+            mix( accent * 1.15, accent * 0.42 + 0.02,
+              step( 0.5, fract( position.x * 3.4 + 0.25 ) ) ), isScarf );
+          // Bare HANDS, not bare forearms — taken from the UNANIMATED position
+          // so a raised arm does not change colour on the way up. The old
+          // half-the-arm version put a skin-toned stick down each side of every
+          // fan, which at 15 m is the single thing that made the limbs read as
+          // detached: a football crowd is in sleeves, and only the cuff down is
+          // skin.
+          pc = mix( pc, aSkin, isArm * smoothstep( 1.00, 0.88, position.y ) * 0.9 );
           vColor.rgb = pc * shade;
         `);
     });
@@ -499,8 +736,10 @@ export class Crowd {
 
     const fan = new Float32Array(count * 4);
     const skin = new Float32Array(count * 3);
+    const trim = new Float32Array(count * 4);
     geo.setAttribute('aFan', new THREE.InstancedBufferAttribute(fan, 4));
     geo.setAttribute('aSkin', new THREE.InstancedBufferAttribute(skin, 3));
+    geo.setAttribute('aTrim', new THREE.InstancedBufferAttribute(trim, 4));
 
     const rng = this.rng;
     const m = new THREE.Matrix4();
@@ -509,6 +748,7 @@ export class Crowd {
     const scl = new THREE.Vector3();
     const col = new THREE.Color();
     const sk = new THREE.Color();
+    const ac = new THREE.Color();
     const cosR = Math.cos(block.rotY), sinR = Math.sin(block.rotY);
 
     let i = 0;
@@ -535,9 +775,17 @@ export class Crowd {
         // face the pitch, plus a little scatter so a row is not a firing squad
         q.setFromAxisAngle(new THREE.Vector3(0, 1, 0),
           block.rotY + Math.PI + rng.range(-0.22, 0.22));
-        // height variation: adults, a few kids, nobody identical
-        const h = rng.range(0.86, 1.06);
-        scl.set(h * rng.range(0.94, 1.06), h, h);
+        // Height AND build. Height alone gave a row of one body type at
+        // different sizes, which from the front row is still a picket fence;
+        // what breaks the fence is that some of them are broad and some are
+        // narrow at the same height. Girth drives x hard and z about a fifth as
+        // hard, because a heavy man is mostly wider, not mostly deeper.
+        // the range is a touch taller than v1.3's because the v1.4 figure is
+        // 1.618m to the crown where the box fan was 1.67m; without that the
+        // same rake came out visibly shorter and the tier read half-empty
+        const h = rng.range(0.88, 1.14);
+        const girth = rng.range(0.92, 1.18);
+        scl.set(h * girth, h, h * (0.92 + (girth - 1) * 0.8));
         m.compose(pos, q, scl);
         inst.setMatrixAt(i, m);
 
@@ -565,6 +813,11 @@ export class Crowd {
         this.pickSkin(sk, rng);
         sk.multiplyScalar(deep);
         skin[i * 3] = sk.r; skin[i * 3 + 1] = sk.g; skin[i * 3 + 2] = sk.b;
+        // the club colour this fan carries on top of whatever coat they are in
+        this.pickAccent(ac, alle, rng);
+        ac.multiplyScalar(deep);
+        trim[i * 4] = ac.r; trim[i * 4 + 1] = ac.g; trim[i * 4 + 2] = ac.b;
+        trim[i * 4 + 3] = rng.next();
         i++;
       }
     }
@@ -603,9 +856,11 @@ export class Crowd {
     if (!this.live || spots.length === 0) return;
     const fan = new Float32Array(spots.length * 4);
     const skin = new Float32Array(spots.length * 3);
+    const trim = new Float32Array(spots.length * 4);
     const geo = this.geo!.clone();
     geo.setAttribute('aFan', new THREE.InstancedBufferAttribute(fan, 4));
     geo.setAttribute('aSkin', new THREE.InstancedBufferAttribute(skin, 3));
+    geo.setAttribute('aTrim', new THREE.InstancedBufferAttribute(trim, 4));
     const inst = new THREE.InstancedMesh(geo, this.mat!, spots.length);
     inst.castShadow = false;
 
@@ -616,7 +871,7 @@ export class Crowd {
     spots.forEach((s, i) => {
       q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), s.rotY + rng.range(-0.15, 0.15));
       m.compose(new THREE.Vector3(s.x, s.y, s.z), q,
-        new THREE.Vector3(1, rng.range(0.96, 1.04), 1));
+        new THREE.Vector3(rng.range(0.97, 1.05), rng.range(0.96, 1.04), 1));
       inst.setMatrixAt(i, m);
       fan[i * 4] = rng.next();
       fan[i * 4 + 1] = (Math.atan2(s.z, s.x) / (Math.PI * 2)) + 0.5;
@@ -625,6 +880,10 @@ export class Crowd {
       inst.setColorAt(i, s.shirt);
       this.pickSkin(sk, rng);
       skin[i * 3] = sk.r; skin[i * 3 + 1] = sk.g; skin[i * 3 + 2] = sk.b;
+      // a bench wears the kit, not club merchandise: accent = the bench colour,
+      // and a dressing roll of 0.4 owns neither a scarf nor a hat
+      trim[i * 4] = s.shirt.r; trim[i * 4 + 1] = s.shirt.g; trim[i * 4 + 2] = s.shirt.b;
+      trim[i * 4 + 3] = 0.4;
     });
     inst.instanceMatrix.needsUpdate = true;
     if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
@@ -645,7 +904,7 @@ export class Crowd {
   private pickShirt(out: THREE.Color, alle: number, rng: RNG): void {
     const roll = rng.next();
     const kit = rng.next() < alle ? this.homeShirt : this.awayShirt;
-    if (roll < 0.44) {
+    if (roll < 0.30) {
       // In the shirt, with real variation. The multiplier matters more than
       // the hue: a replica kit in a stand is never at full kit value — it is
       // under a coat, in the roof's shade, twenty rows back. The first pass at
@@ -653,22 +912,45 @@ export class Crowd {
       // white rectangles brighter than the pitch.
       out.copy(kit).multiplyScalar(rng.range(0.30, 0.72));
       out.offsetHSL(rng.range(-0.02, 0.02), rng.range(-0.14, 0.04), 0);
-    } else if (roll < 0.60) {
+    } else if (roll < 0.46) {
       // a pale coat / a plain shirt
-      const g = rng.range(0.15, 0.36);
+      const g = rng.range(0.14, 0.34);
       out.setRGB(g, g * 1.01, g * 1.05, THREE.LinearSRGBColorSpace);
-    } else if (roll < 0.92) {
+    } else if (roll < 0.80) {
       // generic dark outerwear — a third of any real crowd, and the thing that
       // stops the stand glowing
-      const g = rng.range(0.018, 0.07);
+      const g = rng.range(0.016, 0.065);
       out.setRGB(g * rng.range(0.8, 1.25), g, g * rng.range(0.9, 1.4),
         THREE.LinearSRGBColorSpace);
+    } else if (roll < 0.94) {
+      // The winter-coat rack: olive, navy, oxblood, tan, teal, brown. This is
+      // the band the old palette had nothing in, and the reason a stand used to
+      // read as kit-or-black. Real outerwear is desaturated and mid-dark, and a
+      // seventh of the ground in it is what makes the other six sevenths look
+      // like clothing rather than swatches.
+      const HUES = [0.10, 0.60, 0.015, 0.09, 0.48, 0.065];
+      const h = HUES[Math.min(HUES.length - 1, Math.floor(rng.next() * HUES.length))];
+      out.setHSL(h + rng.range(-0.02, 0.02), rng.range(0.10, 0.36),
+        rng.range(0.055, 0.135));
     } else {
       // the odd bright jacket, which is what keeps a dark crowd from reading
       // as a single grey mass — muted, because eight per cent of a stand in
       // saturated primaries reads as confetti
       out.setHSL(rng.next(), rng.range(0.22, 0.5), rng.range(0.13, 0.26));
     }
+  }
+
+  /**
+   * The club colour a fan carries ON TOP of whatever coat they turned up in —
+   * the scarf round the neck, the hat, the held-up scarf. This is deliberately
+   * separate from the garment: most of a home end is not in the shirt, but most
+   * of a home end is wearing the colours SOMEWHERE, and a band of them at the
+   * collar survives to a distance a replica shirt does not.
+   */
+  private pickAccent(out: THREE.Color, alle: number, rng: RNG): void {
+    const kit = rng.next() < alle ? this.homeShirt : this.awayShirt;
+    out.copy(kit).multiplyScalar(rng.range(0.40, 0.92));
+    out.offsetHSL(rng.range(-0.03, 0.03), rng.range(-0.10, 0.06), 0);
   }
 
   private pickSkin(out: THREE.Color, rng: RNG): void {

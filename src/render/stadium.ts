@@ -9,10 +9,11 @@
 // cards on a four-frame atlas: a crowd that moves, but still a crowd with no
 // silhouette, which falls apart the moment the touchline camera drops to knee
 // height. v1.3 (this file, plus crowd.ts) makes the tier you actually look at
-// out of PEOPLE — 62-triangle figures, instanced once per stand, animated
-// entirely in the vertex shader and reacting to the match through eight floats
-// of uniform. The upper tiers keep the cards, because at 40m up a card is
-// exactly as good and a hundredth of the cost.
+// out of PEOPLE — swept low-poly figures (116 triangles in v1.4, up from v1.3's
+// 62 boxes), instanced once per stand, animated entirely in the vertex shader
+// and reacting to the match through eight floats of uniform. The upper tiers
+// keep the cards, because at 40m up a card is exactly as good and a hundredth
+// of the cost.
 //
 // Everything animated here is driven by the dt the renderer hands down, which
 // under capture is the harness's fixed virtual step — so a still is still a

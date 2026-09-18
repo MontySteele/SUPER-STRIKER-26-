@@ -459,6 +459,17 @@
       "camFacing": true,
       "camOffset": [-7.0, 3.2, 3.5],
       "camAim": 0.4
+    },
+    {
+      "name": "crowd_closeup",
+      "note": "CROWD. The near tier at the range a pitch-side cutaway actually sees it: pitch-side on the far touchline's flank, 3 m off the deck and ~13 m out, looking up into the lower rake of the national bowl so a dozen figures fill the frame. Clear of the tunnel mouth (local x well past TUNNEL_HALF_W) so the front rows are unbroken. Fixed pose, daylight — this is the asset-detail shot, so nothing about it may depend on the sim.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "stadium": "national",
+      "cam": { "pos": [20, 3.0, -37], "look": [14, 4.6, -50], "fov": 36 }
     }
   ]
 }
