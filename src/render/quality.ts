@@ -40,13 +40,21 @@ export interface QualityProfile {
 }
 
 const PROFILES: Record<QualityLevel, QualityProfile> = {
-  // 3 × 1024 beats the old single 2048: the near cascade covers ~40m instead
-  // of 124m, so it lands ~5x the texel density where the players actually are,
-  // for a quarter of the shadow-map memory a 3 × 2048 rig would eat.
+  // 3 × 2048: the near cascade covers ~40m of pitch, so a 2048 map lands ~50
+  // texels per metre where the players are — enough that a boot's own shadow
+  // on the grass has an edge instead of a staircase. The three maps together
+  // are 48MB, which is what the MSAA buffer used to cost for a worse picture
+  // (see samples below).
   high: {
-    level: 'high', retro: false, cascades: 3, shadowMapSize: 1024,
+    level: 'high', retro: false, cascades: 3, shadowMapSize: 2048,
+    // MSAA is bought per DEVICE pixel and paid for twice on a Retina panel:
+    // see effectiveSamples() — at pixel ratio 2 this is spent as 0 and SMAA
+    // carries the edges alone. The 4 is what a 1x display gets.
     samples: 4, bloomScale: 1, aa: 'smaa', grade: true, env: true,
   },
+  // the sensible step down: half the shadow resolution, one fewer cascade,
+  // bloom at half res, FXAA. MEDIUM is what a machine that cannot hold HIGH
+  // at 60 should land on, not a different art direction.
   medium: {
     level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024,
     samples: 0, bloomScale: 0.5, aa: 'fxaa', grade: false, env: true,
@@ -60,6 +68,21 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
 /** Set by the capture harness so a shot never inherits a stray localStorage
  *  value from whatever profile the headless browser happens to be running. */
 let forced: QualityLevel | null = null;
+
+/**
+ * Bench-only field overrides (§7A.9b), e.g. `?bench=1&profile=samples:0`.
+ *
+ * The point is to A/B ONE setting on a real GPU without editing this file and
+ * rebuilding between runs — "is the 30fps lock the MSAA or the bloom" is a
+ * question you want to answer in two minutes, not two rebuilds. Nothing in the
+ * game ever sets this; only src/tools/bench.ts does, and a run that used it
+ * says so in its JSON.
+ */
+let overrides: Partial<QualityProfile> | null = null;
+
+export function overrideProfile(o: Partial<QualityProfile> | null): void {
+  overrides = o;
+}
 
 /** Pin the level for this page load (capture / viewer entry points only). */
 export function forceQuality(level: QualityLevel): void {
@@ -81,6 +104,25 @@ export function setQuality(level: QualityLevel): void {
   } catch { /* private browsing: the toggle just won't persist */ }
 }
 
+/**
+ * MSAA samples this profile should actually ask for at a given pixel ratio.
+ *
+ * Measured on an M3 (ANGLE/Metal), broadcast_midfield, 2940x1598 device px:
+ *
+ *   samples 4 → 31 fps (a clean 33.3ms: every other vsync missed)
+ *   samples 2 → 46 fps (oscillating between 16.7 and 33.3)
+ *   samples 0 → 60 fps, and the whole frame bursts at 2.1ms instead of 5.3ms
+ *
+ * A 4x multisampled HALF-FLOAT colour buffer is the expensive part — the
+ * resolve is bandwidth the tile memory cannot hide — and at pixel ratio 2 the
+ * edges it cleans are already half the size of the ones SMAA is tuned for. So
+ * HIGH spends MSAA only where the pixels are big enough to need it. On a 1x
+ * display (an external 1080p monitor) the 4 samples come back.
+ */
+export function effectiveSamples(profile: QualityProfile, pixelRatio: number): number {
+  return pixelRatio >= 1.75 ? 0 : profile.samples;
+}
+
 export function qualityProfile(level: QualityLevel = qualitySetting()): QualityProfile {
-  return PROFILES[level];
+  return overrides ? { ...PROFILES[level], ...overrides } : PROFILES[level];
 }

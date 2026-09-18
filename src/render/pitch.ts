@@ -68,8 +68,10 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
     map: maps.macro,
     normalMap: maps.detailNormal,
     // the grass is not a rough sheet of paper: it has enough of a lobe left to
-    // catch a low key at a grazing angle, which is the whole low-sun shot
-    normalScale: new THREE.Vector2(0.5, 0.5),
+    // catch a low key at a grazing angle, which is the whole low-sun shot.
+    // 0.5 -> 0.62 with the 1024 detail map: the relief is finer now, so it can
+    // be deeper before it reads as gravel.
+    normalScale: new THREE.Vector2(0.62, 0.62),
     roughness: 0.9,
     metalness: 0,
   });
@@ -131,11 +133,24 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
       }
     `);
 
-    // the specular half: blades laid toward you scatter wider than blades laid
-    // away, so the two phases must not share a roughness
+    // The specular half. Two terms:
+    //
+    //  • blades laid toward you scatter wider than blades laid away, so the
+    //    two stripe phases must not share a roughness;
+    //
+    //  • and a real pitch goes SILVERY when you look along it — the grazing
+    //    sheen every floodlit night broadcast has and this pitch did not,
+    //    because roughness 0.9 has no lobe left to catch a key with. Cubed, so
+    //    it is absent from the helicopter shot and full strength only at the
+    //    knee-height angles (and the night game, where the key is the rig).
     frag = frag.replace('#include <roughnessmap_fragment>', /* glsl */`
       #include <roughnessmap_fragment>
-      roughnessFactor = clamp( roughnessFactor - ss26StripePhase() * 0.12, 0.04, 1.0 );
+      {
+        vec3 ss26Vr = normalize( cameraPosition - ss26WorldPos );
+        float ss26Sheen = pow( 1.0 - abs( ss26Vr.y ), 3.0 );
+        roughnessFactor = clamp(
+          roughnessFactor - ss26StripePhase() * 0.12 - ss26Sheen * 0.26, 0.10, 1.0 );
+      }
     `);
 
     // ...and the reason any of it reads: the shading normal leans along the
@@ -154,10 +169,14 @@ function bakedPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
         // the pitch. dist / |view.y| is that footprint's vertical extent; fade
         // the detail normal out along it. The mowing lean below is a 6.5-metre
         // feature applied AFTER the fade, so it survives to the far touchline.
+        // The fade window is texel-relative, so it moved in with the 1024
+        // detail map: half the texel size means the footprint that swallows a
+        // texel arrives at half the distance. 40/180 on a 1024 map is a pitch
+        // that dithers from the halfway line out at DPR 2.
         vec3 ss26Vn = normalize( cameraPosition - ss26WorldPos );
         float ss26Foot = length( cameraPosition - ss26WorldPos ) / max( abs( ss26Vn.y ), 0.04 );
         normal = normalize( mix( normal, nonPerturbedNormal,
-          smoothstep( 40.0, 180.0, ss26Foot ) ) );
+          smoothstep( 24.0, 120.0, ss26Foot ) ) );
 
         vec3 ss26Axis = normalize( ( viewMatrix * vec4( 1.0, 0.0, 0.0, 0.0 ) ).xyz );
         normal = normalize( normal + ss26Axis * ( ss26StripePhase() * 0.20 ) );
@@ -213,20 +232,120 @@ function retroPitchMaterial(lab: TextureLab): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9, metalness: 0 });
 }
 
+// ------------------------------------------------------------------ the net
+//
+// The net used to be one 128px grid at opacity 0.5 on a MeshBasicMaterial,
+// with `back.material.map.repeat.set(6, 2)` — and because all four planes
+// SHARED that material and therefore that texture, the one repeat set for the
+// 7.3m-wide back was also applied to the 2.2m-deep sides and roof. Nothing was
+// at the right cord density anywhere, an unlit white at half alpha does not
+// darken when the goalmouth is in shade, and the mip chain averaged a 1.5px
+// line in a 10px cell down to a flat grey long before the corner camera got
+// there. The result is the thing in captures/cam/setpiece_corner.png: a
+// translucent grey slab hanging in the goal.
+//
+// What a net actually is: white nylon cord, ~2mm, knotted into a ~10cm mesh,
+// hung diagonally so the cells read as diamonds. So:
+//
+//  • a SEAMLESS diamond lattice, drawn as ±45° cords with a period that divides
+//    the tile, so a non-integer repeat has no seam to show;
+//  • one tile = a fixed number of METRES, and every plane's repeat is computed
+//    from its own world size, so the cord pitch is identical on the back, the
+//    sides and the roof;
+//  • a LIT material (MeshStandardMaterial, registered with the CSM rig like
+//    everything else built before Atmosphere.register), because a net in the
+//    shadow of the crossbar is grey and a net in the floodlights is white, and
+//    an unlit basic material is neither;
+//  • alpha BLENDED with depthWrite off, not alpha tested: the mip chain fades
+//    a distant net toward its average alpha, which is ~0.15 here, and an alpha
+//    test would simply delete the whole net the moment that average fell under
+//    the threshold.
+
+/** Metres covered by one tile of the net texture. Eight diamonds per tile at
+ *  0.8m is a ~10cm mesh, which is what a match net is knotted at. */
+const NET_TILE_M = 0.8;
+/** Tile resolution and the cord period inside it (must divide it, or the
+ *  lattice stops being seamless and every plane grows a visible grid of tile
+ *  boundaries). */
+const NET_PX = 256;
+const NET_PERIOD_PX = NET_PX / 8;
+
 function makeNetTexture(): THREE.Texture {
   const c = document.createElement('canvas');
-  c.width = 128; c.height = 128;
+  c.width = NET_PX; c.height = NET_PX;
   const ctx = c.getContext('2d')!;
-  ctx.clearRect(0, 0, 128, 128);
-  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
-  ctx.lineWidth = 1.5;
-  for (let i = 0; i <= 128; i += 10) {
-    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 128); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(128, i); ctx.stroke();
+  ctx.clearRect(0, 0, NET_PX, NET_PX);
+  ctx.lineCap = 'square';
+  // Two passes per diagonal: a wide, dimmer pass for the shaded flank of the
+  // cord and a narrow bright one for its lit crown. That is the whole of the
+  // "it is a round cord, not a drawn line" cue, and it costs two strokes.
+  const pass: [number, string][] = [[3.4, 'rgba(226,232,240,0.55)'], [1.6, 'rgba(255,255,255,0.96)']];
+  for (const [width, style] of pass) {
+    ctx.lineWidth = width;
+    ctx.strokeStyle = style;
+    for (let k = -NET_PX; k <= NET_PX * 2; k += NET_PERIOD_PX) {
+      ctx.beginPath(); ctx.moveTo(k, 0); ctx.lineTo(k + NET_PX, NET_PX); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(k, NET_PX); ctx.lineTo(k + NET_PX, 0); ctx.stroke();
+    }
+  }
+  // the knots: a dot where two cords cross, which is what stops the lattice
+  // reading as a printed pattern when the replay camera is two metres away
+  ctx.fillStyle = 'rgba(255,255,255,0.98)';
+  for (let y = 0; y <= NET_PX; y += NET_PERIOD_PX) {
+    for (let x = (y / NET_PERIOD_PX) % 2 ? NET_PERIOD_PX / 2 : 0; x <= NET_PX; x += NET_PERIOD_PX) {
+      ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fill();
+    }
   }
   const tex = new THREE.CanvasTexture(c);
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
   return tex;
+}
+
+/** One net panel: its own texture clone (so its repeat is its own) over the
+ *  shared canvas, at the shared cord pitch. */
+function netMaterial(base: THREE.Texture, width: number, height: number):
+THREE.MeshStandardMaterial {
+  const tex = base.clone();
+  tex.needsUpdate = true;
+  tex.repeat.set(width / NET_TILE_M, height / NET_TILE_M);
+  return new THREE.MeshStandardMaterial({
+    map: tex,
+    color: 0xeef3f8,
+    // A flat plane is a bad model of a lattice of 2mm cords: a cord is lit from
+    // every side at once, so a panel whose surface normal happens to face away
+    // from the key goes black, which a real net never does. A small constant
+    // stands in for that wrap — negligible against a sunlit pitch, and the
+    // difference between "net" and "hole" in the far goal at night.
+    emissive: 0x20262e,
+    roughness: 0.92,
+    metalness: 0,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    // nylon is thin enough that both faces of a cell take the key
+    flatShading: false,
+  });
+}
+
+/**
+ * Hang a panel: push the interior vertices along the plane's own normal (local
+ * +z, before the mesh is rotated into place) by a smooth bulge that is zero at
+ * every edge. A net is rope, not canvas — the roof bellies down between the
+ * crossbar and the back, and the back bulges out under its own weight.
+ */
+function sagPanel(geo: THREE.PlaneGeometry, depth: number): void {
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox!;
+  for (let i = 0; i < pos.count; i++) {
+    const u = (pos.getX(i) - bb.min.x) / Math.max(1e-6, bb.max.x - bb.min.x);
+    const v = (pos.getY(i) - bb.min.y) / Math.max(1e-6, bb.max.y - bb.min.y);
+    pos.setZ(i, pos.getZ(i) + depth * Math.sin(Math.PI * u) * Math.sin(Math.PI * v));
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
 }
 
 function buildGoal(scene: THREE.Scene, side: number): void {
@@ -250,24 +369,36 @@ function buildGoal(scene: THREE.Scene, side: number): void {
   bar.castShadow = true;
   group.add(bar);
 
-  // net: back + sides + roof, semi-transparent grid
+  // --- net: back + two sides + roof, each at its own repeat (see makeNetTexture)
   const netTex = makeNetTexture();
-  const netMat = new THREE.MeshBasicMaterial({
-    map: netTex, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false,
-  });
-  const back = new THREE.Mesh(new THREE.PlaneGeometry(GOAL_HALF_W * 2, GOAL_HEIGHT), netMat);
-  (back.material as THREE.MeshBasicMaterial).map!.repeat.set(6, 2);
+  const W = GOAL_HALF_W * 2;
+
+  // The back hangs off the top of the frame and bellies OUT under its own
+  // weight — the local +z of this plane is world +x once it is rotated, i.e.
+  // away from the pitch, which is the direction a ball pushes it too.
+  const backGeo = new THREE.PlaneGeometry(W, GOAL_HEIGHT, 14, 6);
+  sagPanel(backGeo, 0.10);
+  const back = new THREE.Mesh(backGeo, netMaterial(netTex, W, GOAL_HEIGHT));
   back.rotation.y = Math.PI / 2;
   back.position.set(GOAL_DEPTH, GOAL_HEIGHT / 2, 0);
   group.add(back);
+
+  // sides stay taut: they are pulled between the post and the back stanchion
+  const sideMat = netMaterial(netTex, GOAL_DEPTH, GOAL_HEIGHT);
   for (const y of [-GOAL_HALF_W, GOAL_HALF_W]) {
-    const sideNet = new THREE.Mesh(new THREE.PlaneGeometry(GOAL_DEPTH, GOAL_HEIGHT), netMat);
+    const sideNet = new THREE.Mesh(new THREE.PlaneGeometry(GOAL_DEPTH, GOAL_HEIGHT), sideMat);
     sideNet.position.set(GOAL_DEPTH / 2, GOAL_HEIGHT / 2, y);
     group.add(sideNet);
   }
-  const roof = new THREE.Mesh(new THREE.PlaneGeometry(GOAL_DEPTH, GOAL_HALF_W * 2), netMat);
-  roof.rotation.z = Math.PI / 2;
-  roof.rotation.y = Math.PI / 2;
+
+  // The roof is the panel the sag actually shows on, because a low replay
+  // camera looks straight along it. One x-rotation (not the z-then-y pair this
+  // used to use) puts the plane's own +z straight DOWN, so sagPanel's bulge is
+  // the belly and nothing has to be sign-corrected.
+  const roofGeo = new THREE.PlaneGeometry(GOAL_DEPTH, W, 8, 16);
+  sagPanel(roofGeo, 0.16);
+  const roof = new THREE.Mesh(roofGeo, netMaterial(netTex, GOAL_DEPTH, W));
+  roof.rotation.x = Math.PI / 2;
   roof.position.set(GOAL_DEPTH / 2, GOAL_HEIGHT, 0);
   group.add(roof);
 

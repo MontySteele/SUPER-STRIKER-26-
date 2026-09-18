@@ -27,6 +27,11 @@ const DEV_SERVER = process.env.SS26_DEV_SERVER || '';
 const PAGE = (process.env.SS26_PAGE || 'index').replace(/\.html$/, '');
 const START_QUERY = process.env.SS26_QUERY || '';
 const WANT_FULLSCREEN = process.env.SS26_WINDOWED !== '1';
+// windowed size, for the bench (`npm run app:bench` wants a known 1920x1080)
+const WANT_W = Number(process.env.SS26_WIDTH || 0);
+const WANT_H = Number(process.env.SS26_HEIGHT || 0);
+// bench/capture runs must not float over whatever the user is doing
+const WANT_FOCUS = process.env.SS26_NO_FOCUS !== '1';
 const OPEN_DEVTOOLS = process.env.SS26_DEVTOOLS === '1';
 // headless-ish smoke test: capture a PNG N ms after load, then quit
 const CAPTURE_PATH = process.env.SS26_CAPTURE || '';
@@ -113,8 +118,11 @@ function createWindow() {
   const { width, height } = display.workAreaSize;
 
   const win = new BrowserWindow({
-    width: Math.min(1600, width),
-    height: Math.min(900, height),
+    // an explicit size is taken at face value (the bench quotes numbers for a
+    // 1920x1080 frame and a clamped window would quietly measure something
+    // else); otherwise fit the work area
+    width: WANT_W || Math.min(1600, width),
+    height: WANT_H || Math.min(900, height),
     backgroundColor: '#06090d',
     show: false,
     title: "SUPER STRIKER '26",
@@ -144,8 +152,10 @@ function createWindow() {
   wireLogging(win);
 
   win.once('ready-to-show', () => {
-    win.show();
-    win.focus();
+    if (WANT_W && WANT_H) win.setContentSize(WANT_W, WANT_H);
+    if (WANT_FOCUS) win.show();
+    else win.showInactive();
+    if (WANT_FOCUS) win.focus();
     if (OPEN_DEVTOOLS) win.webContents.openDevTools({ mode: 'detach' });
   });
 

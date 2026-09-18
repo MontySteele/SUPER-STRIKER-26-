@@ -29,6 +29,29 @@ export type ShaderPatch = (shader: THREE.WebGLProgramParametersWithUniforms) => 
  */
 export const SHADOW_LAYER = 1;
 
+// ------------------------------------------------------- texture filtering
+
+/**
+ * The GPU's real anisotropic-filtering limit, published here because the
+ * TextureLab bakes its maps before anything hands it a renderer — and because
+ * a hardcoded 16 is a lie on any device that caps lower (it silently clamps,
+ * so the bug is invisible and the grass shimmers anyway).
+ *
+ * SceneManager sets this from renderer.capabilities.getMaxAnisotropy() the
+ * moment the context exists, which is before the first bake. The default is
+ * the WebGL2 floor, so a texture baked without a renderer is still sane.
+ */
+let maxAniso = 4;
+
+export function setMaxAnisotropy(n: number): void {
+  if (Number.isFinite(n) && n >= 1) maxAniso = Math.floor(n);
+}
+
+/** Anisotropy for a map that is seen edge-on (grass, markings, ad boards). */
+export function maxAnisotropy(): number {
+  return maxAniso;
+}
+
 /** Queue a fragment-shader patch. Nothing happens until applyShaderPatches(). */
 export function queueShaderPatch(mat: THREE.Material, patch: ShaderPatch): void {
   const list = (mat.userData.ss26Patches ?? (mat.userData.ss26Patches = [])) as ShaderPatch[];

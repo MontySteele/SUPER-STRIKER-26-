@@ -27,6 +27,7 @@
 
 import * as THREE from 'three';
 import { RNG } from '../core/rng';
+import { maxAnisotropy } from './materials';
 import {
   BOX_DEPTH, BOX_HALF_W, CENTER_CIRCLE_R, HALF_L, HALF_W, PENALTY_SPOT,
   PITCH_LENGTH, PITCH_WIDTH, SIX_DEPTH, SIX_HALF_W,
@@ -168,16 +169,22 @@ const KIT_H = 512;
 const NUM_W = 256;
 const NUM_H = 160;
 
-// Tiling detail resolution and the patch of pitch it covers. 4m over 512px is
-// 128 texels per metre, so the blade octave lands at ~6cm — fine enough that a
-// knee-height camera reads grain and not gravel.
-const DETAIL_PX = 512;
+// Tiling detail resolution and the patch of pitch it covers. 4m over 1024px is
+// 256 texels per metre — a quarter-centimetre per texel, which is finally finer
+// than a blade of grass, so the knee-height camera reads individual leaves in
+// the normal map instead of a suggestion of them. (512 was 6cm per feature:
+// grain, not grass.) The tile is 4MB; the map it replaces was 1MB.
+const DETAIL_PX = 1024;
 const DETAIL_M = 4;
 // the macro layers are low-frequency by definition, so they are baked small and
 // scaled up onto the marking canvas — a 2048x1330 per-pixel noise loop is a
 // second of the budget for detail nobody can resolve
 const MACRO_PX = 256;
-const PITCH_TEX_W = 2048;
+// The macro map carries the LINE MARKINGS, which are the one thing on this
+// pitch with a hard edge, and a 105m pitch across 2048px put a 12cm touchline
+// inside two texels — so every line in the game was a grey smear at DPR 2.
+// 4096 puts it in four and costs 42MB for a map that is baked once.
+const PITCH_TEX_W = 4096;
 
 export class TextureLab {
   private field: NoiseField;
@@ -192,8 +199,11 @@ export class TextureLab {
 
   constructor(private seed: number = LAB_SEED) {
     const rng = new RNG(seed);
-    // 5 octaves from base 4: periods 4, 8, 16, 32, 64 cells over a [0,1) tile
-    this.field = new NoiseField(rng, 4, 5);
+    // 6 octaves from base 4: periods 4, 8, 16, 32, 64, 128 cells over a [0,1)
+    // tile. The 6th is new with the 1024px detail map and is APPENDED, so
+    // octaves 0-4 draw exactly the gradients they always did and every map
+    // that does not ask for octave 5 is bit-identical to before.
+    this.field = new NoiseField(rng, 4, 6);
     this.dressRng = new RNG(seed ^ 0x9e3779b9);
   }
 
@@ -285,12 +295,13 @@ export class TextureLab {
       const v = y / DETAIL_PX;
       for (let x = 0; x < DETAIL_PX; x++) {
         const u = x / DETAIL_PX;
-        // octave 4 = 64 cells over the 4m tile ≈ 6cm blades; octave 1 = 8
-        // cells ≈ 50cm clumps. Anything finer is below what a 512px/4m map can
-        // carry and just aliases into noise.
+        // octave 5 = 128 cells over the 4m tile ≈ 3cm leaf, octave 4 ≈ 6cm
+        // blade clusters, octave 1 = 8 cells ≈ 50cm clumps. The leaf octave is
+        // only affordable at 1024px: at 512 it landed on 4 texels and aliased.
+        const leaf = this.field.octave(5, u, v);
         const blade = this.field.octave(4, u, v);
         const clump = this.field.octave(1, u, v);
-        const val = blade * 0.62 + clump * 0.38;
+        const val = leaf * 0.24 + blade * 0.44 + clump * 0.32;
         h[y * DETAIL_PX + x] = val;
         if (val < lo) lo = val;
         if (val > hi) hi = val;
@@ -329,7 +340,7 @@ export class TextureLab {
     // a centimetre and the low-sun camera sees it edge-on for fifty metres.
     // Max anisotropy is what keeps that from turning into a dither pattern.
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.anisotropy = 16;
+    tex.anisotropy = maxAnisotropy();
     return tex;
   }
 
@@ -344,10 +355,13 @@ export class TextureLab {
     const px = img.data;
     const N = DETAIL_PX;
     const at = (x: number, y: number): number => h[((y + N) % N) * N + ((x + N) % N)];
-    // how steep the derived surface is; tuned so the grass reads as grass and
-    // not as gravel under a low key. The mowing stripes lean the normal by
-    // 0.20 and this has to stay well under that or the stripes drown in grain.
-    const STRENGTH = 0.95;
+    // How steep the derived surface is. A Sobel works in TEXELS, so doubling
+    // the map to 1024 halved every gradient it measures — the same 0.95 on the
+    // finer grid is a visibly flatter pitch. 1.9 puts the blade relief back
+    // where it was and the new leaf octave on top of it, which is the "stronger
+    // blade detail" half of the uplift. The mowing stripes lean the normal by
+    // 0.20 and the grain must stay a texture under them, not a competitor.
+    const STRENGTH = 1.9;
     for (let y = 0; y < N; y++) {
       for (let x = 0; x < N; x++) {
         const tl = at(x - 1, y - 1), t = at(x, y - 1), tr = at(x + 1, y - 1);
@@ -374,7 +388,7 @@ export class TextureLab {
     // a centimetre and the low-sun camera sees it edge-on for fifty metres.
     // Max anisotropy is what keeps that from turning into a dither pattern.
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.anisotropy = 16;
+    tex.anisotropy = maxAnisotropy();
     return tex;
   }
 
@@ -443,7 +457,10 @@ export class TextureLab {
 
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
-    tex.anisotropy = 8;
+    // the macro map IS the line markings, and the markings are what a low
+    // camera sees edge-on for eighty metres — this is the single most
+    // anisotropy-hungry texture in the game
+    tex.anisotropy = maxAnisotropy();
     return tex;
   }
 

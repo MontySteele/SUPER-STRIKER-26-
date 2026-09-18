@@ -867,9 +867,16 @@ function loop(now: number): void {
 // of the broadcast kit driven into its settled state over a seeded match and
 // frozen for a screenshot. Separate module, separate shot list — a UI tweak
 // must never invalidate a lighting baseline.
+// `?bench=1` is the real-GPU sibling of `?capture=` (§7A.9b): same bypass of
+// the menus and the attract match, but it DRAWS — the live game loop through
+// four seeded situations, reporting frame cost at a pinned 1920x1080@2.
 const captureShot = new URLSearchParams(location.search).get('capture');
 const tvShot = new URLSearchParams(location.search).get('broadcast');
-if (tvShot) {
+const benchArg = new URLSearchParams(location.search).get('bench');
+if (benchArg) {
+  inMenus = false;
+  void import('./tools/bench').then((m) => m.runBench(canvas, benchArg));
+} else if (tvShot) {
   inMenus = false;
   void import('./ui/broadcastShots').then((m) => m.runBroadcastShot(canvas, tvShot));
 } else if (captureShot) {

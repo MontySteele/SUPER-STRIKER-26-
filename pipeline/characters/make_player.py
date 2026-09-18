@@ -11,9 +11,28 @@ Spec keys (all optional, defaults are a young average male):
   race: {african, asian, caucasian}, skin (mhmat file), eyes (mhclo), eyebrows,
   eyelashes, teeth, tongue, hair, shirt, shorts, shoes,
   hair_color [r,g,b], targets {"arms/measure-upperarm-length-incr": 0.7, ...},
-  tex_max (px), image_format (WEBP|AUTO), lods [ratio,...] (default [0.35, 0.12]), preview (bool)
+  image_format (WEBP|AUTO), lods [ratio,...] (default [0.35, 0.12]), preview (bool)
+
+Texture budget (all in px, all optional). The cap is per PART, not global,
+because the parts are not worth the same number of texels:
+  tex_max        the skin — the one map a broadcast close-up actually resolves,
+                 and the only one the MPFB library ships at 2048 that is worth
+                 keeping there. Default 2048.
+  tex_parts      hair, boots, garments. The shirt and shorts maps are REPAINTED
+                 at runtime (characterAssets.ts) so their authored resolution
+                 only has to survive being read once; hair and boots are drawn
+                 as authored. Default 1024.
+  tex_hidden     teeth, tongue, eyelashes, eyebrows — meshes CULL_MESHES drops
+                 before anything is ever drawn. They stay in the file so the
+                 model lab and the retarget rig still have a full head; they do
+                 not need texels. Default 256.
+  tex_lod        every map, re-scaled once the full-detail GLB is written, so
+                 the two LOD siblings do not each carry another megabyte of the
+                 same skin. The runtime shares level 0's materials across every
+                 level (prepareArchetype), so these are a fallback, not what is
+                 drawn. Default 512.
 """
-import bpy, importlib, json, math, os, sys
+import bpy, importlib, json, math, os, re, sys
 
 
 def dynamic_import(absolute_package_str, key):
@@ -199,14 +218,154 @@ if hair_rgb:
             nt.links.new(mix.outputs[2], bsdf.inputs["Base Color"])
             print(f"[make_player] hair colour {hair_rgb} on {mat.name}")
 
-# --- texture budget: nothing above tex_max px (default 1024) ------------------
-tex_max = int(spec.get("tex_max", 1024))
-for img in bpy.data.images:
-    if img.size[0] > tex_max or img.size[1] > tex_max:
+# --- normal maps ---------------------------------------------------------------
+#
+# MPFB's GAMEENGINE material tree HAS a normal-map branch (Image -> Normal Map ->
+# Principled.Normal) but only wires it when the .mhmat carries the key spelled
+# `normalmapTexture`. Most of the community assets spell it `bumpTexture`, which
+# mhmatkeys aliases to `bumpmapTexture` — a key the GAMEENGINE wrapper never
+# looks at. The result is that every one of these characters exported with no
+# normal map at all while the source pack had one sitting next to the diffuse.
+#
+# So: find the .mhmat that produced each material (it lives in the same folder as
+# the diffuse image the tree already loaded), read whichever of the three normal
+# keys it actually uses, and wire the branch by hand. Costs one texture on the
+# shorts today; costs nothing on assets that never had one.
+NORMAL_KEYS = ("normalmapTexture", "bumpmapTexture", "bumpTexture")
+
+
+def mhmat_normal_map(diffuse_path):
+    """Path of the normal/bump map declared beside `diffuse_path`, or None."""
+    folder = os.path.dirname(bpy.path.abspath(diffuse_path))
+    if not os.path.isdir(folder):
+        return None
+    for fname in sorted(os.listdir(folder)):
+        if not fname.endswith(".mhmat"):
+            continue
+        for line in open(os.path.join(folder, fname), encoding="utf-8", errors="replace"):
+            bits = line.strip().split(None, 1)
+            if len(bits) != 2 or bits[0] not in NORMAL_KEYS:
+                continue
+            cand = os.path.join(folder, bits[1].strip())
+            if not os.path.exists(cand):
+                continue
+            # eyebrows/eyelashes declare their own DIFFUSE as the bump map; a
+            # colour image read as a tangent-space normal is a lit-wrong mess.
+            if os.path.samefile(cand, bpy.path.abspath(diffuse_path)):
+                continue
+            return cand
+    return None
+
+
+def wire_normal_map(mat):
+    nt = mat.node_tree
+    if not nt:
+        return False
+    bsdf = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if not bsdf or bsdf.inputs["Normal"].is_linked:
+        return False
+    link = next((l for l in nt.links if l.to_node == bsdf and l.to_socket.name == "Base Color"), None)
+    diffuse = None
+    node = link.from_node if link else None
+    while node is not None and diffuse is None:
+        if node.type == "TEX_IMAGE" and node.image:
+            diffuse = node.image
+        else:
+            up = next((l for l in nt.links if l.to_node == node), None)
+            node = up.from_node if up else None
+    if not diffuse or not diffuse.filepath:
+        return False
+    path = mhmat_normal_map(diffuse.filepath)
+    if not path:
+        return False
+    img = bpy.data.images.load(path, check_existing=True)
+    img.colorspace_settings.name = "Non-Color"
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    tex.location = (-560, -240)
+    nmap = nt.nodes.new("ShaderNodeNormalMap")
+    nmap.location = (-260, -240)
+    nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
+    nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+    print(f"[make_player] normal map {os.path.basename(path)} -> {mat.name}")
+    return True
+
+
+# --- surface response ----------------------------------------------------------
+# The GAMEENGINE tree leaves every Principled at the Blender default (roughness
+# 0.5, metallic 0), which the exporter writes straight into the glTF and which
+# under ACES reads as damp plastic on everything from a shin to a boot. These are
+# the values the renderer wants anyway (fixCharacterMaterial only ever raises
+# roughness, so a sane number here survives); setting them in the FILE means the
+# model lab, any third-party viewer and the game agree.
+SURFACE = [
+    # brows and lashes FIRST: "eyebrow003" contains "eye", and hair read as a
+    # cornea is a pair of glossy black slugs over the eyes
+    ("eyebrow|eyelash", 0.72, 0.0),
+    ("low-poly|cornea|eyeball", 0.12, 0.0),  # wet, and the only real highlight on a face
+    ("shoes|boot", 0.38, 0.0),               # moulded synthetic: glossy, not chrome
+    ("hair|afro|short0", 0.68, 0.0),
+    ("teeth|tongue", 0.35, 0.0),
+    ("shirt|shorts|trunks|jeans|t-shirt", 0.85, 0.0),   # fabric
+    ("", 0.58, 0.0),                         # skin
+]
+for mat in bpy.data.materials:
+    if not mat.node_tree:
+        continue
+    wire_normal_map(mat)
+    bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if not bsdf:
+        continue
+    for pattern, rough, metal in SURFACE:
+        if not pattern or re.search(pattern, mat.name, re.I):
+            bsdf.inputs["Roughness"].default_value = rough
+            bsdf.inputs["Metallic"].default_value = metal
+            print(f"[make_player] surface {mat.name}: roughness {rough} metallic {metal}")
+            break
+
+# --- texture budget: a cap PER PART, not one number for the file ---------------
+# The skin is the map a close-up resolves and the MPFB library ships it at 2048;
+# hair/boots/garments are drawn smaller or repainted at runtime; the mouth and
+# the brows are dropped by the loader before they are ever drawn. See the module
+# docstring.
+TEX_MAX = int(spec.get("tex_max", 2048))
+TEX_PARTS = int(spec.get("tex_parts", 1024))
+TEX_HIDDEN = int(spec.get("tex_hidden", 256))
+TEX_LOD = int(spec.get("tex_lod", 512))
+HIDDEN_RE = re.compile(r"teeth|tongue|eyelash|eyebrow", re.I)
+
+
+def images_of(obj):
+    out = []
+    for mat in getattr(obj.data, "materials", []) or []:
+        if not mat or not mat.node_tree:
+            continue
+        for n in mat.node_tree.nodes:
+            if n.type == "TEX_IMAGE" and n.image:
+                out.append(n.image)
+    return out
+
+
+def scale_images(caps, tag):
+    for img, cap in caps.items():
         w, h = img.size
-        f = tex_max / max(w, h)
+        if w <= cap and h <= cap:
+            continue
+        f = cap / max(w, h)
         img.scale(max(1, int(w * f)), max(1, int(h * f)))
-        print(f"[make_player] scaled {img.name} {w}x{h} -> {img.size[0]}x{img.size[1]}")
+        print(f"[make_player] {tag} {img.name} {w}x{h} -> {img.size[0]}x{img.size[1]}")
+
+
+caps = {}
+for obj in [basemesh] + assets:
+    cap = TEX_MAX if obj is basemesh else (
+        TEX_HIDDEN if HIDDEN_RE.search(f"{obj.name} {ObjectService.get_object_type(obj) or ''}")
+        else TEX_PARTS)
+    for img in images_of(obj):
+        caps[img] = min(caps.get(img, cap), cap)
+for img in bpy.data.images:
+    caps.setdefault(img, TEX_PARTS)
+scale_images(caps, "scaled")
 
 glb = os.path.join(out_dir, f"{name}.glb")
 bpy.ops.export_scene.gltf(filepath=glb, export_format="GLB", use_selection=True,
@@ -242,11 +401,23 @@ if spec.get("preview", True):
     for tag, lens, loc, rot in shots:
         cam.lens = lens; co.location = loc; co.rotation_euler = tuple(math.radians(a) for a in rot)
         scene.render.resolution_x, scene.render.resolution_y = (720, 1200) if tag == "body" else (900, 900)
-        scene.render.filepath = os.path.join(out_dir, f"{name}_{tag}.png")
+        # review renders live beside the pipeline, not in public/ (the game
+        # never loads them, and they were shipping 6.6 MB for nothing)
+        prev_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "previews")
+        os.makedirs(prev_dir, exist_ok=True)
+        scene.render.filepath = os.path.join(prev_dir, f"{name}_{tag}.png")
         bpy.ops.render.render(write_still=True)
         print(f"[make_player] preview {scene.render.filepath}")
 
-# --- LODs: cumulative decimation of every mesh, exported as <name>_lod<n>.glb.
+# --- LODs ----------------------------------------------------------------------
+# Textures first: the two LOD siblings used to re-embed a byte-identical copy of
+# every map in the full-detail file, which is where two thirds of the character
+# download went. The runtime hands level 0's materials to every level, so what
+# is in these files is a fallback for a name that failed to match — and a
+# fallback does not need 2048 of skin.
+scale_images({img: TEX_LOD for img in bpy.data.images}, "lod texture")
+
+# Cumulative decimation of every mesh, exported as <name>_lod<n>.glb.
 # Decimate (collapse) keeps vertex groups, so skinning survives; UVs are
 # preserved well enough for kit texturing at the distances these are shown.
 for li, ratio in enumerate(spec.get("lods", [0.35, 0.12]), start=1):

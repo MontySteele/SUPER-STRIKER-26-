@@ -40,23 +40,63 @@ import type { PlayerData } from '../data/types';
 import type { ActionAnim } from '../sim/player';
 import { LOCO_CHAIN, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
   type ClipId, type PreparedClip } from './characterAssets';
-import { SHADOW_LAYER } from './materials';
 import type { KitSpec } from './playerMesh';
 
 /**
  * §7A.2 detail bands, in metres from the camera, plus the hysteresis margin.
  *
- * Tuned against the shot list: goalmouth_scramble's camera sits 19–25m off the
- * players around the ball, so lod0 has to reach 26m for them; midfield_wide is
- * a 24m-high broadcast pose where the far shape is 60m+ and belongs on lod2.
+ * MEASURED against the shot list, not guessed. The distances that matter are:
+ * goalmouth_scramble's camera sits 19–25m off the bodies round the ball;
+ * midfield_wide is a 24m-high broadcast pose whose NEAR shape is ~25m and whose
+ * FAR shape is ~50m; the tele rig on tele_midfield puts the far side of the
+ * pitch at 45–55m; setpiece_corner runs 20–60m across one frame.
+ *
+ * The old bands were [26, 52], chosen when the whole skinned path had to fit in
+ * a frame budget nobody had measured on the real GPU. That put the entire far
+ * team of every broadcast shot on lod1 — a 0.35 decimation, which is the level
+ * where the collapse eats the hands, squares off the shoulders and turns the
+ * head into a lump. It is visible at 40m on a Retina panel, and at 40m the far
+ * team is half the players on screen.
+ *
+ * So the bands are pushed out to cover the whole broadcast working range with
+ * the full mesh:
+ *   lod0 ≤ 45m   everything a broadcast camera is actually looking at
+ *   lod1 ≤ 90m   the far touchline of a wide, and the far half in an establisher
+ *   lod2 > 90m   a shape, and the permanent shadow caster at every distance
+ *
+ * The cost was MEASURED, A against B, same build, only this line changed
+ * (tools/capture.mjs, --players skinned --bake):
+ *
+ *   midfield_wide    [26,52]  623k tris  317 calls   tiers  0 / 11 / 11
+ *                    [45,90]  791k tris  319 calls   tiers  2 / 20 /  0
+ *   setpiece_corner  [26,52]  579k tris  326 calls   tiers  1 /  9 / 12
+ *                    [45,90]  771k tris  331 calls   tiers  6 / 14 /  2
+ *
+ * — about +170k to +190k triangles a frame, and essentially no extra draw
+ * calls, because a level change moves a player between meshes rather than
+ * adding one. `npm run app:bench -- --pin window` then prices it on the real
+ * GPU at 1470x799 @ DPR 2: 60 fps in all four situations, 1% low 56.5–57.7,
+ * 2.1–3.5 ms of GPU work a frame against a 16.7 ms budget. The triangles were
+ * never the constraint; the draw calls were, and the shadow-proxy merge in
+ * characterAssets.ts paid for this change several times over.
+ *
  * The margin stops a player jogging along a band edge from flickering between
- * two detail levels once a frame.
+ * two detail levels once a frame. It is wider than it was because the bands are
+ * further out, and a player's distance changes faster in metres per second the
+ * further away he is from a camera that is itself tracking play.
  */
-export const LOD_BANDS_M = [26, 52];
-const LOD_HYSTERESIS_M = 3;
+export const LOD_BANDS_M = [45, 90];
+const LOD_HYSTERESIS_M = 5;
 
-/** Beyond this the mixer ticks at half rate. */
-export const SKINNED_NEAR_M = 45;
+/**
+ * Beyond this the mixer ticks at half rate.
+ *
+ * Deliberately just past the lod0 band plus its hysteresis: a player drawn at
+ * full detail is a player close enough for a 30Hz mixer to read as a stutter in
+ * his hands, and the two tests drifting apart is what produced the artefact the
+ * comment in updateLOD() describes.
+ */
+export const SKINNED_NEAR_M = 52;
 
 /** Playback rate is clamped: a walk cycle at 3x is a cartoon, at 0.2x it is a
  *  freeze frame, and neither is better than a small amount of foot slide. */
@@ -364,11 +404,13 @@ export class SkinnedPlayerMesh {
    * this is nothing but a visibility flag — no rebuild, no re-bind, and never
    * a frame where the swapped-in mesh has not been posed yet.
    *
-   * Shadows do not follow the visible level. The lowest level is permanently
-   * on SHADOW_LAYER, which the cascade cameras draw and the game camera does
-   * not: a close player is drawn once at 28k triangles and casts off 1.5k
-   * instead of feeding 28k into three cascades. That single change is most of
-   * the frame this pipeline got back.
+   * Shadows do not follow the visible level, and no longer share a mesh with
+   * it: every player carries a dedicated proxy — one merged skinned mesh at
+   * the lowest detail, permanently visible, permanently on SHADOW_LAYER, which
+   * the cascade cameras draw and the game camera does not. So a close player
+   * is drawn once at 28k triangles and casts off ~3k into three cascades, and
+   * — unlike the arrangement this replaced — he casts at every distance
+   * instead of only past the last band.
    *
    * Mixer rate also drops past SKINNED_NEAR_M.
    */
@@ -399,12 +441,14 @@ export class SkinnedPlayerMesh {
         m.visible = on && (tier === 0 || !/low-poly|eye/i.test(m.name));
       }
     }
-    // the shadow proxy draws for the cascades only — unless it IS the visible
-    // level, in which case it needs the camera's layer back
-    for (const m of this.inst.shadowMeshes) {
-      m.layers.set(SHADOW_LAYER);
-      if (tier === this.inst.levels.length - 1) m.layers.enable(0);
-    }
+    // The shadow proxy is deliberately NOT touched here. It used to be: the
+    // caster was the lowest level's own meshes, and this loop re-layered them
+    // every time the tier changed — but the loop above had already set
+    // `visible = false` on them, and three's shadow pass skips an invisible
+    // object before it looks at a layer. Every player nearer than the last
+    // band cast nothing at all. The proxy is now its own mesh, permanently
+    // visible and permanently on SHADOW_LAYER (CharacterRig.instance), so the
+    // detail level and the shadow have nothing to say to each other.
   }
 
   update(dt: number, x: number, y: number, z: number, facing: number, speed: number,

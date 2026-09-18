@@ -18,6 +18,7 @@
     "app:prod": "npm run build && electron electron/main.cjs",
     "app:build": "npm run build && node electron/package.mjs",
     "app:smoke": "node electron/smoke.mjs",
+    "app:bench": "node electron/bench.mjs",
     "test:input": "tsx src/input/input.test.ts"
   },
   "repository": {

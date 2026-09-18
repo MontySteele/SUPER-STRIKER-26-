@@ -21,9 +21,34 @@ blender -b --python pipeline/characters/make_player.py -- spec.json out_dir [--s
 
 Builds one human from a JSON spec (macro sliders, race mix, skin, hair, brows, lashes, teeth,
 shirt, shorts, shoes, hair colour), rigs it with MPFB's built-in **Mixamo** skeleton (52 bones,
-`mixamorig:*` names), bakes shape keys and clothing delete-groups, drops helper geometry, scales
-textures to 1024, and exports `<name>.glb` (WEBP textures, ~2 MB, ~38k triangles) plus two preview
-renders. Specs for the roster live in `characters/specs/`.
+`mixamorig:*` names), bakes shape keys and clothing delete-groups, drops helper geometry, and
+exports `<name>.glb` (WEBP textures, ~2.1–2.4 MB, ~35–37k triangles) plus `_lod1`/`_lod2`
+siblings and two preview renders. Specs for the roster live in `characters/specs/`.
+
+Three things it does that are not obvious:
+
+* **Texture budget per part, not per file.** `tex_max` (2048) is the *skin* — the one map a
+  broadcast close-up resolves, and the only one the MPFB library ships above 1024 that is worth
+  keeping there. `tex_parts` (1024) is hair, boots and garments; `tex_hidden` (256) is the teeth,
+  tongue, brows and lashes, which `CULL_MESHES` in `characterAssets.ts` drops before anything is
+  drawn; `tex_lod` (512) is everything, re-scaled after the full-detail GLB is written, so the two
+  LOD siblings stop re-embedding a byte-identical copy of the same 2048 skin. The runtime hands
+  level 0's materials to every level, so the LOD maps are a fallback, not what is drawn. Net effect
+  of the 2048 rebake: the roster went **18.7 MB → 15.4 MB** while the skin got four times the texels.
+* **Normal maps.** MPFB's GAMEENGINE material tree has a normal-map branch but only wires it when
+  the `.mhmat` spells the key `normalmapTexture`; most community assets spell it `bumpTexture`,
+  which the parser aliases to `bumpmapTexture` — a key that branch never reads. So the script finds
+  the `.mhmat` beside each diffuse and wires the branch itself. Today that is the shorts (the
+  swimming-trunks asset ships a 2048 NRM); anything else in the pack that grows one is picked up
+  for free. It refuses a bump map that is the diffuse itself, which is how the brows declare theirs.
+* **Surface response in the file.** The GAMEENGINE tree leaves every Principled at roughness 0.5,
+  which under ACES reads as damp plastic on everything from a shin to a boot. `SURFACE` writes a
+  sensible roughness/metallic per material (cornea 0.12, boot 0.38, skin 0.58, fabric 0.85), which
+  `fixCharacterMaterial` then only ever *raises*.
+
+`lods` defaults to `[0.55, 0.15]`. 0.35 was too brutal for lod1's real job: with the detail bands
+at `[45, 90]` m, lod1 is where most of a broadcast frame's players live, and a 0.35 collapse eats
+the hands and squares off the shoulders visibly at 50 m.
 
 ## Animation — `anim/retarget_bvh.py`
 

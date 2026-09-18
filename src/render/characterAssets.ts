@@ -30,8 +30,9 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { PlayerData } from '../data/types';
-import { queueBroadcastSkin, queueShaderPatch } from './materials';
+import { SHADOW_LAYER, queueBroadcastSkin, queueShaderPatch } from './materials';
 import { luminance, shade, type KitColors } from './TextureLab';
 import type { KitSpec } from './playerMesh';
 
@@ -336,19 +337,44 @@ export function fixCharacterMaterial(mat: THREE.Material, meshName: string,
   std.side = TWO_SIDED.test(id) ? THREE.DoubleSide : THREE.FrontSide;
   std.shadowSide = std.side === THREE.DoubleSide ? THREE.DoubleSide : THREE.FrontSide;
 
-  // The exporter ships everything at metalness 0 / roughness ~0.5, which under
-  // ACES plus a bright environment reads as damp plastic.
-  if (/base|body|teeth|tongue/i.test(id)) {
-    std.roughness = Math.max(std.roughness, 0.62);
-    std.envMapIntensity = 0.45;
-  } else if (/low-poly|eye/i.test(id)) {
-    std.roughness = 0.18;
+  // Surface response, per PART.
+  //
+  // The MPFB GAMEENGINE tree used to ship everything at roughness ~0.5 /
+  // metalness 0, which under ACES plus a bright environment reads as damp
+  // plastic on every one of them; make_player.py now writes a sensible number
+  // per material into the file, and these clamps are the renderer's floor under
+  // it (Math.max, so a re-bake that chooses something rougher still wins).
+  //
+  // The bands are the ones the eye actually separates at broadcast distance:
+  // a cornea is wet, a moulded boot is glossy, cloth is not, and skin sits
+  // between cloth and boot — barely specular, but NOT matte, because the one
+  // thing that stops a face reading as putty is the sheen down the nose and the
+  // cheekbones catching the key.
+  if (/low-poly|cornea|eyeball/i.test(id)) {
+    std.roughness = 0.16;
+    std.metalness = 0;
     std.envMapIntensity = 1.0;
+  } else if (/shoes|boot/i.test(id)) {
+    std.roughness = Math.min(Math.max(std.roughness, 0.3), 0.42);
+    std.metalness = 0.04;              // synthetic upper, not leather
+    std.envMapIntensity = 0.85;
+  } else if (/hair|afro|short0/i.test(id)) {
+    std.roughness = Math.max(std.roughness, 0.6);
+    std.metalness = 0;
+    std.envMapIntensity = 0.5;
+  } else if (/shirt|jersey|shorts|trunks|jeans/i.test(id)) {
+    std.roughness = Math.max(std.roughness, 0.82);
+    std.metalness = 0;
+    std.envMapIntensity = 0.45;
+  } else if (/base|body|teeth|tongue/i.test(id)) {
+    std.roughness = Math.max(std.roughness, 0.54);
+    std.metalness = 0;
+    std.envMapIntensity = 0.5;
   } else {
     std.roughness = Math.max(std.roughness, 0.7);
+    std.metalness = 0;
     std.envMapIntensity = 0.55;
   }
-  std.metalness = 0;
   std.needsUpdate = true;
 }
 
@@ -597,7 +623,10 @@ function makeInPlace(clip: THREE.AnimationClip, hipsTrackName: string): number {
 
 /**
  * Where the authored t-shirt UVs put the two islands, measured off the mesh
- * (crude_male_shirt, 1024² texture space, glTF v = canvas y from the top).
+ * (crude_male_shirt). These are UV FRACTIONS, not pixels, and every painter
+ * below multiplies them by the canvas it is given — so the kit canvas can be
+ * resized (it has been: 512 → 1024) and the authored map re-baked at any
+ * resolution without a number in here changing. glTF v = canvas y from the top.
  *
  * The BACK island is the top half and is laid out UPSIDE DOWN AND MIRRORED —
  * v rises with body height and u rises with body +x, which for a viewer stood
@@ -619,7 +648,23 @@ const SHIRT_UV = {
  *  archetypes — the shoe mesh and its texture are identical across them). */
 const SOCK_UV = [0.775, 0.850, 1.0, 1.0] as const;
 
-const SHIRT_PX = 512;
+/**
+ * The kit canvas, in pixels square.
+ *
+ * This is the ONE number that decides how crisp a squad number is, because the
+ * back panel is only 0.237 × 0.520 of it: at 512 the number was 69 px tall and
+ * the surname 18, which is a grey smudge the moment a replay camera gets inside
+ * ten metres. At 1024 they are 138 and 36, which holds up at the celebration
+ * close-up (the shot that shows a back at ~3 m).
+ *
+ * The cost is per PLAYER, not per team — the number is his — so it is 22
+ * textures a match: 1024² RGBA with mips is ~5.6 MB each, ~123 MB of the
+ * unified memory on the target machine, which is the single biggest line this
+ * pipeline spends and still comfortably inside a 16 GB box. Anything above
+ * 1024 does not survive the anisotropic filtering at broadcast distance and is
+ * not worth four times that.
+ */
+const SHIRT_PX = 1024;
 
 /** One 2D canvas, sized. */
 const canvas2d = (w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] => {
@@ -677,9 +722,30 @@ export interface Archetype {
   /** R = sock coverage, G = height up the shin; painted once, shared by every
    *  kit and mixed in by the body material's shader (see sockMask) */
   sockMask: THREE.CanvasTexture | null;
+  /**
+   * ONE geometry that is the whole player's silhouette at the lowest detail
+   * level: body, shirt, shorts and boots merged, skin weights kept, UVs and
+   * everything else thrown away. This is what casts every shadow — see
+   * buildShadowGeometry() and CharacterRig.instance().
+   */
+  shadowGeometry: THREE.BufferGeometry | null;
+  /** triangles in shadowGeometry, for the budget line */
+  shadowTriangles: number;
   /** the shorts map, flattened to a neutral cloth so a kit colour can be
    *  multiplied onto it without the authored garment's own colour surviving */
   shortsMap: THREE.CanvasTexture | null;
+  /**
+   * The authored shorts NORMAL map, kept when the pipeline found one.
+   *
+   * The kit colour has to be repainted, so the diffuse is thrown away and
+   * rebuilt — but the weave, the seams and the drawstring fold are geometry,
+   * not colour, and survive a recolour untouched. MPFB's GAMEENGINE tree only
+   * wires a normal map when the .mhmat spells the key `normalmapTexture`, and
+   * the asset packs mostly spell it `bumpTexture`, so this was null until
+   * make_player.py started wiring the branch itself (see NORMAL_KEYS there).
+   * Still null for an archetype whose garment never shipped one.
+   */
+  shortsNormal: THREE.Texture | null;
 }
 
 export interface CharacterAssets {
@@ -933,13 +999,118 @@ function prepareArchetype(url: string, scenes: (THREE.Group | null)[]): Archetyp
     levels.push({ scene, triangles: Math.round(triangles) });
   }
 
+  // Every level hands its materials over to level 0's, matched by mesh name.
+  //
+  // This is what the class comment has always claimed and what the code did
+  // not do: each LOD sibling is a separate GLB, so it arrived with its own
+  // Material objects and its own decoded copies of the same skin, hair and boot
+  // maps — three sets per archetype, twelve for the roster. Nothing downstream
+  // wanted them: dress() replaces the kit parts outright, and matchCopy() keys
+  // its per-match clone on the SOURCE material's uuid, so three uuids meant
+  // three clones of one body material and three shader patches to compile.
+  //
+  // Names are stable across levels because the decimator only edits geometry,
+  // and the only thing that changes with detail is the triangle count — a
+  // material is not a detail level. A level whose name does not match (a
+  // re-bake that renamed a mesh) simply keeps its own, blurrier, map.
+  const byName = new Map<string, THREE.Material | THREE.Material[]>();
+  levels[0].scene.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (m.isMesh) byName.set(m.name, m.material);
+  });
+  for (let li = 1; li < levels.length; li++) {
+    levels[li].scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      const hit = m.isMesh ? byName.get(m.name) : undefined;
+      if (hit) m.material = hit;
+    });
+  }
+
   const arch: Archetype = {
     url, levels, scene: levels[0].scene, groundOffset: 0,
-    triangles: levels[0].triangles, sockMask: null, shortsMap: null,
+    triangles: levels[0].triangles, sockMask: null,
+    shadowGeometry: null, shadowTriangles: 0, shortsMap: null,
+    shortsNormal: null,
   };
+  const shadow = buildShadowGeometry(levels[levels.length - 1].scene);
+  arch.shadowGeometry = shadow;
+  if (shadow) {
+    const idx = shadow.getIndex();
+    arch.shadowTriangles = Math.round(
+      (idx ? idx.count : shadow.getAttribute('position').count) / 3);
+  }
   arch.sockMask = buildSockMask(arch);
   arch.shortsMap = neutralGarmentMap(arch, isShorts, 0.78);
+  arch.shortsNormal = sourceMaterialOf(arch, isShorts)?.normalMap ?? null;
   return arch;
+}
+
+// ------------------------------------------------------------ shadow proxy
+//
+// THE BUG THIS EXISTS TO KILL: the shadow caster used to BE the lowest detail
+// level's meshes, parked on SHADOW_LAYER by updateLOD(). But updateLOD also
+// hides every level except the one being drawn — so the moment a player was
+// near enough for lod0 or lod1, his caster was `visible = false`, and three's
+// shadow pass skips invisible objects before it looks at layers, materials or
+// anything else. With two players at lod0 and twenty at lod1 that is
+// twenty-two players casting nothing at all. Players had no shadows.
+//
+// The fix is to stop overloading one mesh with two jobs. A proxy is its own
+// mesh: bound to the same skeleton (so it is posed for free, every frame, with
+// no extra mixer and no second bone texture), never touched by the LOD picker,
+// permanently visible, permanently on SHADOW_LAYER — which the game camera
+// does not draw, so "permanently visible" costs the beauty pass nothing.
+//
+// And since it is its own mesh, it can be ONE mesh. Merging the lowest level's
+// body, shirt, shorts and boots into a single geometry takes a player's shadow
+// from four skinned draws per cascade to one, which is 66 draw calls a frame
+// back across a 22-man squad and three cascades.
+
+/** Parts whose silhouette a shadow actually needs. Hair is in: a shadow with a
+ *  flat skull reads as a bald man. Eyes, teeth and brows are not. */
+const SHADOW_PARTS = (m: THREE.Mesh): boolean =>
+  isBody(m) || isShirt(m) || isShorts(m) || isShoes(m) || /hair|afro|short0/i.test(nameOf(m));
+
+/** Attributes a depth-only draw needs. Everything else (uv, uv2, tangent,
+ *  colour) is buffer the shadow pass never reads. */
+const SHADOW_ATTRS = ['position', 'normal', 'skinIndex', 'skinWeight'];
+
+/**
+ * Merge one detail level's silhouette parts into a single skinned geometry.
+ *
+ * Returns null — and the caller falls back to per-part proxies — if the parts
+ * do not agree on a bind matrix or an attribute set, because a merge across
+ * two different bind poses is a player whose shadow is inside out.
+ */
+function buildShadowGeometry(scene: THREE.Group): THREE.BufferGeometry | null {
+  const parts: THREE.SkinnedMesh[] = [];
+  scene.traverse((o) => {
+    const m = o as THREE.SkinnedMesh;
+    if (m.isSkinnedMesh && SHADOW_PARTS(m)) parts.push(m);
+  });
+  if (!parts.length) return null;
+
+  const bind = parts[0].bindMatrix;
+  const geos: THREE.BufferGeometry[] = [];
+  for (const part of parts) {
+    if (!part.bindMatrix.equals(bind)) {
+      console.warn(`characters: ${part.name} has its own bind matrix`
+        + ' — shadow proxy falls back to per-part meshes');
+      return null;
+    }
+    const g = part.geometry.clone();
+    for (const name of Object.keys(g.attributes)) {
+      if (!SHADOW_ATTRS.includes(name)) g.deleteAttribute(name);
+    }
+    if (SHADOW_ATTRS.some((n) => !g.getAttribute(n))) return null;
+    if (!g.getIndex()) return null;
+    g.clearGroups();
+    g.morphAttributes = {};
+    geos.push(g);
+  }
+  const merged = mergeGeometries(geos, false);
+  for (const g of geos) g.dispose();
+  return merged;
 }
 
 /** Which garment a mesh is, tolerant of the asset pipeline renaming things
@@ -968,7 +1139,11 @@ function neutralGarmentMap(arch: Archetype, pick: (m: THREE.Mesh) => boolean,
   target: number): THREE.CanvasTexture | null {
   const img = sourceImageOf(arch, pick);
   if (!img) return null;
-  const N = 256;
+  // 512, not 256: the map is multiplied by the kit colour and is therefore the
+  // only thing carrying the crease and seam detail of the shorts. At 256 the
+  // seams were a suggestion; the normal map now sitting alongside it is 1024
+  // and wants a diffuse that can keep up.
+  const N = 512;
   const [c, ctx] = canvas2d(N, N);
   ctx.drawImage(img, 0, 0, N, N);
   const data = ctx.getImageData(0, 0, N, N);
@@ -993,21 +1168,30 @@ function neutralGarmentMap(arch: Archetype, pick: (m: THREE.Mesh) => boolean,
   return tex;
 }
 
-/** The first image on a mesh the predicate likes, at any detail level. */
-function sourceImageOf(arch: Archetype, pick: (m: THREE.Mesh) => boolean):
-CanvasImageSource | null {
-  let img: CanvasImageSource | null = null;
+/** The first material on a mesh the predicate likes, at any detail level. */
+function sourceMaterialOf(arch: Archetype, pick: (m: THREE.Mesh) => boolean):
+THREE.MeshStandardMaterial | null {
+  let found: THREE.MeshStandardMaterial | null = null;
+  let any: THREE.MeshStandardMaterial | null = null;
   for (const level of arch.levels) {
     level.scene.traverse((o) => {
       const m = o as THREE.Mesh;
-      if (img || !m.isMesh || !pick(m)) return;
+      if (found || !m.isMesh || !pick(m)) return;
       const mat = (Array.isArray(m.material) ? m.material[0] : m.material) as THREE.MeshStandardMaterial;
-      const src = mat.map?.image as CanvasImageSource | undefined;
-      if (src) img = src;
+      any ??= mat;
+      // prefer one that actually carries the authored map: that is what every
+      // caller is really after
+      if (mat?.map) found = mat;
     });
-    if (img) break;
+    if (found) break;
   }
-  return img;
+  return found ?? any;
+}
+
+/** The first image on a mesh the predicate likes, at any detail level. */
+function sourceImageOf(arch: Archetype, pick: (m: THREE.Mesh) => boolean):
+CanvasImageSource | null {
+  return (sourceMaterialOf(arch, pick)?.map?.image as CanvasImageSource | undefined) ?? null;
 }
 
 // ------------------------------------------------------------------- socks
@@ -1312,6 +1496,8 @@ export class CharacterRig {
    * dance idempotent again. Textures are shared and deliberately NOT cloned.
    */
   private matClones = new Map<string, THREE.MeshStandardMaterial>();
+  /** one depth-only material for every shadow proxy in the match */
+  private shadowMat: THREE.MeshBasicMaterial | null = null;
   private kitShirtBase = new Map<string, HTMLCanvasElement>();
   private shirtMats = new Map<string, THREE.MeshStandardMaterial>();
   private shortsMats = new Map<string, THREE.MeshStandardMaterial>();
@@ -1323,6 +1509,23 @@ export class CharacterRig {
 
   clip(id: ClipId): PreparedClip | undefined {
     return this.assets.clips.get(id);
+  }
+
+  /**
+   * The shadow proxies' material: one, shared by all 22.
+   *
+   * three does not draw this — it DERIVES a depth material from it for the
+   * shadow pass — so the only things that matter are the ones that change that
+   * derivation: no map and no alphaTest means the cheapest skinned depth
+   * shader there is, and one material across the squad means one shader
+   * program and no per-player state change between cascades.
+   */
+  private shadowMaterial(): THREE.MeshBasicMaterial {
+    if (!this.shadowMat) {
+      this.shadowMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+      this.owned.push(this.shadowMat);
+    }
+    return this.shadowMat;
   }
 
   /** Triangles per player at each detail level, for the budget line. */
@@ -1400,10 +1603,40 @@ export class CharacterRig {
       levels.push({ meshes });
     }
 
-    // the lowest level doubles as the shadow proxy (see SHADOW_LAYER)
-    const shadowMeshes = levels[levels.length - 1].meshes
-      .filter((m) => isBody(m) || isShirt(m) || isShorts(m) || isShoes(m));
-    for (const m of shadowMeshes) m.castShadow = true;
+    // The shadow proxy: its own mesh, its own geometry, never a detail level.
+    // See the buildShadowGeometry() block for why this is not the lod2 mesh
+    // wearing a second hat — that arrangement meant no player cast a shadow
+    // unless he happened to be past the last band.
+    const shadowMeshes: THREE.SkinnedMesh[] = [];
+    if (shared && arch.shadowGeometry) {
+      const proxy = new THREE.SkinnedMesh(arch.shadowGeometry, this.shadowMaterial());
+      proxy.name = 'shadowProxy';
+      proxy.bindMode = levels[0].meshes[0]?.bindMode ?? proxy.bindMode;
+      proxy.bind(shared as THREE.Skeleton, levels[0].meshes[0]?.bindMatrix);
+      meshParent.add(proxy);
+      shadowMeshes.push(proxy);
+    } else {
+      // fallback: the lowest level's silhouette parts, CLONED so the LOD
+      // picker's visibility flags cannot reach them
+      for (const src of levels[levels.length - 1].meshes.filter(SHADOW_PARTS)) {
+        const m = new THREE.SkinnedMesh(src.geometry, this.shadowMaterial());
+        m.name = `${src.name}.shadow`;
+        m.bindMode = src.bindMode;
+        m.bind(src.skeleton, src.bindMatrix);
+        meshParent.add(m);
+        shadowMeshes.push(m);
+      }
+    }
+    for (const m of shadowMeshes) {
+      m.castShadow = true;
+      m.receiveShadow = false;
+      m.frustumCulled = false;
+      // permanently visible and permanently invisible: SHADOW_LAYER is drawn
+      // by the cascade cameras and by scene.ts's shadow probe, and by nothing
+      // the player ever looks at
+      m.visible = true;
+      m.layers.set(SHADOW_LAYER);
+    }
 
     return {
       root,
@@ -1548,7 +1781,7 @@ export class CharacterRig {
     tex.flipY = false;
     tex.anisotropy = 8;
     const mat = new THREE.MeshStandardMaterial({
-      map: tex, roughness: 0.74, metalness: 0,
+      map: tex, roughness: 0.82, metalness: 0, envMapIntensity: 0.45,
       alphaTest: 0.5, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide,
     });
     queueBroadcastSkin(mat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
@@ -1574,7 +1807,11 @@ export class CharacterRig {
     if (hit) return hit;
     const mat = new THREE.MeshStandardMaterial({
       map: arch.shortsMap, color: new THREE.Color(kit.shorts),
-      roughness: 0.78, metalness: 0,
+      // the authored weave survives the recolour as a normal map even though
+      // the colour does not (see Archetype.shortsNormal)
+      normalMap: arch.shortsNormal,
+      normalScale: new THREE.Vector2(0.6, 0.6),
+      roughness: 0.84, metalness: 0, envMapIntensity: 0.45,
       alphaTest: 0.5, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide,
     });
     queueBroadcastSkin(mat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.06, rimPower: 3.6 });
@@ -1595,7 +1832,10 @@ export class CharacterRig {
     const hit = this.bootMats.get(key);
     if (hit) return hit;
     const img = sourceImageOf(arch, isShoes);
-    const N = 512;
+    // the authored shoes06 atlas is 1024²; painting it into a smaller canvas
+    // threw away the lace and panel detail that is the only thing making a
+    // boot read as a boot in a slide-tackle close-up
+    const N = 1024;
     const [c, ctx] = canvas2d(N, N);
     if (img) recolour(ctx, img, N, N, '#191c22', 0.28);
     else { ctx.fillStyle = '#191c22'; ctx.fillRect(0, 0, N, N); }
@@ -1604,8 +1844,11 @@ export class CharacterRig {
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.flipY = false;
     tex.anisotropy = 8;
+    // A moulded synthetic boot is the glossiest thing on a player: it is the
+    // only part that takes a hard highlight off the floodlights, and it is what
+    // separates "wearing boots" from "feet painted black".
     const mat = new THREE.MeshStandardMaterial({
-      map: tex, roughness: 0.55, metalness: 0,
+      map: tex, roughness: 0.34, metalness: 0.04, envMapIntensity: 0.85,
       alphaTest: 0.5, side: THREE.FrontSide,
     });
     queueBroadcastSkin(mat, { wrap: 0.2, wrapTint: 0xf2ece6, rim: 0.08, rimPower: 3.2 });
@@ -1619,6 +1862,7 @@ export class CharacterRig {
   dispose(): void {
     for (const o of this.owned) o.dispose();
     this.owned = [];
+    this.shadowMat = null;
     this.matClones.clear();
     this.shirtMats.clear();
     this.shortsMats.clear();

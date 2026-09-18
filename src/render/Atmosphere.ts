@@ -50,6 +50,21 @@ interface Preset {
 const dir = (x: number, y: number, z: number): THREE.Vector3 =>
   new THREE.Vector3(x, y, z).normalize();
 
+/**
+ * Put a light on SHADOW_LAYER as well as its own.
+ *
+ * SceneManager's shadow pass runs from a probe camera whose mask is
+ * SHADOW_LAYER alone (see drawShadows), and three collects the lights for a
+ * render by testing each one against THAT mask. A light the probe cannot see
+ * is a light with no shadow map. Every light in the rig goes on the layer, not
+ * just the shadow-casting key: the probe and the real render must agree on the
+ * light counts or every material in the scene gets compiled twice, once per
+ * camera, and swaps programs every frame.
+ */
+const lightSeesShadowPass = (...lights: (THREE.Light | null)[]): void => {
+  for (const l of lights) l?.layers.enable(SHADOW_LAYER);
+};
+
 // Late-afternoon angles for day and sunset: the sun is low and off to the west
 // end, so every player drags a long shadow across the mowing stripes. That one
 // choice does more for "this is a real broadcast" than any post effect.
@@ -185,6 +200,7 @@ export class Atmosphere {
       key.target.position.set(0, 0, 0);
       scene.add(key, key.target);
       this.legacyKey = key;
+      lightSeesShadowPass(key, this.hemi);
 
       scene.fog = new THREE.Fog(p.fog, p.fogNear, p.fogFar);
       scene.background = new THREE.Color(p.fog);
@@ -217,26 +233,41 @@ export class Atmosphere {
       maxFar: CSM_MAX_FAR,
       mode: 'practical',
       shadowMapSize: profile.shadowMapSize,
-      shadowBias: -0.0006,
+      // depth bias scales with the texel: HIGH doubled the map to 2048, so the
+      // slope error inside one texel halved and so does this. Left at -0.0006
+      // a 2048 rig peter-pans — the near cascade's texels are ~2cm of pitch
+      // and the old bias is most of a boot sole.
+      shadowBias: profile.shadowMapSize >= 2048 ? -0.0003 : -0.0006,
       lightDirection: p.sunDir.clone().negate(),
       lightIntensity: p.keyIntensity,
       lightNear: 1,
       lightFar: 900,
       lightMargin: 120,
     });
+    lightSeesShadowPass(this.hemi, this.bounce);
     for (const light of this.csm.lights) {
       light.color.set(p.keyColor);
-      // The cascade shadow cameras also draw the SHADOW-PROXY layer, which the
-      // game camera does not. That is how a skinned player casts a shadow off
-      // his cheapest mesh while the camera draws his most expensive one — see
-      // SHADOW_LAYER in skinnedPlayer.ts. Harmless for everything else: nothing
-      // outside that pipeline puts anything on the layer.
-      light.shadow.camera.layers.enable(SHADOW_LAYER);
+      lightSeesShadowPass(light);
+      // NOT light.shadow.camera.layers: three never consults the shadow
+      // camera's mask. What decides a shadow map's contents is the mask of the
+      // camera passed to WebGLShadowMap.render, which is why the shadow pass
+      // is driven from SceneManager.drawShadows() by a probe camera that sees
+      // SHADOW_LAYER — and why the light above has to be on it as well, or the
+      // probe collects no lights and quietly renders no shadows at all.
       // CSM has no knob for either of these. normalBias kills the acne a 105m
       // pitch under a low sun would otherwise show everywhere; radius is what
       // the PCF tap kernel spreads by, i.e. how soft the edge reads.
-      light.shadow.normalBias = 0.035;
-      light.shadow.radius = 2.2;
+      //
+      // Both are texel-relative, so both follow the map size. At 2048 the
+      // normal offset that used to be needed is half a texel of over-push —
+      // visible as a gap under the boot on the tele cam — and 2.2 texels of
+      // PCF radius is half the penumbra it used to be, which reads as a hard
+      // edge. 3.0 texels at 2048 is slightly CRISPER than 2.2 at 1024 and
+      // still five Vogel taps wide, which is the trade we want: sharper
+      // contact, same softness class.
+      const fine = profile.shadowMapSize >= 2048;
+      light.shadow.normalBias = fine ? 0.018 : 0.035;
+      light.shadow.radius = fine ? 3.0 : 2.2;
     }
 
     if (profile.env) {
@@ -287,6 +318,16 @@ export class Atmosphere {
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const m of mats) this.registerMaterial(m);
     });
+  }
+
+  /**
+   * Every light in the rig that owns a shadow map, for SceneManager's explicit
+   * shadow pass (see SceneManager.drawShadows — three's automatic one cannot
+   * see the shadow-proxy layer).
+   */
+  shadowLights(): THREE.Light[] {
+    if (this.csm) return this.csm.lights as unknown as THREE.Light[];
+    return this.legacyKey ? [this.legacyKey] : [];
   }
 
   /** Called once per drawn frame, before the composer runs. */

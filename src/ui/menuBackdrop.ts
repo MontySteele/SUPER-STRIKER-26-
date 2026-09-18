@@ -2,17 +2,31 @@
 // depth-of-field 3D player render backdrop").
 //
 // A small dedicated three.js scene — NOT the match renderer: two skinned
-// players in the current kits, three lights, no shadow maps, no post stack,
-// rendered at a fraction of the CSS resolution into its own canvas and scaled
-// back up by the compositor. That upscale is the depth of field: it costs
-// nothing (a full-screen CSS `filter: blur()` costs a whole raster pass and
-// looks the same) and it is exactly the soft, slightly out-of-focus figure a
-// PS3 front end put behind its menus. A CSS vignette finishes the grade.
+// players in the current kits, three lights, no shadow maps.
 //
-// Budget: ~16k triangles, 1 draw pass, 3 lights, and a backing store between a
-// quarter and a half of the frame — around 1ms/frame on an M3, and the main
-// menu suspends the CPU-vs-CPU attract match while this is up, so the front end
-// is CHEAPER than it was. It stops rendering the moment the page is hidden.
+// THE DEPTH OF FIELD USED TO BE A LIE. The backing store was rendered at
+// 0.26-0.42 of the CSS size and the compositor's bilinear upscale was called
+// "defocus". On a Retina panel that is not a lens, it is a 4x upscale of a
+// quarter-resolution image, and it reads exactly like what it is: the players'
+// faces are mush and the kit numbers are a smear. The rule for a menu is the
+// opposite of a lens — the SUBJECT must be the sharpest thing on screen.
+//
+// So the chain now is:
+//
+//   scene → sceneRT (full res, half-float, linear)
+//         → 9-tap separable Gaussian at HALF res (two passes)
+//         → composite: mix(sharp, blurred) by a radial mask centred on the
+//           figures, then ACES + vignette + sRGB, straight to the canvas.
+//
+// The players are drawn at full device resolution and stay sharp in both
+// states; what the mask softens is the fall-off around them, which is where a
+// real lens loses focus anyway. The menu state widens the mask and drops two
+// stops instead of dropping resolution.
+//
+// Budget: ~16k triangles, one scene pass and three fullscreen passes (two of
+// them at quarter the pixels) — ~2ms/frame on an M3, against a front end that
+// suspends the attract match while this is up. It stops rendering the moment
+// the page is hidden.
 //
 // It NEVER edits the character pipeline: CharacterRig/preloadCharacters are
 // used exactly as the match renderer uses them.
@@ -26,14 +40,16 @@ import { pickStartingXI } from '../data/loader';
 import type { PlayerData, TeamData } from '../data/types';
 
 /**
- * Render scale — this IS the lens. The backing store is rendered at a fraction
- * of the CSS size and the compositor's bilinear upscale does the defocusing,
- * which is both the cheapest possible blur and the one a PS3 menu actually
- * used. The title is the sharper of the two because the figures are the
- * subject there; behind the menus they are wallpaper.
+ * The lens, as a real depth of field: how much of the frame stays sharp around
+ * the figures, and how strongly everything outside that is blurred. The title
+ * screen holds focus wide (the figures ARE the picture); behind the menus the
+ * circle of sharpness closes down and the surround goes soft, so the type
+ * wins — without ever softening the players themselves.
  */
-const RES_TITLE = 0.42;
-const RES_MENU = 0.26;
+const FOCUS_TITLE = { inner: 0.44, outer: 0.95, amount: 0.55 };
+const FOCUS_MENU = { inner: 0.26, outer: 0.72, amount: 0.9 };
+/** Gaussian radius in half-res texels — the blur's actual strength. */
+const BLUR_RADIUS = 2.6;
 /** Exposure follows suit: the menus need the type to win. */
 const EXPOSURE_TITLE = 0.95;
 const EXPOSURE_MENU = 0.52;
@@ -54,6 +70,15 @@ interface Actor {
   inst: CharacterInstance;
   mixer: THREE.AnimationMixer;
 }
+
+/** Shared by the blur and composite passes: a full-screen triangle-ish quad. */
+const QUAD_VS = /* glsl */`
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
 
 export class MenuBackdrop {
   private canvas: HTMLCanvasElement;
@@ -76,6 +101,18 @@ export class MenuBackdrop {
   private defocused = false;
   private frozen = false;
   private resize: () => void;
+  /** the post chain (see the header): full-res scene, half-res blur, composite */
+  private sceneRT: THREE.WebGLRenderTarget | null = null;
+  private blurA: THREE.WebGLRenderTarget | null = null;
+  private blurB: THREE.WebGLRenderTarget | null = null;
+  private quadScene = new THREE.Scene();
+  private quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private quad: THREE.Mesh | null = null;
+  private blurMat: THREE.ShaderMaterial | null = null;
+  private compMat: THREE.ShaderMaterial | null = null;
+  /** eased towards FOCUS_TITLE / FOCUS_MENU so the rack is a MOVE, not a cut */
+  private focus = { ...FOCUS_TITLE };
+  private exposure = EXPOSURE_TITLE;
 
   constructor(private parent: HTMLElement) {
     this.fallback = document.createElement('div');
@@ -95,10 +132,13 @@ export class MenuBackdrop {
         canvas: this.canvas, antialias: false, alpha: false,
         powerPreference: 'low-power', depth: true, stencil: false,
       });
-      this.renderer.setPixelRatio(RES_TITLE);
+      // full device resolution, capped at 2 exactly like the match renderer
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      this.renderer.toneMappingExposure = EXPOSURE_TITLE;
+      // the tone-map lives in the composite shader (three skips tone mapping
+      // when it draws into a render target, so doing it here would apply the
+      // curve to the screen pass only — and twice to nothing)
+      this.renderer.toneMapping = THREE.NoToneMapping;
     } catch {
       // a second WebGL context is not always available (context limits, a lost
       // GPU). The styled fallback is a perfectly good title screen.
@@ -107,6 +147,7 @@ export class MenuBackdrop {
     }
 
     this.buildStage();
+    this.buildPost();
     this.sizeToParent();
     this.last = performance.now();
     this.raf = requestAnimationFrame((n) => this.loop(n));
@@ -130,6 +171,12 @@ export class MenuBackdrop {
     });
     this.rig?.dispose();
     this.rig = null;
+    this.sceneRT?.dispose();
+    this.blurA?.dispose();
+    this.blurB?.dispose();
+    this.quad?.geometry.dispose();
+    this.blurMat?.dispose();
+    this.compMat?.dispose();
     this.renderer?.dispose();
     this.renderer = null;
     this.canvas.remove();
@@ -137,18 +184,16 @@ export class MenuBackdrop {
   }
 
   /**
-   * Where the figures stand in frame, and how sharp they are. The title screen
-   * wants them centred behind the logo and reasonably crisp; every other screen
-   * needs the middle of the screen for the UI, so they slide over to stage
-   * right, drop to a quarter-resolution backing store and lose two stops.
+   * Where the figures stand in frame, and how the lens is racked. The title
+   * screen wants them centred behind the logo with focus held wide; every
+   * other screen needs the middle of the screen for the UI, so they slide over
+   * to stage right, the circle of sharpness closes down around them and the
+   * whole plate loses two stops. The PLAYERS never lose resolution.
    */
   setFocus(toTheSide: boolean): void {
     this.panWanted = toTheSide ? PAN_SIDE : 0;
-    if (!this.renderer || toTheSide === this.defocused) return;
+    if (!this.renderer) return;
     this.defocused = toTheSide;
-    this.renderer.setPixelRatio(toTheSide ? RES_MENU : RES_TITLE);
-    this.renderer.toneMappingExposure = toTheSide ? EXPOSURE_MENU : EXPOSURE_TITLE;
-    this.sizeToParent();
   }
 
   /**
@@ -212,12 +257,137 @@ export class MenuBackdrop {
     this.camera.lookAt(this.target);
   }
 
+  /** The post chain: two shaders and one quad, reused by all three passes. */
+  private buildPost(): void {
+    this.sceneRT = new THREE.WebGLRenderTarget(1, 1, {
+      type: THREE.HalfFloatType, depthBuffer: true, stencilBuffer: false,
+    });
+    this.sceneRT.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    const half = (): THREE.WebGLRenderTarget => {
+      const rt = new THREE.WebGLRenderTarget(1, 1, {
+        type: THREE.HalfFloatType, depthBuffer: false, stencilBuffer: false,
+      });
+      rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+      return rt;
+    };
+    this.blurA = half();
+    this.blurB = half();
+
+    this.blurMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tSrc: { value: null as THREE.Texture | null },
+        dir: { value: new THREE.Vector2(1, 0) },
+      },
+      vertexShader: QUAD_VS,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tSrc;
+        uniform vec2 dir;
+        varying vec2 vUv;
+        void main() {
+          // 9 taps, binomial weights, in linear light — blurring a tone-mapped
+          // image is what makes a cheap defocus look like grey mud
+          float w[5];
+          w[0] = 0.2270270; w[1] = 0.1945946; w[2] = 0.1216216;
+          w[3] = 0.0540541; w[4] = 0.0162162;
+          vec3 sum = texture2D(tSrc, vUv).rgb * w[0];
+          for (int i = 1; i < 5; i++) {
+            vec2 o = dir * float(i);
+            sum += texture2D(tSrc, vUv + o).rgb * w[i];
+            sum += texture2D(tSrc, vUv - o).rgb * w[i];
+          }
+          gl_FragColor = vec4(sum, 1.0);
+        }
+      `,
+      depthTest: false, depthWrite: false,
+    });
+
+    this.compMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tSharp: { value: null as THREE.Texture | null },
+        tBlur: { value: null as THREE.Texture | null },
+        focus: { value: new THREE.Vector2(0.5, 0.5) },
+        aspect: { value: new THREE.Vector2(1.78, 1) },
+        inner: { value: FOCUS_TITLE.inner },
+        outer: { value: FOCUS_TITLE.outer },
+        amount: { value: FOCUS_TITLE.amount },
+        exposure: { value: EXPOSURE_TITLE },
+        vignette: { value: 0.34 },
+      },
+      vertexShader: QUAD_VS,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tSharp;
+        uniform sampler2D tBlur;
+        uniform vec2 focus;
+        uniform vec2 aspect;
+        uniform float inner;
+        uniform float outer;
+        uniform float amount;
+        uniform float exposure;
+        uniform float vignette;
+        varying vec2 vUv;
+
+        vec3 RRTAndODTFit(vec3 v) {
+          vec3 a = v * (v + 0.0245786) - 0.000090537;
+          vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+          return a / b;
+        }
+        vec3 aces(vec3 color) {
+          const mat3 inMat = mat3(
+            0.59719, 0.07600, 0.02840,
+            0.35458, 0.90834, 0.13383,
+            0.04823, 0.01566, 0.83777);
+          const mat3 outMat = mat3(
+             1.60475, -0.10208, -0.00327,
+            -0.53108,  1.10813, -0.07276,
+            -0.07367, -0.00605,  1.07602);
+          color *= exposure / 0.6;
+          color = outMat * RRTAndODTFit(inMat * color);
+          return clamp(color, 0.0, 1.0);
+        }
+        vec3 toSRGB(vec3 c) {
+          return mix(c * 12.92,
+            1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055,
+            step(vec3(0.0031308), c));
+        }
+
+        void main() {
+          vec3 sharp = texture2D(tSharp, vUv).rgb;
+          vec3 soft = texture2D(tBlur, vUv).rgb;
+          // the lens: sharp on the figures, falling off around them. aspect
+          // keeps the circle a circle on a 21:9 window.
+          float d = length((vUv - focus) * aspect);
+          float coc = smoothstep(inner, outer, d) * amount;
+          vec3 c = mix(sharp, soft, coc);
+          c = aces(c);
+          float v = distance(vUv, vec2(0.5));
+          c *= 1.0 - vignette * smoothstep(0.30, 0.95, v);
+          gl_FragColor = vec4(toSRGB(c), 1.0);
+        }
+      `,
+      depthTest: false, depthWrite: false,
+    });
+
+    this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.blurMat);
+    this.quad.frustumCulled = false;
+    this.quadScene.add(this.quad);
+  }
+
   private sizeToParent(): void {
     const w = Math.max(320, this.parent.clientWidth || window.innerWidth);
     const h = Math.max(240, this.parent.clientHeight || window.innerHeight);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer?.setSize(w, h, false);
+    if (!this.renderer) return;
+    const ratio = this.renderer.getPixelRatio();
+    const pw = Math.max(2, Math.round(w * ratio));
+    const ph = Math.max(2, Math.round(h * ratio));
+    this.sceneRT?.setSize(pw, ph);
+    // the blur runs at half res in each axis: a quarter of the pixels for a
+    // Gaussian nobody can tell from the full-res one once it is this wide
+    this.blurA?.setSize(Math.max(1, pw >> 1), Math.max(1, ph >> 1));
+    this.blurB?.setSize(Math.max(1, pw >> 1), Math.max(1, ph >> 1));
+    if (this.compMat) this.compMat.uniforms.aspect.value.set(w / h, 1);
   }
 
   // ----------------------------------------------------------------- actors
@@ -319,9 +489,68 @@ export class MenuBackdrop {
     this.target.set(this.pan + Math.sin(t * 0.052) * 0.09, 1.02 + Math.sin(t * 0.071) * 0.03, 0);
     this.camera.lookAt(this.target);
 
-    this.renderer.render(this.scene, this.camera);
+    this.draw(dt);
+  }
+
+  /**
+   * Scene → blur → composite. Kept in one place so the fallback (no render
+   * targets, e.g. a context that refused a half-float buffer) is a single
+   * early return that still puts the players on screen.
+   */
+  private draw(dt: number): void {
+    const r = this.renderer;
+    if (!r) return;
+    if (!this.sceneRT || !this.blurA || !this.blurB || !this.quad
+      || !this.blurMat || !this.compMat) {
+      r.render(this.scene, this.camera);
+      return;
+    }
+
+    // rack the lens towards wherever setFocus last asked for (~300ms)
+    const want = this.defocused ? FOCUS_MENU : FOCUS_TITLE;
+    const k = Math.min(1, dt * 7);
+    this.focus.inner += (want.inner - this.focus.inner) * k;
+    this.focus.outer += (want.outer - this.focus.outer) * k;
+    this.focus.amount += (want.amount - this.focus.amount) * k;
+    const wantExp = this.defocused ? EXPOSURE_MENU : EXPOSURE_TITLE;
+    this.exposure += (wantExp - this.exposure) * k;
+
+    r.setRenderTarget(this.sceneRT);
+    r.clear();
+    r.render(this.scene, this.camera);
+
+    const bw = this.blurA.width, bh = this.blurA.height;
+    this.quad.material = this.blurMat;
+    this.blurMat.uniforms.tSrc.value = this.sceneRT.texture;
+    this.blurMat.uniforms.dir.value.set(BLUR_RADIUS / bw, 0);
+    r.setRenderTarget(this.blurB);
+    r.render(this.quadScene, this.quadCam);
+
+    this.blurMat.uniforms.tSrc.value = this.blurB.texture;
+    this.blurMat.uniforms.dir.value.set(0, BLUR_RADIUS / bh);
+    r.setRenderTarget(this.blurA);
+    r.render(this.quadScene, this.quadCam);
+
+    // where the figures actually are on screen, so the sharp circle tracks the
+    // camera drift and the stage-right pan instead of sitting in the middle
+    const subject = SUBJECT.set(this.target.x, 1.12, this.target.z).project(this.camera);
+    this.quad.material = this.compMat;
+    const u = this.compMat.uniforms;
+    u.tSharp.value = this.sceneRT.texture;
+    u.tBlur.value = this.blurA.texture;
+    u.focus.value.set(subject.x * 0.5 + 0.5, subject.y * 0.5 + 0.5);
+    u.inner.value = this.focus.inner;
+    u.outer.value = this.focus.outer;
+    u.amount.value = this.focus.amount;
+    u.exposure.value = this.exposure;
+    r.setRenderTarget(null);
+    r.render(this.quadScene, this.quadCam);
   }
 }
+
+/** Scratch vector for projecting the subject; allocating one per frame in a
+ *  menu that runs at 60Hz is how a front end grows a GC sawtooth. */
+const SUBJECT = new THREE.Vector3();
 
 /** The team's face for the poster: the star if there is one, else a striker. */
 function heroOf(team: TeamData): PlayerData {

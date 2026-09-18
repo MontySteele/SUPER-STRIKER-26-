@@ -25,5 +25,9 @@
   "arms/measure-upperarm-length-incr": 0.7,
   "arms/measure-lowerarm-length-incr": 0.7
  },
- "shorts": "mindfront_male_swimming_trunks_01.mhclo"
+ "shorts": "mindfront_male_swimming_trunks_01.mhclo",
+ "lods": [
+  0.55,
+  0.15
+ ]
 }

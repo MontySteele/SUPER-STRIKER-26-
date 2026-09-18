@@ -34,8 +34,34 @@ npm run app:pad        # same, but boots straight into the controller bench
 npm run app:prod       # build dist/ and run the shell against the build
 npm run app:build      # build dist/ and produce release/…/SUPER STRIKER '26.app
 npm run app:smoke      # boot the built app, log the renderer console, screenshot
+npm run app:bench      # REAL-GPU benchmark: 4 seeded situations, fps + frame ms
 npm run test:input     # pad detection + deadzone + rumble unit checks (tsx)
 ```
+
+### `npm run app:bench` — the real-GPU benchmark (§7A.9b)
+
+`tools/capture.mjs` answers *does this frame still look right*; it runs under
+SwiftShader, where its fps column is noise. `npm run app:bench` is the other
+half: it opens the shell in a normal 1920x1080 window (not fullscreen, shown
+without focus), plays a seeded match through four representative situations —
+`broadcast_midfield`, `goal_sequence`, `corner`, `walkout` — and prints a table
+plus JSON in `captures/bench/<label>.json`. The whole run is ~90s.
+
+```bash
+npm run app:bench                                   # HIGH, 1920x1080 @2
+npm run app:bench -- --label before                 # name the JSON
+npm run app:bench -- --pin window                   # the frame THIS panel draws
+npm run app:bench -- --quality medium --label med   # another level
+npm run app:bench -- --situations corner --secs 3   # iterate on one
+npm run app:bench -- --profile samples:0            # A/B one profile field
+```
+
+Two numbers, and they are not the same number. **fps / 1% low** come from a
+vsync-paced roll and answer *does it hold 60*. **frame ms** is the presented
+interval; **burst ms** is what the frame costs with the GPU queue saturated,
+and **headroom** is 1000/burst — what is left to spend. The drawing buffer is
+pinned (`SceneManager.pinRenderSize`) and adaptive resolution is disabled for
+the duration, so a run is comparable to the one before it.
 
 `npm run dev` and the browser workflow are untouched — the shell is an extra
 front door, not a replacement.

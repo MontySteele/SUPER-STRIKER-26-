@@ -25,3 +25,6 @@ pipeline/audio/samples/
 # native shell: packaged .app and its staging tree (regenerable, ~400MB)
 release/
 build/
+
+# character review renders (regenerable by make_player.py)
+pipeline/characters/previews/

@@ -14,7 +14,18 @@
 import * as THREE from 'three';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 
-/** The single ACES filmic tone-map, plus a mild broadcast grade + vignette. */
+/**
+ * The single ACES filmic tone-map, plus a mild broadcast grade, a contrast-
+ * adaptive sharpen and a vignette.
+ *
+ * The sharpen lives HERE rather than in a pass of its own on purpose. It is
+ * four extra taps on a pass that is already reading this pixel, where a
+ * separate pass would be another full read and write of a 3840x2160 buffer —
+ * the most expensive way to buy the cheapest effect in the chain. It runs
+ * BEFORE the tone-map, in linear light, and clamps its result to the
+ * neighbourhood's own min/max, which is what stops an unsharp mask from
+ * drawing a white line down every floodlight mast.
+ */
 export const TonemapGradeShader = {
   name: 'SS26TonemapGrade',
   uniforms: {
@@ -24,6 +35,10 @@ export const TonemapGradeShader = {
     saturation: { value: 1.05 },
     /** 0 disables the split-tone + saturation trim (MEDIUM) */
     gradeAmount: { value: 1.0 },
+    /** unsharp amount; 0 = off. SceneManager sets it per quality level. */
+    sharpen: { value: 0.0 },
+    /** 1 / drawing-buffer size, so the taps are one DEVICE pixel apart */
+    texel: { value: new THREE.Vector2(1 / 1920, 1 / 1080) },
     shadowTint: { value: new THREE.Vector3(0.94, 1.0, 1.05) },
     highlightTint: { value: new THREE.Vector3(1.05, 1.0, 0.95) },
   },
@@ -40,6 +55,8 @@ export const TonemapGradeShader = {
     uniform float vignette;
     uniform float saturation;
     uniform float gradeAmount;
+    uniform float sharpen;
+    uniform vec2 texel;
     uniform vec3 shadowTint;
     uniform vec3 highlightTint;
     varying vec2 vUv;
@@ -71,6 +88,23 @@ export const TonemapGradeShader = {
 
     void main() {
       vec4 c = texture2D(tDiffuse, vUv);
+
+      // ---- contrast-adaptive sharpen, in linear light ----
+      // Skipped entirely when the amount is 0: MEDIUM's FXAA and RETRO's
+      // stack both want a soft image, and a branch on a uniform is free.
+      if (sharpen > 0.0) {
+        vec3 n = texture2D(tDiffuse, vUv + vec2(0.0, texel.y)).rgb;
+        vec3 s = texture2D(tDiffuse, vUv - vec2(0.0, texel.y)).rgb;
+        vec3 e = texture2D(tDiffuse, vUv + vec2(texel.x, 0.0)).rgb;
+        vec3 w = texture2D(tDiffuse, vUv - vec2(texel.x, 0.0)).rgb;
+        vec3 lo = min(min(n, s), min(e, w));
+        vec3 hi = max(max(n, s), max(e, w));
+        vec3 blur = (n + s + e + w) * 0.25;
+        // the clamp is the whole trick: a pixel may only be pushed as far as
+        // its own neighbours already go, so an edge gets crisper and never
+        // grows the bright fringe an unclamped unsharp mask paints
+        c.rgb = clamp(c.rgb + (c.rgb - blur) * sharpen, min(lo, c.rgb), max(hi, c.rgb));
+      }
 
       // ---- the one and only tone-map ----
       c.rgb = acesFilmic(max(c.rgb, 0.0));
