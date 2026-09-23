@@ -153,6 +153,8 @@ export interface BenchResult {
   headroomFps: number;
   triangles: { avg: number; max: number };
   drawCalls: { avg: number; max: number };
+  /** presented intervals over 25 ms: roll index, ms, draw calls, sim steps in */
+  spikes: { i: number; ms: number; calls: number; tris: number; sim: number }[];
 }
 
 export interface BenchReport {
@@ -267,10 +269,15 @@ async function runSituation(
   const costs: number[] = [];
   const tris: number[] = [];
   const calls: number[] = [];
+  // every presented interval over two vsyncs, with where it fell — a 1% low
+  // that is three identical spikes in every run is an EVENT, and the event is
+  // found by when it happens, not by how bad the average is
+  const spikes: { i: number; ms: number; calls: number; tris: number; sim: number }[] = [];
 
   await new Promise<void>((resolve) => {
     let acc = 0;
     let frame = 0;
+    let simSteps = 0;
     let last = performance.now();
     let collecting = false;
     let deadline = 0;
@@ -292,6 +299,7 @@ async function runSituation(
           renderer.snapshot();
           acc -= SIM_DT;
           steps++;
+          simSteps++;
         }
         if (acc > SIM_DT * 2) acc = SIM_DT * 2;
       }
@@ -308,6 +316,10 @@ async function runSituation(
         intervals.push(interval);
         tris.push(info.render.triangles);
         calls.push(info.render.calls);
+        if (interval > 25) {
+          spikes.push({ i: intervals.length - 1, ms: r1(interval), calls: info.render.calls,
+            tris: info.render.triangles, sim: simSteps });
+        }
       }
 
       if (!collecting || now < deadline) requestAnimationFrame(tick);
@@ -338,6 +350,7 @@ async function runSituation(
   const sortedInterval = intervals.slice().sort((a, b) => a - b);
   const span = intervals.reduce((a, b) => a + b, 0);
   const result: BenchResult = {
+    spikes,
     name: s.name,
     note: s.note,
     frames: intervals.length + costs.length,

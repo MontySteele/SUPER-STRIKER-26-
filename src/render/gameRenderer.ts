@@ -346,7 +346,41 @@ export class GameRenderer {
     this.snapshot();
     this.snapshot();
     this.cam.jumpTo(0, 30, 60, 0, 0, 0);
+    this.prewarm();
   }
+
+  /**
+   * Draw everything once, now, while the match is still loading.
+   *
+   * WebGL compiles a program the first time a material is DRAWN and uploads a
+   * buffer the first time a geometry is, and nothing here ever asked for either
+   * early: the bench showed the same 83-167 ms stall at the same sim step of
+   * every run, on the frame the tele cam first brought players into LOD0 (their
+   * eye and hair programs, their morphed buffers), and again on the first close
+   * cam (the DoF pass's three programs and targets). So: every object visible
+   * and unculled, the lens open, one full frame through shadows and the
+   * composer, then everything put back exactly as it was. Anything created
+   * later (confetti, replay props) still pays on first use.
+   */
+  private prewarm(): void {
+    // `?prewarm=0` — the A/B switch for the bench
+    if (typeof location !== 'undefined' && /[?&]prewarm=0/.test(location.search)) return;
+    const scene = this.sceneMgr.scene;
+    const saved: [THREE.Object3D, boolean, boolean][] = [];
+    scene.traverse((o) => {
+      saved.push([o, o.visible, o.frustumCulled]);
+      o.visible = true;
+      o.frustumCulled = false;
+    });
+    this.sceneMgr.setDepthOfField(1, 10);
+    try {
+      this.sceneMgr.render();
+    } finally {
+      for (const [o, v, f] of saved) { o.visible = v; o.frustumCulled = f; }
+      this.sceneMgr.setDepthOfField(0, 10);
+    }
+  }
+
 
   /**
    * Pick every player's detail tier against the camera that is about to draw
