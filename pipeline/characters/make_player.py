@@ -455,6 +455,15 @@ print(f"[make_player] TOTAL tris {tris}")
 
 # --- hair colour: multiply the hair texture by a constant. The glTF exporter
 # folds an Image -> Mix(MULTIPLY, colour) -> Principled chain into baseColorFactor.
+#
+# `hair_color` IS THE HAIR'S ALBEDO in the game, not a tint on the photo. Every
+# cut the specs use is a scalp cap painted with a near-black strand photo, so
+# colour x photo came out at ~0.001 and every head was the same black helmet.
+# The runtime (characterAssets.ts, HAIR_STRANDS) now takes only the photo's
+# CLUMPING — its luminance divided by its own mean — and the colour from here,
+# so pick this as the linear albedo you want to see (black ~0.03, brown ~0.12,
+# blond ~0.5). The map's own colour, and its white background bleeding in at
+# the alpha fringe, never reach the screen.
 hair_rgb = spec.get("hair_color")
 if hair_rgb:
     for o in assets:

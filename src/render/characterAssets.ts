@@ -1305,7 +1305,11 @@ export function appearanceOf(data: PlayerData, kit: KitSpec, arch: Archetype): A
   // hair colour: a multiply around 1, so a blond archetype stays blond and a
   // black-haired one cannot go ginger. Wide enough to separate two men side by
   // side, narrow enough that nobody's hair reads as dyed.
-  const hk = 0.62 + rnd() * 0.7;
+  // The archetype colour is now the hair's real albedo (the shader takes only
+  // the map's clumping, not its brightness), so the multiply sits a little
+  // UNDER 1: the specs were chosen against a black map, and at face value the
+  // blond reads platinum.
+  const hk = 0.62 + rnd() * 0.4;
   const hairColor = new THREE.Color(hk * (0.94 + rnd() * 0.14), hk, hk * (0.9 + rnd() * 0.12));
   // skin tone: a tenth of a stop either side of the archetype's atlas, with a
   // little warmth. Any wider and it stops reading as "this man" and starts
@@ -2012,7 +2016,23 @@ function prepareArchetype(url: string, scenes: (THREE.Group | null)[],
 /** Parts whose silhouette a shadow actually needs. Hair is in: a shadow with a
  *  flat skull reads as a bald man. Eyes, teeth and brows are not. */
 const SHADOW_PARTS = (m: THREE.Mesh): boolean =>
-  isBody(m) || isShirt(m) || isShorts(m) || isShoes(m) || /hair|afro|short0/i.test(nameOf(m));
+  isBody(m) || isShirt(m) || isShorts(m) || isShoes(m) || (!HAIR_NO_SHADOW && isHairPart(m));
+const isHairPart = (m: THREE.Mesh): boolean => /hair|afro|short0/i.test(nameOf(m));
+/** `?hairshadow=0`: leave the hair out of the shadow proxy altogether (A/B). */
+const HAIR_NO_SHADOW = typeof location !== 'undefined' && /[?&]hairshadow=0/.test(location.search);
+/**
+ * How far the proxy's hair is sunk into the skull, metres.
+ *
+ * The proxy is built from the LOWEST level, which wears cut ZERO decimated to
+ * 15% — not the cut the player has on, and not the same surface even when it
+ * is. Left where it was authored it enclosed the real hair (an afro01 proxy
+ * over a short02 player, or just a decimated shell bulging out through the
+ * cap), and the hair spent every frame in its own shadow: no key light, no
+ * highlight, a dark helmet whatever the shading did. Sunk two centimetres it
+ * sits under any cut in the pool and still gives an afro its volume on the
+ * grass; a short cut's proxy lands inside the skull and costs nothing.
+ */
+const HAIR_SHADOW_SINK = 0.02;
 
 /** Attributes a depth-only draw needs. Everything else (uv, uv2, tangent,
  *  colour) is buffer the shadow pass never reads. */
@@ -2042,6 +2062,16 @@ function buildShadowGeometry(scene: THREE.Group): THREE.BufferGeometry | null {
       return null;
     }
     const g = part.geometry.clone();
+    if (isHairPart(part)) {
+      const pos = g.getAttribute('position') as THREE.BufferAttribute;
+      const nor = g.getAttribute('normal') as THREE.BufferAttribute | undefined;
+      if (nor) {
+        for (let i = 0; i < pos.count; i++) {
+          pos.setXYZ(i, pos.getX(i) - nor.getX(i) * HAIR_SHADOW_SINK,
+            pos.getY(i) - nor.getY(i) * HAIR_SHADOW_SINK, pos.getZ(i) - nor.getZ(i) * HAIR_SHADOW_SINK);
+        }
+      }
+    }
     for (const name of Object.keys(g.attributes)) {
       if (!SHADOW_ATTRS.includes(name)) g.deleteAttribute(name);
     }
@@ -2545,29 +2575,342 @@ const SKIN_PARS = ((): string | null => {
   `);
 })();
 
+// ------------------------------------------------------------------ hair
+//
+// WHAT THE HAIR ACTUALLY IS. Every cut in the MPFB library that suits a
+// footballer is a SCALP CAP: one shell hugging the skull, painted with a strand
+// photo, with a soft alpha fringe at the hairline and — on a couple of them — a
+// handful of tuft cards. Not strand geometry, not layered cards. And the bake
+// multiplied that (already near-black) photo by a near-black hair colour, so the
+// albedo that reached the screen was ~0.001: every strand the painter drew was
+// multiplied out and what was left was a solid dark helmet with a 512-texel
+// alpha-test contour for a hairline.
+//
+// So the hair is rebuilt at the shader, where it costs nothing to download:
+//
+//  • ALBEDO is the baked colour times the map's LUMINANCE NORMALISED BY ITS OWN
+//    MEAN (hairMapMean). The photo's clumping survives, the colour is the
+//    spec's, and a blond archetype comes out blond instead of dark brown.
+//  • A STRAND FIELD in skull space: the bind-pose position is turned into
+//    (azimuth, polar angle) about a crown pole, and anisotropic value noise is
+//    laid along the meridians — thin across, long along — so every strand runs
+//    from the crown down to the hairline the way a short cut lies. It lives on
+//    the mesh (bind pose, morphed face included), so it cannot crawl as the man
+//    moves, and it is filtered by its own screen derivative: past a couple of
+//    pixels per strand it fades to its mean, so a tele-cam head is a clean
+//    shape and never noise.
+//  • Two KAJIYA-KAY lobes along that same flow (Scheuermann): an untinted
+//    primary shifted toward the tip and a broader secondary tinted by the hair,
+//    both jittered per strand so the highlight breaks into strands instead of
+//    sitting on the skull as one plastic band. The old single lobe was tinted
+//    by the albedo — i.e. multiplied by ~0.03 on dark hair, i.e. never seen.
+//  • The HAIRLINE: the alpha contour is pushed in and out by the fine strands,
+//    so the edge is broken into strands rather than cut along the map's
+//    blurred 512-texel outline. An opaque alpha-test pass draws everything
+//    above 0.5; at LOD0 a second, BLENDED pass (SS26_HAIR_FRINGE) draws only
+//    what the first discarded, so the wisps fade out instead of stepping. No
+//    TAA and no MSAA at DPR 2 means hashed alpha would crawl; this cannot.
+
 /** Kajiya-Kay along the strand: the band of light that runs across a head of
  *  hair instead of the round plastic highlight a Blinn lobe puts there. */
 const HAIR_PARS = ((): string | null => {
   const chunk = THREE.ShaderChunk.lights_physical_pars_fragment;
   const m = chunk.match(DIRECT_DIFFUSE);
   if (!m) return null;
-  return chunk.replace(DIRECT_DIFFUSE, /* glsl */ `
+  const GGX = /reflectedLight\.directSpecular\s*\+=\s*irradiance\s*\*\s*BRDF_GGX_Multiscatter\(/;
+  // The round GGX lobe is what makes a skull cap read as a helmet; hair keeps a
+  // little of it (the cap is a surface too) and gets its shine from the strands.
+  const body = GGX.test(chunk)
+    ? chunk.replace(GGX, 'reflectedLight.directSpecular += ss26HairGgx * irradiance * BRDF_GGX_Multiscatter(')
+    : chunk;
+  return /* glsl */ `
+    uniform vec2 ss26HairSpec;
+    uniform vec2 ss26HairExp;
+    uniform vec2 ss26HairShift;
+    uniform float ss26HairGgx;
+    // set in main() before the lights run (see HAIR_STRANDS)
+    vec3 ss26HairT;
+    vec3 ss26HairIrr = vec3( 0.0 );
+    float ss26HairFine;
+    float ss26HairClump;
+    float ss26HairFar;
+  ` + body.replace(DIRECT_DIFFUSE, /* glsl */ `
     reflectedLight.directDiffuse += irradiance * BRDF_Lambert( material.${m[1]} );
     {
-      // No tangents ship with these meshes, so the strand direction is derived:
-      // across = normal x up, strand = across x normal, i.e. the line of
-      // steepest descent over the skull — which is how a short cut lies.
-      vec3 ss26Across = normalize( cross( geometryNormal, vec3( 0.0, 1.0, 0.0 ) ) + vec3( 1e-4 ) );
-      vec3 ss26Strand = normalize( cross( ss26Across, geometryNormal ) );
+      vec3 ss26T = ss26HairT - geometryNormal * dot( geometryNormal, ss26HairT );
+      ss26T = normalize( ss26T + vec3( 1e-5 ) );
+      float ss26J = ( ss26HairFine - 0.5 ) * 0.22 + ( ss26HairClump - 0.5 ) * 0.18;
+      vec3 ss26T1 = normalize( ss26T + geometryNormal * ( ss26HairShift.x + ss26J ) );
+      vec3 ss26T2 = normalize( ss26T + geometryNormal * ( ss26HairShift.y + ss26J ) );
       vec3 ss26H = normalize( directLight.direction + geometryViewDir );
-      float ss26TH = dot( ss26Strand, ss26H );
-      float ss26Sin = sqrt( max( 0.0, 1.0 - ss26TH * ss26TH ) );
-      float ss26Shift = saturate( dot( geometryNormal, directLight.direction ) * 0.6 + 0.4 );
-      reflectedLight.directSpecular += directLight.color * material.diffuseColor
-        * ( ss26HairSpec * pow( ss26Sin, ss26HairExp ) * ss26Shift );
+      float ss26D1 = dot( ss26T1, ss26H );
+      float ss26D2 = dot( ss26T2, ss26H );
+      // Specular AA: once the head is too small for its clumps to resolve,
+      // a tight lobe lands facet by facet on the decimated LODs and sparkles
+      // as he turns — so it widens (and dims) into a soft sheen instead.
+      vec2 ss26E = mix( ss26HairExp, vec2( 10.0, 6.0 ), ss26HairFar );
+      float ss26S1 = pow( sqrt( max( 0.0, 1.0 - ss26D1 * ss26D1 ) ), ss26E.x );
+      float ss26S2 = pow( sqrt( max( 0.0, 1.0 - ss26D2 * ss26D2 ) ), ss26E.y );
+      ss26S1 *= mix( 1.0, 0.3, ss26HairFar );
+      ss26S2 *= mix( 1.0, 0.5, ss26HairFar );
+      ss26HairIrr += directLight.color * saturate( dot( geometryNormal, directLight.direction ) );
+      // a strand lit from behind the skull still has its far side in shadow
+      float ss26Vis = smoothstep( -0.1, 0.4, dot( geometryNormal, directLight.direction ) );
+      vec3 ss26Alb = material.${m[1]};
+      float ss26AlbL = max( dot( ss26Alb, vec3( 0.2126, 0.7152, 0.0722 ) ), 1e-4 );
+      // secondary lobe: the light that went INTO the fibre and came back out,
+      // so it wears the hair's hue — and a dark fibre gives less of it back
+      vec3 ss26Tint = mix( vec3( 1.0 ), ss26Alb / max( max( ss26Alb.r, max( ss26Alb.g, ss26Alb.b ) ), 1e-4 ), 0.85 );
+      float ss26Back = clamp( sqrt( ss26AlbL ) * 2.2, 0.35, 1.0 );
+      float ss26Spark = mix( 0.35, 1.65, ss26HairFine ) * mix( 0.7, 1.3, ss26HairClump );
+      // the surface reflection is white in a textbook; on a head of light hair
+      // with nothing else lighting it, white reads as silver — so a little of
+      // the hue, and a little less of it the lighter the hair
+      vec3 ss26P = mix( vec3( 1.0, 0.97, 0.94 ), ss26Tint, 0.3 )
+        * mix( 1.0, 0.6, saturate( ss26AlbL * 3.0 ) );
+      // Light from BEHIND the head: what comes over the crown then is light
+      // that went through the fibres (hair-coloured), not a white reflection —
+      // and a crown seen edge-on turns even a narrow white lobe into a grey
+      // skullcap. Hand the primary over to the tinted lobe as the key goes round.
+      float ss26Front = saturate( dot( directLight.direction, geometryViewDir ) * 0.6 + 0.6 );
+      ss26P *= mix( 0.25, 1.0, ss26Front );
+      reflectedLight.directSpecular += directLight.color * ss26Vis * ss26Spark * (
+        ss26HairSpec.x * ss26S1 * ss26P
+        + ss26HairSpec.y * ss26S2 * ss26Tint * ss26Back );
     }
   `);
 })();
+
+/** Vertex side of the strand field: the bind-pose offset from the skull centre
+ *  (for the noise) and the flow direction, skinned and in view space (for the
+ *  highlight). */
+const HAIR_VERT_PARS = /* glsl */ `
+  #ifdef SS26_HAIR_FRINGE
+    varying float vSs26Shell;
+    #ifdef SS26_HAIR_SHELLS
+      attribute float ss26Shell;
+      uniform float ss26ShellH;
+    #endif
+  #endif
+  uniform vec3 ss26HairC;
+  uniform vec3 ss26HairAxis;
+  varying vec3 vSs26HairP;
+  varying vec3 vSs26HairT;
+`;
+const HAIR_VERT = /* glsl */ `
+  {
+    vec3 ss26R = normalize( position - ss26HairC );
+    // down the meridian, away from the crown pole
+    vec3 ss26Tb = -( ss26HairAxis - ss26R * dot( ss26HairAxis, ss26R ) );
+    ss26Tb = normalize( ss26Tb + vec3( 0.0, -1e-4, 0.0 ) );
+    #ifdef USE_SKINNING
+      ss26Tb = ( skinMatrix * vec4( ss26Tb, 0.0 ) ).xyz;
+    #endif
+    vSs26HairT = normalize( ( modelViewMatrix * vec4( ss26Tb, 0.0 ) ).xyz );
+    vSs26HairP = position - ss26HairC;
+  }
+`;
+
+/** Fragment side: the strand field itself, the albedo and the hairline. Runs
+ *  right after map_fragment, before the alpha test. */
+const HAIR_FRAG_PARS = /* glsl */ `
+  #ifdef SS26_HAIR_FRINGE
+    varying float vSs26Shell;
+  #endif
+  uniform vec3 ss26HairAxis;
+  uniform vec3 ss26HairE1;
+  uniform vec3 ss26HairE2;
+  uniform float ss26HairMean;
+  varying vec3 vSs26HairP;
+  varying vec3 vSs26HairT;
+  float ss26Hash( vec2 p ) {
+    p = fract( p * vec2( 0.1031, 0.1030 ) );
+    p += dot( p, p.yx + 33.33 );
+    return fract( ( p.x + p.y ) * p.x );
+  }
+  // one strand column: a value that drifts slowly along its length
+  float ss26Col( float i, float v ) {
+    float vv = v + ss26Hash( vec2( i, 3.7 ) ) * 11.0;
+    float j = floor( vv );
+    float g = fract( vv );
+    g = g * g * ( 3.0 - 2.0 * g );
+    return mix( ss26Hash( vec2( i, j ) ), ss26Hash( vec2( i, j + 1.0 ) ), g );
+  }
+  // columns side by side, periodic in u so the azimuth seam is invisible
+  float ss26Strands( float u, float v, float period ) {
+    float i = floor( u );
+    float f = fract( u );
+    f = f * f * ( 3.0 - 2.0 * f );
+    return mix( ss26Col( mod( i, period ), v ), ss26Col( mod( i + 1.0, period ), v ), f );
+  }
+`;
+const HAIR_STRANDS = /* glsl */ `
+  {
+    vec3 ss26R = normalize( vSs26HairP );
+    float ss26Up = dot( ss26R, ss26HairAxis );
+    vec2 ss26Q = vec2( dot( ss26R, ss26HairE1 ), dot( ss26R, ss26HairE2 ) );
+    float ss26QL = max( length( ss26Q ), 1e-3 );
+    // azimuth in turns [0,1) and polar angle in half-turns [0,1]
+    float ss26Phi = atan( ss26Q.y, ss26Q.x ) * 0.15915494 + 0.5;
+    float ss26Th = acos( clamp( ss26Up, -1.0, 1.0 ) ) * 0.31830989;
+    // derivative of the azimuth taken off the (seam-free) direction, in turns
+    float ss26DPhi = ( abs( dFdx( ss26Q.x ) ) + abs( dFdy( ss26Q.x ) )
+      + abs( dFdx( ss26Q.y ) ) + abs( dFdy( ss26Q.y ) ) ) / ss26QL * 0.15915494;
+    float ss26DTh = fwidth( ss26Th );
+    // a gentle comb wave, so the strands are not ruled lines
+    float ss26W = sin( ss26Th * 41.0 + ss26Phi * 37.699 ) * 0.35;
+    const float FINE = 300.0;
+    const float CLUMP = 64.0;
+    float ss26F = ss26Strands( ss26Phi * FINE + ss26W, ss26Th * 16.0, FINE );
+    float ss26C = ss26Strands( ss26Phi * CLUMP + ss26W * 0.3, ss26Th * 6.0, CLUMP );
+    // cells per pixel: past ~0.5 the fine layer aliases, past ~0.6 the clumps do
+    float ss26FineK = 1.0 - smoothstep( 0.3, 0.65, max( ss26DPhi * FINE, ss26DTh * 16.0 ) );
+    float ss26ClumpK = 1.0 - smoothstep( 0.3, 0.7, max( ss26DPhi * CLUMP, ss26DTh * 6.0 ) );
+    ss26HairFine = mix( 0.5, ss26F, ss26FineK );
+    ss26HairClump = mix( 0.5, ss26C, ss26ClumpK );
+    ss26HairFar = 1.0 - ss26ClumpK;
+    ss26HairT = vSs26HairT;
+
+    #ifdef USE_MAP
+      // albedo: the map's own brightness, normalised by its mean, so the
+      // painter's clumps survive and the COLOUR is the spec's
+      float ss26L = dot( sampledDiffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+      float ss26Ratio = ss26HairMean > 0.0
+        ? clamp( mix( 1.0, ss26L / ss26HairMean, 0.45 ), 0.55, 1.3 ) : 1.0;
+      // part-transparent texels bled the map's white background in: trust them less
+      ss26Ratio = mix( 1.0, ss26Ratio, smoothstep( 0.4, 0.9, sampledDiffuseColor.a ) );
+      diffuseColor.rgb = diffuse * ss26Ratio;
+    #endif
+    diffuseColor.rgb *= mix( 0.62, 1.38, ss26HairFine ) * mix( 0.8, 1.2, ss26HairClump );
+
+    // the hairline: push the alpha contour in and out along the strands
+    float ss26Break = ( smoothstep( 0.25, 0.75, ss26F ) - 0.5 ) * ss26FineK
+      + ( ss26C - 0.5 ) * 0.5 * ss26ClumpK;
+    float ss26A = diffuseColor.a + ss26Break * 0.55 * ( 1.0 - smoothstep( 0.75, 1.0, diffuseColor.a ) );
+    #ifdef SS26_HAIR_FRINGE
+      if ( vSs26Shell < 0.5 ) {
+        // layer 0: only what the opaque pass threw away, faded, not stepped
+        if ( ss26A >= 0.5 ) discard;
+        diffuseColor.a = smoothstep( 0.06, 0.5, ss26A );
+      }
+      #ifdef SS26_HAIR_SHELLS
+      else {
+        // the shells: strand ends standing proud of the cap. Fewer of them
+        // the further out, only where the cap itself is solid hair, and the
+        // outer ones catch more light than the roots.
+        float ss26Lv = vSs26Shell / SS26_HAIR_SHELLS;
+        float ss26S = ss26F * 0.65 + ss26C * 0.35;
+        float ss26Cut = 0.42 + 0.3 * ss26Lv;
+        float ss26M = smoothstep( ss26Cut, ss26Cut + 0.12, ss26S );
+        // past the strands' resolution the mask becomes its own average: a
+        // soft halo, which is the right thing for an edge to become
+        ss26M = mix( 0.5 - 0.3 * ss26Lv, ss26M, ss26FineK );
+        diffuseColor.a = ss26M * smoothstep( 0.55, 0.95, sampledDiffuseColor.a ) * ( 1.0 - 0.35 * ss26Lv );
+        diffuseColor.rgb *= 0.85 + 0.3 * ss26Lv;
+      }
+      #endif
+      if ( diffuseColor.a < 0.01 ) discard;
+    #else
+      diffuseColor.a = ss26A;
+    #endif
+  }
+`;
+
+/** A haircut mesh, by mesh + material name (every cut the specs use). */
+const HAIR_MESH = /hair|afro|short0|braid|cornrow|micky|messy/i;
+/** `?hairdebug=1|2|3`: albedo / strand field / direct specular only. */
+const HAIR_DEBUG = typeof location !== 'undefined'
+  ? Number((/[?&]hairdebug=(\d)/.exec(location.search) ?? [])[1] ?? 0) : 0;
+/** `?hairshade=0`: stock cutout hair — no strand shading, no fringe, no
+ *  shells. The A/B baseline for the bench. */
+const HAIR_PLAIN = typeof location !== 'undefined' && /[?&]hairshade=0/.test(location.search);
+/** `?hairfringe=0`: no blended hairline pass (A/B and bench). */
+const HAIR_NO_FRINGE = typeof location !== 'undefined' && /[?&]hairfringe=0/.test(location.search);
+
+/** Per-archetype strand frame, in the meshes' own (bind-pose, y-up, face +z)
+ *  space: the skull centre and the crown pole the strands flow away from. */
+interface HairFrame {
+  center: THREE.Vector3;
+  axis: THREE.Vector3;
+  e1: THREE.Vector3;
+  e2: THREE.Vector3;
+}
+
+const HAIR_FRAMES = new WeakMap<object, HairFrame>();
+
+/** Find the skull in the body mesh: its top, and the midline depth a little
+ *  below it. Every cut in an archetype shares the skull, so one frame serves
+ *  the whole pool. */
+function hairFrameOf(arch: Archetype): HairFrame {
+  const hit = HAIR_FRAMES.get(arch);
+  if (hit) return hit;
+  let body: THREE.Mesh | null = null;
+  arch.levels[0].scene.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!body && m.isMesh && isBody(m)) body = m;
+  });
+  const center = new THREE.Vector3(0, 1.6, 0.05);
+  const pos = (body as THREE.Mesh | null)?.geometry.getAttribute('position');
+  if (pos) {
+    let top = -Infinity;
+    for (let i = 0; i < pos.count; i++) top = Math.max(top, pos.getY(i));
+    let zmin = Infinity; let zmax = -Infinity;
+    for (let i = 0; i < pos.count; i++) {
+      const y = top - pos.getY(i);
+      if (y < 0.07 || y > 0.12 || Math.abs(pos.getX(i)) > 0.025) continue;
+      zmin = Math.min(zmin, pos.getZ(i));
+      zmax = Math.max(zmax, pos.getZ(i));
+    }
+    if (Number.isFinite(top) && zmax > zmin) center.set(0, top - 0.1, (zmin + zmax) / 2);
+  }
+  // The whorl sits a little behind the top of the head. Not far: the flow
+  // lines decide where the highlight band lands (where they cross the half
+  // vector), and a pole tipped well back bends them down over the forehead,
+  // which parks the band on the hairline as a pale halo.
+  const axis = new THREE.Vector3(0, 1, -0.12).normalize();
+  const e1 = new THREE.Vector3(1, 0, 0);
+  const e2 = new THREE.Vector3().crossVectors(axis, e1).normalize();
+  const f = { center, axis, e1, e2 };
+  HAIR_FRAMES.set(arch, f);
+  return f;
+}
+
+const HAIR_MEANS = new WeakMap<THREE.Texture, number>();
+
+/** Mean linear luminance of a hair map over its opaque texels — the number the
+ *  shader divides by so the photo supplies clumping and not colour. Read once
+ *  per map off a 64² thumbnail. 0 = unknown (the shader then leaves the map's
+ *  brightness out of the albedo). */
+function hairMapMean(tex: THREE.Texture | null): number {
+  if (!tex) return 0;
+  const hit = HAIR_MEANS.get(tex);
+  if (hit !== undefined) return hit;
+  let mean = 0;
+  try {
+    const img = tex.image as CanvasImageSource | undefined;
+    if (img && typeof document !== 'undefined') {
+      const c = document.createElement('canvas');
+      c.width = c.height = 64;
+      const g = c.getContext('2d', { willReadFrequently: true });
+      if (g) {
+        g.drawImage(img, 0, 0, 64, 64);
+        const d = g.getImageData(0, 0, 64, 64).data;
+        const lin = (v: number): number => Math.pow(v / 255, 2.2);
+        let s = 0; let n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] < 128) continue;
+          s += 0.2126 * lin(d[i]) + 0.7152 * lin(d[i + 1]) + 0.0722 * lin(d[i + 2]);
+          n++;
+        }
+        mean = n > 32 ? s / n : 0;
+      }
+    }
+  } catch {
+    mean = 0;
+  }
+  HAIR_MEANS.set(tex, mean);
+  return mean;
+}
 
 const SKIN_UNIFORMS = /* glsl */ `
   uniform vec3 ss26SkinWrap;
@@ -2695,15 +3038,117 @@ function queueSkinShading(mat: THREE.MeshStandardMaterial, o: SkinShadingOptions
   });
 }
 
-/** The hair sheen, queued on one hair material. */
-function queueHairShading(mat: THREE.MeshStandardMaterial): void {
+/** Hair response. Spec/Exp/Shift are (primary, secondary) Kajiya-Kay lobes;
+ *  shifts are along the normal, negative = toward the root. */
+const HAIR_TUNE = {
+  spec: new THREE.Vector2(0.05, 0.035),
+  exp: new THREE.Vector2(130, 24),
+  /** Coily cuts (afros): a fibre that turns every millimetre has no one
+   *  direction to reflect along, so a weak, broad lobe and no sharp band. */
+  coilSpec: new THREE.Vector2(0.018, 0.02),
+  coilExp: new THREE.Vector2(24, 10),
+  shift: new THREE.Vector2(-0.06, 0.12),
+  ggx: 0.1,
+  /**
+   * Blended strand shells over the cap at LOD0, and their spacing (m). OFF.
+   * They work, and over skin they read — but a head's silhouette is where
+   * they were meant to earn their keep, and there they are drawn over the
+   * background without writing depth, so the depth-of-field pass files every
+   * strand end under "far" and blurs it away with the crowd. Writing depth
+   * instead leaves the crowd behind them unblurred: a sharp halo round the
+   * head. Neither is worth three more copies of the hair's vertices.
+   */
+  shells: 0,
+  shellStep: 0.0025,
+};
+
+/**
+ * The cap, repeated: layer 0 is the cap itself (the blended hairline), layers
+ * 1..n the same vertices tagged `ss26Shell` = n, which the fringe shader pushes
+ * out along the normal. One geometry, so the whole soft edge of a player's hair
+ * — hairline, silhouette fuzz, strand ends — is ONE extra draw. Layers go out
+ * in index order, inner to outer, which is the right order to blend them in.
+ */
+function hairShellGeometry(src: THREE.BufferGeometry, layers: number): THREE.BufferGeometry {
+  const n = src.getAttribute('position').count;
+  const out = new THREE.BufferGeometry();
+  const copies = layers + 1;
+  for (const [name, attr] of Object.entries(src.attributes)) {
+    const a = attr as THREE.BufferAttribute;
+    if ((attr as THREE.InterleavedBufferAttribute).isInterleavedBufferAttribute) return src;
+    const Ctor = a.array.constructor as new (len: number) => THREE.TypedArray;
+    const arr = new Ctor(a.array.length * copies);
+    for (let l = 0; l < copies; l++) arr.set(a.array as ArrayLike<number>, l * a.array.length);
+    out.setAttribute(name, new THREE.BufferAttribute(arr, a.itemSize, a.normalized));
+  }
+  const shell = new Float32Array(n * copies);
+  for (let l = 0; l < copies; l++) shell.fill(l, l * n, (l + 1) * n);
+  out.setAttribute('ss26Shell', new THREE.BufferAttribute(shell, 1));
+  const idx = src.getIndex();
+  const count = idx ? idx.count : n;
+  const index = n * copies > 65535 ? new Uint32Array(count * copies) : new Uint16Array(count * copies);
+  for (let l = 0; l < copies; l++) {
+    for (let i = 0; i < count; i++) index[l * count + i] = (idx ? idx.getX(i) : i) + l * n;
+  }
+  out.setIndex(new THREE.BufferAttribute(index, 1));
+  out.boundingSphere = src.boundingSphere?.clone() ?? null;
+  out.boundingBox = src.boundingBox?.clone() ?? null;
+  return out;
+}
+
+/** The hair look, queued on one hair material: strand field, albedo, hairline
+ *  and the two-lobe sheen. See the block comment above HAIR_PARS. */
+function queueHairShading(mat: THREE.MeshStandardMaterial, frame: HairFrame, mean: number,
+  coily: boolean): void {
+  if (!HAIR_PARS) return;
+  const pars = HAIR_PARS;
   queueShaderPatch(mat, (shader) => {
-    shader.uniforms.ss26HairSpec = { value: 0.55 };
-    shader.uniforms.ss26HairExp = { value: 26.0 };
-    let frag = shader.fragmentShader.replace('#include <common>',
-      '#include <common>\nuniform float ss26HairSpec;\nuniform float ss26HairExp;');
-    if (HAIR_PARS) frag = frag.replace('#include <lights_physical_pars_fragment>', HAIR_PARS);
-    shader.fragmentShader = frag;
+    shader.uniforms.ss26HairSpec = { value: coily ? HAIR_TUNE.coilSpec : HAIR_TUNE.spec };
+    shader.uniforms.ss26HairExp = { value: coily ? HAIR_TUNE.coilExp : HAIR_TUNE.exp };
+    shader.uniforms.ss26HairShift = { value: HAIR_TUNE.shift };
+    shader.uniforms.ss26HairGgx = { value: HAIR_TUNE.ggx };
+    shader.uniforms.ss26HairC = { value: frame.center };
+    shader.uniforms.ss26HairAxis = { value: frame.axis };
+    shader.uniforms.ss26HairE1 = { value: frame.e1 };
+    shader.uniforms.ss26HairE2 = { value: frame.e2 };
+    shader.uniforms.ss26HairMean = { value: mean };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${HAIR_VERT_PARS}`)
+      .replace('#include <skinnormal_vertex>', `#include <skinnormal_vertex>\n${HAIR_VERT}`)
+      // shells: pushed out along the BIND-pose normal, before skinning
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        #ifdef SS26_HAIR_FRINGE
+          #ifdef SS26_HAIR_SHELLS
+            transformed += normal * ( ss26Shell * ss26ShellH );
+            vSs26Shell = ss26Shell;
+          #else
+            vSs26Shell = 0.0;
+          #endif
+        #endif`);
+    shader.uniforms.ss26ShellH = { value: HAIR_TUNE.shellStep };
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${HAIR_FRAG_PARS}`)
+      .replace('#include <lights_physical_pars_fragment>', pars)
+      .replace('#include <map_fragment>', `#include <map_fragment>\n${HAIR_STRANDS}`)
+      // the environment's round reflection is the helmet all over again:
+      // keep a streaky third of it
+      .replace('#include <lights_fragment_maps>', `#include <lights_fragment_maps>
+        #if defined( RE_IndirectSpecular )
+          radiance *= 0.35 * mix( 0.4, 1.6, ss26HairFine );
+        #endif`);
+    if (HAIR_DEBUG) {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <opaque_fragment>', `
+        #if SS26_HAIR_DEBUG == 1
+          outgoingLight = diffuseColor.rgb * 4.0;
+        #elif SS26_HAIR_DEBUG == 2
+          outgoingLight = vec3( ss26HairFine, ss26HairClump, 0.0 );
+        #elif SS26_HAIR_DEBUG == 4
+          outgoingLight = ss26HairIrr * 0.1;
+        #else
+          outgoingLight = reflectedLight.directSpecular;
+        #endif
+        #include <opaque_fragment>`);
+    }
   });
 }
 
@@ -2788,7 +3233,7 @@ export class CharacterRig {
   private shirtMats = new Map<string, THREE.MeshStandardMaterial>();
   private shortsMats = new Map<string, THREE.MeshStandardMaterial>();
   private bootMats = new Map<string, THREE.MeshStandardMaterial>();
-  private owned: (THREE.Material | THREE.Texture)[] = [];
+  private owned: (THREE.Material | THREE.Texture | THREE.BufferGeometry)[] = [];
   private nextArchetype = 0;
 
   constructor(readonly assets: CharacterAssets) {}
@@ -2900,12 +3345,22 @@ export class CharacterRig {
           meshes.push(m);
         });
       }
+      const fringes: THREE.SkinnedMesh[] = [];
       for (const mesh of meshes) {
         mesh.frustumCulled = false;
         mesh.castShadow = false;
         mesh.receiveShadow = true;
+        const srcMat = mesh.material as THREE.Material;
         mesh.material = this.dress(mesh, kit, data, arch, look);
+        // the soft hairline pass, near band only (see hairFringe)
+        if (li === 0 && !HAIR_NO_FRINGE && !HAIR_PLAIN && !Array.isArray(srcMat)
+          && HAIR_MESH.test(`${mesh.name} ${srcMat.name}`)) {
+          const f = this.hairFringe(mesh, srcMat, arch, look);
+          (mesh.parent ?? meshParent).add(f);
+          fringes.push(f);
+        }
       }
+      meshes.push(...fringes);
       levels.push({ meshes });
     }
 
@@ -2974,6 +3429,63 @@ export class CharacterRig {
     return this.matchCopy(mesh.material as THREE.Material, mesh.name, kit, arch, look);
   }
 
+  /** Turn a fresh clone of an archetype hair material into this player's hair:
+   *  his colour, the strand shading, and — for the fringe pass — blending. */
+  private dressHair(copy: THREE.MeshStandardMaterial, arch: Archetype, look: Appearance,
+    fringe: boolean): void {
+    copy.color.multiply(look.hairColor);
+    // the sheen comes from the strands now; a strong IBL lobe on a skull cap is
+    // the helmet all over again
+    // (IBL DIFFUSE stays as it was — cut this and shaded hair loses its colour
+    // and goes grey; the IBL SPECULAR is cut in the shader instead)
+    copy.envMapIntensity = 0.5;
+    copy.roughness = Math.max(copy.roughness, 0.62);
+    if (fringe) {
+      copy.transparent = true;
+      copy.depthWrite = false;
+      copy.alphaTest = 0;
+      // one pass: a DoubleSide transparent material is otherwise drawn twice
+      copy.forceSinglePass = true;
+      copy.defines = { ...(copy.defines ?? {}), SS26_HAIR_FRINGE: '' };
+      if (HAIR_TUNE.shells > 0) copy.defines.SS26_HAIR_SHELLS = HAIR_TUNE.shells.toFixed(1);
+    }
+    if (HAIR_DEBUG) copy.defines = { ...(copy.defines ?? {}), SS26_HAIR_DEBUG: String(HAIR_DEBUG) };
+    copy.customProgramCacheKey = (): string => (fringe ? 'ss26-hair-fringe' : 'ss26-hair');
+    if (!HAIR_PLAIN) queueHairShading(copy, hairFrameOf(arch), hairMapMean(copy.map), /afro|micky/i.test(copy.name));
+    // a crown is seen edge-on in half the shots this game takes, so a fresnel
+    // rim there is not an edge light, it is a grey skullcap: keep it faint
+    queueBroadcastSkin(copy, { wrap: 0.3, wrapTint: 0xd8cec4, rim: 0.022, rimPower: 4.0 });
+  }
+
+  /** The blended hairline pass for one LOD0 haircut: same geometry, same
+   *  skeleton, drawn after the opaques, only where the opaque pass discarded.
+   *  One per player, near band only — past it the fringe is sub-pixel. */
+  private hairFringe(mesh: THREE.SkinnedMesh, src: THREE.Material, arch: Archetype,
+    look: Appearance): THREE.SkinnedMesh {
+    const key = `${src.uuid}|${look.hairColor.getHexString()}|fringe`;
+    let mat = this.matClones.get(key);
+    if (!mat) {
+      mat = (src as THREE.MeshStandardMaterial).clone();
+      mat.userData = {};
+      this.dressHair(mat, arch, look, true);
+      this.matClones.set(key, mat);
+      this.owned.push(mat);
+    }
+    // His own geometry (the face pool morphed it) — shared as it is, or, with
+    // shells on, layered into a copy that is the match's and goes with it.
+    const geo = HAIR_TUNE.shells > 0 ? hairShellGeometry(mesh.geometry, HAIR_TUNE.shells)
+      : mesh.geometry;
+    if (geo !== mesh.geometry) this.owned.push(geo);
+    const f = new THREE.SkinnedMesh(geo, mat);
+    f.name = `${mesh.name}.fringe`;
+    f.bindMode = mesh.bindMode;
+    f.bind(mesh.skeleton, mesh.bindMatrix);
+    f.frustumCulled = false;
+    f.castShadow = false;
+    f.receiveShadow = true;
+    return f;
+  }
+
   /**
    * This match's copy of one archetype material.
    *
@@ -3011,10 +3523,7 @@ export class CharacterRig {
         stubbleColor: look.stubbleColor,
       });
     } else if (hair) {
-      copy.color.multiply(look.hairColor);
-      copy.customProgramCacheKey = (): string => 'ss26-hair';
-      queueHairShading(copy);
-      queueBroadcastSkin(copy, { wrap: 0.3, wrapTint: 0xd8cec4, rim: 0.05, rimPower: 3.2 });
+      this.dressHair(copy, arch, look, false);
     } else if (eye) {
       // a cornea is the only wet thing on a player and the only real highlight
       // on a face; it is also the difference between eyes and two dark holes
