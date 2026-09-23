@@ -319,6 +319,21 @@ async function ablate(
     await probe('grass shells', () => { grass.visible = false; }, () => { grass.visible = true; });
   }
 
+  // ---- the pitch: its custom turf code vs the lighting under it
+  const pitch = sm.scene.getObjectByName('pitch') as THREE.Mesh | undefined;
+  if (pitch && !Array.isArray(pitch.material)) {
+    const real = pitch.material as THREE.MeshStandardMaterial;
+    const Std = real.constructor as typeof THREE.MeshStandardMaterial;
+    const stock = new Std({ map: real.map, normalMap: real.normalMap, roughness: real.roughness });
+    stock.normalScale.copy(real.normalScale);
+    sm.atmos.registerMaterial(stock); // CSM-wired like the real one, or the A/B is off
+    const unlit = new ((await import('three')).MeshBasicMaterial)({ map: real.map });
+    const swap = (m: THREE.Material): void => { pitch.material = m; burstMin(renderer, gl); };
+    await probe('variant: pitch as stock MeshStandard (no turf code)', () => swap(stock), () => swap(real));
+    await probe('variant: pitch unlit (no lighting at all)', () => swap(unlit), () => swap(real));
+    stock.dispose(); unlit.dispose();
+  }
+
   // ---- cheaper VARIANTS rather than absences: what a setting change buys
   const smx = sm as unknown as Loose;
   const comp = sm.composer as unknown as Loose;
@@ -329,7 +344,7 @@ async function ablate(
       () => { bloom.scale = 0.5; resize(); }, () => { bloom.scale = 1; resize(); });
   }
   const smaaAt = sm.composer.passes.findIndex((p) => p.constructor.name === 'SMAAPass');
-  if (smaaAt >= 0) {
+  if (smaaAt >= 0 && sm.composer.passes[smaaAt].enabled) {
     const smaa = sm.composer.passes[smaaAt];
     const fxaa = new FXAAPass();
     fxaa.renderToScreen = smaa.renderToScreen;

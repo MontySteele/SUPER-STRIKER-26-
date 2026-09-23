@@ -75,6 +75,10 @@ export type TimeOfDay = 'day' | 'sunset' | 'night';
 //    cost pixels;
 //  • the first WARMUP_MS of a renderer's life is ignored outright, which
 //    is where every one of those stalls lives;
+//  • a steady JUDDER drops too: the hot clock above bleeds while frames are
+//    clean, so one miss in four (a visible 45fps shimmer) never fills it —
+//    a full post-change second with JUDDER_RATE of its frames missed is
+//    reason enough on its own;
 //  • and every drop is put on trial: once the smaller buffer has settled we
 //    watch DROP_TRIAL seconds of it, and if the miss rate did not fall by at
 //    least a third the misses were never fill-rate (the sim, GC, another app
@@ -106,6 +110,8 @@ const RAISE_AFTER_MAX = 20;
 const PROMOTION_REGRET = 4.0;
 /** frames right after a resolution change are re-allocation, not gameplay */
 const SETTLE = 0.35;
+/** share of a second's frames missed that counts as judder */
+const JUDDER_RATE = 0.15;
 /** seconds of post-drop frames a demotion is judged on */
 const DROP_TRIAL = 2.0;
 /** a drop must cut the miss rate to at most this fraction of what it was */
@@ -157,6 +163,8 @@ export class SceneManager {
   /** §7A.6b — null on RETRO and on any level whose profile says aoStrength 0 */
   private aoPass: DepthAOPass | null = null;
   private dofPass: DofBlurPass | null = null;
+  private smaaPass: SMAAPass | null = null;
+  private fxaaPass: FXAAPass | null = null;
 
   private basePixelRatio: number;
   private ratioIdx = 0;
@@ -180,6 +188,8 @@ export class SceneManager {
   /** drops are refused while this is > 0 (a recent drop bought nothing) */
   private futileLeft = 0;
   private futileHold = FUTILE_HOLD;
+  /** seconds of judged (post-warmup, post-settle) frames since the last change */
+  private judged = 0;
   /** rolling one-second window of presented intervals, for the overlay */
   private recent: number[] = [];
   private recentMs = 0;
@@ -339,8 +349,23 @@ export class SceneManager {
       // writes (see TonemapGradeShader), and both write straight to the
       // screen: no OutputPass, one less full-screen pass. With no AA at all
       // the grade itself is the last pass and goes to the screen.
-      if (this.profile.aa === 'smaa') this.composer.addPass(new SMAAPass());
-      if (this.profile.aa === 'fxaa') this.composer.addPass(new FXAAPass());
+      //
+      // HIGH asks for SMAA but only gets it on a 1x display. At DPR >= 1.75
+      // an edge step is half a CSS pixel, where SMAA and FXAA are hard to tell
+      // apart at arm's length and SMAA's three full-res passes cost ~5ms of a
+      // 3840x2160 frame against FXAA's ~2 (bench &ablate=1, "variant: FXAA
+      // instead of SMAA"). Both are built so a drag between the Retina panel
+      // and a 1x monitor can swap them (see pickAA); the composer sends
+      // whichever is the last ENABLED pass to the screen.
+      if (this.profile.aa === 'smaa') {
+        this.smaaPass = new SMAAPass();
+        this.composer.addPass(this.smaaPass);
+      }
+      if (this.profile.aa === 'smaa' || this.profile.aa === 'fxaa') {
+        this.fxaaPass = new FXAAPass();
+        this.composer.addPass(this.fxaaPass);
+      }
+      this.pickAA();
     }
     this.composer.setSize(w, h);
     if (!this.profile.retro) this.syncTexel();
@@ -441,6 +466,7 @@ export class SceneManager {
 
     const missed = ms > this.vsyncMs * MISS_FACTOR;
     if (this.futileLeft > 0) this.futileLeft -= dtReal;
+    this.judged += dtReal;
 
     // a drop on trial: did giving up pixels actually stop the misses?
     if (this.trial) {
@@ -475,15 +501,19 @@ export class SceneManager {
       this.hotFor = Math.max(0, this.hotFor - dtReal * 0.5);
     }
 
-    if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1 && this.futileLeft > 0) {
+    // the one-second window is wholly after the last change once judged >= 1
+    const judder = this.judged >= 1 && this.recentMissRate() >= JUDDER_RATE;
+    const wantDrop = (this.hotFor >= DROP_AFTER || judder) && this.ratioIdx < this.steps.length - 1;
+    if (wantDrop && this.futileLeft > 0) {
       this.lastNote = `hot, but drops bought nothing (hold ${this.futileLeft.toFixed(0)}s)`;
-    } else if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1) {
+    } else if (wantDrop) {
       // a promotion that got us here was a mistake; be more patient next time
       if (this.sinceRaise < PROMOTION_REGRET) {
         this.raiseAfter = Math.min(this.raiseAfter * 2, RAISE_AFTER_MAX);
       }
       const before = this.recentMissRate();
-      this.setRatioStep(this.ratioIdx + 1, 'dropped: missed vsyncs for 1s');
+      this.setRatioStep(this.ratioIdx + 1, judder && this.hotFor < DROP_AFTER
+        ? `dropped: judder, ${(before * 100) | 0}% missed` : 'dropped: missed vsyncs for 1s');
       this.trial = { before, left: DROP_TRIAL, frames: 0, misses: 0 };
     } else if (this.coolFor >= this.raiseAfter && this.ratioIdx > 0) {
       this.setRatioStep(this.ratioIdx - 1, 'restored: 1s+ clean');
@@ -504,6 +534,18 @@ export class SceneManager {
     return n ? miss / n : 0;
   }
 
+  /** The AA actually running: SMAA only below Retina density (see above). */
+  private activeAA(): 'smaa' | 'fxaa' | 'none' {
+    if (this.smaaPass && this.basePixelRatio < 1.75) return 'smaa';
+    return this.fxaaPass ? 'fxaa' : 'none';
+  }
+
+  private pickAA(): void {
+    const aa = this.activeAA();
+    if (this.smaaPass) this.smaaPass.enabled = aa === 'smaa';
+    if (this.fxaaPass) this.fxaaPass.enabled = aa === 'fxaa';
+  }
+
   private setRatioStep(idx: number, why: string): void {
     this.ratioIdx = idx;
     const ratio = this.basePixelRatio * this.steps[idx];
@@ -513,6 +555,7 @@ export class SceneManager {
     // a resolution change is a fresh baseline; don't judge it on stale frames
     this.hotFor = 0;
     this.coolFor = 0;
+    this.judged = 0;
     this.settleLeft = SETTLE;
     this.lastNote = `${why} → x${this.steps[idx]}`;
     console.info(`ss26 render scale x${this.steps[idx]} (${why})`);
@@ -535,7 +578,7 @@ export class SceneManager {
       steps: this.steps,
       pinned: !!this.pinned,
       quality: this.profile.level,
-      aa: this.profile.aa,
+      aa: this.activeAA(),
       msaaSamples: effectiveSamples(this.profile, this.basePixelRatio),
       sharpen: (this.gradePass.uniforms.sharpen?.value as number) ?? 0,
       anisotropy: this.renderer.capabilities.getMaxAnisotropy(),
@@ -614,6 +657,7 @@ export class SceneManager {
     this.ratioIdx = 0;
     this.renderer.setPixelRatio(ratio);
     this.composer.setPixelRatio(ratio);
+    this.pickAA();
     this.renderer.setSize(w, h, false);
     this.composer.setSize(w, h);
     this.camera.aspect = w / h;
@@ -678,6 +722,7 @@ export class SceneManager {
       this.basePixelRatio = base;
       this.renderer.setPixelRatio(base * this.steps[this.ratioIdx]);
       this.composer.setPixelRatio(base * this.steps[this.ratioIdx]);
+      this.pickAA();
     }
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);

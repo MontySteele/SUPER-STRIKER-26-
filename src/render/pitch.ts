@@ -43,6 +43,7 @@ export function buildPitch(scene: THREE.Scene, lab: TextureLab, profile: Quality
     ? new THREE.PlaneGeometry(PITCH_LENGTH + PITCH_MARGIN * 2, PITCH_WIDTH + PITCH_MARGIN * 2)
     : runoffPlane();
   const mesh = new THREE.Mesh(geo, mat);
+  mesh.name = 'pitch';
   mesh.rotation.x = -Math.PI / 2;
   mesh.receiveShadow = true;
   scene.add(mesh);
@@ -52,6 +53,7 @@ export function buildPitch(scene: THREE.Scene, lab: TextureLab, profile: Quality
     new THREE.PlaneGeometry(600, 480),
     new THREE.MeshStandardMaterial({ color: 0x101816, roughness: 0.95 }),
   );
+  surround.name = 'pitchSurround';
   surround.rotation.x = -Math.PI / 2;
   surround.position.y = -0.05;
   surround.receiveShadow = true;
@@ -91,6 +93,45 @@ function runoffPlane(): THREE.PlaneGeometry {
   }
   uv.needsUpdate = true;
   return geo;
+}
+
+/** Lattice cells per side of the noise table. The pitch shader's highest
+ *  octave is 3.3 cells a metre, and the whole plane, run-off included, is
+ *  inside ±80m — so ±512 cells covers every lookup without a repeat. */
+const LATTICE_N = 1024;
+const LATTICE_HALF = LATTICE_N / 2;
+let lattice: THREE.DataTexture | null = null;
+
+/**
+ * The value-noise lattice, precomputed: texel (x, y) holds the hash of the
+ * integer point (x - 512, y - 512), computed in float32 steps exactly as the
+ * GLSL hash did (Math.fround), so the pitch keeps the same blotches it had.
+ * Half float, linear filtered: R16F filters in core WebGL2, and its 11-bit
+ * mantissa is far below anything the ±9% variation can show.
+ */
+function latticeTexture(): THREE.DataTexture {
+  if (lattice) return lattice;
+  const f = Math.fround;
+  const fract = (x: number): number => f(x - Math.floor(x));
+  const data = new Uint16Array(LATTICE_N * LATTICE_N);
+  for (let y = 0; y < LATTICE_N; y++) {
+    for (let x = 0; x < LATTICE_N; x++) {
+      let px = fract(f((x - LATTICE_HALF) * f(0.3183099)));
+      let py = fract(f((y - LATTICE_HALF) * f(0.3678794)));
+      const d = f(f(px * f(px + f(19.19))) + f(py * f(py + f(19.19))));
+      px = f(px + d); py = f(py + d);
+      data[y * LATTICE_N + x] = THREE.DataUtils.toHalfFloat(fract(f(f(px * py) * f(95.4337))));
+    }
+  }
+  const t = new THREE.DataTexture(data, LATTICE_N, LATTICE_N, THREE.RedFormat, THREE.HalfFloatType);
+  t.minFilter = THREE.LinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.generateMipmaps = false;
+  t.colorSpace = THREE.NoColorSpace;
+  t.needsUpdate = true;
+  lattice = t;
+  return t;
 }
 
 /**
@@ -139,6 +180,7 @@ THREE.MeshStandardMaterial {
 
   queueShaderPatch(mat, (shader) => {
     shader.uniforms.ss26Detail = { value: maps.detail };
+    shader.uniforms.ss26Lattice = { value: latticeTexture() };
     shader.uniforms.ss26DetailRepeat = { value: maps.repeat.clone() };
     shader.uniforms.ss26StripeK = { value: Math.PI / STRIPE_PERIOD };
     shader.uniforms.ss26Wet = { value: wx.wet };
@@ -212,18 +254,17 @@ THREE.MeshStandardMaterial {
       // 4m and at 90m, and the stripes, the wear paths and the mowing sheen
       // are all still there when the camera is in the gantry. It costs ~20 ALU
       // on a shader that is already doing three texture fetches.
-      float ss26Hash2( vec2 p ) {
-        p = fract( p * vec2( 0.3183099, 0.3678794 ) );
-        p += dot( p, p + 19.19 );
-        return fract( p.x * p.y * 95.4337 );
-      }
-
+      // Smooth value noise, ONE fetch: ss26Lattice holds the lattice hash at
+      // every integer point (see latticeTexture), so a bilinear tap placed at
+      // i + smoothstep(f) is exactly the four-hash mix this used to compute
+      // in ALU — about 60 instructions a call, eight calls a pixel, across
+      // most of the screen. No mips: it is a point evaluation, as before.
+      uniform sampler2D ss26Lattice;
       float ss26Noise2( vec2 p ) {
         vec2 i = floor( p ), f = fract( p );
         vec2 u = f * f * ( 3.0 - 2.0 * f );
-        return mix(
-          mix( ss26Hash2( i ), ss26Hash2( i + vec2( 1.0, 0.0 ) ), u.x ),
-          mix( ss26Hash2( i + vec2( 0.0, 1.0 ) ), ss26Hash2( i + vec2( 1.0, 1.0 ) ), u.x ), u.y );
+        return texture2D( ss26Lattice,
+          ( i + u + ${LATTICE_HALF.toFixed(1)} + 0.5 ) / ${LATTICE_N.toFixed(1)} ).r;
       }
 
       /** How worn this square metre of turf is, 0..1. */
