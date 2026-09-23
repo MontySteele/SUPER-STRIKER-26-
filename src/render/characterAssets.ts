@@ -1149,8 +1149,31 @@ interface FaceMap {
   /** authored normal − normal re-derived from the unmoved mesh, so a zero
    *  offset reproduces the authored shading exactly */
   bias: Float32Array;
+  /** the jaw/neck band the deltas are relaxed over (see relaxBand) */
+  band: FaceBand | null;
   src: THREE.BufferGeometry;
 }
+
+/**
+ * The pool's mask fades a face into the neck by the Head bone's SKIN WEIGHT,
+ * and MPFB's weights step sharply under the jaw: a head-square or chin target
+ * moved the jaw at full strength and the skin a centimetre below it not at all,
+ * so every seeded face folded over its own neck in a hard crease. The band is
+ * the welded vertices within BAND_RINGS edge-rings of the unmoved neck, with
+ * CSR adjacency, so a morph can relax its offsets there into a gentle ramp
+ * without a rebake, and without touching the eyes, nose or mouth further up.
+ */
+interface FaceBand {
+  /** welded representative vertices in the band */
+  verts: Uint32Array;
+  /** relaxation strength per band vertex, 1 at the neck fading to 0 */
+  weight: Float32Array;
+  /** CSR adjacency over welded representatives (unmoved neighbours included) */
+  nStart: Uint32Array;
+  nIdx: Uint32Array;
+}
+const BAND_RINGS = 10;
+const BAND_ITERS = 24;
 
 export interface FacePool {
   file: FacePoolFile;
@@ -1306,8 +1329,10 @@ function buildFaceMap(mesh: THREE.Mesh, pool: FacePool, sec: FaceSection): FaceM
     tris: Uint32Array.from(tris),
     moved: Uint32Array.from(moved),
     bias: new Float32Array(moved.length * 3),
+    band: null,
     src: geo,
   };
+  fm.band = buildFaceBand(fm);
   // rederive normals from the UNMOVED mesh and keep the difference
   const rederived = new Float32Array(n * 3);
   accumulateNormals(fm, pos.array as Float32Array, rederived);
@@ -1318,6 +1343,84 @@ function buildFaceMap(mesh: THREE.Mesh, pool: FacePool, sec: FaceSection): FaceM
     fm.bias[k * 3 + 2] = nor.getZ(i) - rederived[i * 3 + 2];
   }
   return fm;
+}
+
+/** Ring distance from the unmoved mesh over welded vertices; see FaceBand. */
+function buildFaceBand(fm: FaceMap): FaceBand | null {
+  const index = fm.src.getIndex()!;
+  const adj = new Map<number, Set<number>>();
+  const link = (a: number, b: number): void => {
+    let s = adj.get(a);
+    if (!s) { s = new Set(); adj.set(a, s); }
+    s.add(b);
+  };
+  for (const t of fm.tris) {
+    const v = [fm.weld[index.getX(t)], fm.weld[index.getX(t + 1)], fm.weld[index.getX(t + 2)]];
+    for (let e = 0; e < 3; e++) { link(v[e], v[(e + 1) % 3]); link(v[(e + 1) % 3], v[e]); }
+  }
+  // a welded vertex counts as moved if any of its duplicates is
+  const movedRep = new Set<number>();
+  for (const i of fm.moved) movedRep.add(fm.weld[i]);
+  const ring = new Map<number, number>();
+  let frontier: number[] = [];
+  for (const r of movedRep) {
+    for (const nb of adj.get(r) ?? []) {
+      if (!movedRep.has(nb)) { ring.set(r, 0); frontier.push(r); break; }
+    }
+  }
+  if (!frontier.length) return null;          // eyes, brows: nothing to ramp into
+  for (let d = 1; d < BAND_RINGS * 2 && frontier.length; d++) {
+    const next: number[] = [];
+    for (const r of frontier) {
+      for (const nb of adj.get(r) ?? []) {
+        if (movedRep.has(nb) && !ring.has(nb)) { ring.set(nb, d); next.push(nb); }
+      }
+    }
+    frontier = next;
+  }
+  const verts = [...ring.keys()];
+  const weight = new Float32Array(verts.length);
+  const nStart = new Uint32Array(verts.length + 1);
+  const nIdx: number[] = [];
+  verts.forEach((r, k) => {
+    const d = ring.get(r)!;
+    // full strength through BAND_RINGS, then fading out over as many again
+    weight[k] = d <= BAND_RINGS ? 1 : 1 - (d - BAND_RINGS) / BAND_RINGS;
+    for (const nb of adj.get(r) ?? []) nIdx.push(nb);
+    nStart[k + 1] = nIdx.length;
+  });
+  return { verts: Uint32Array.from(verts), weight, nStart, nIdx: Uint32Array.from(nIdx) };
+}
+
+/**
+ * Relax one morph's offsets over the jaw/neck band: Jacobi-smoothed toward the
+ * neighbour mean, with the unmoved neck pinned at zero, so the step the skin
+ * weights left becomes a ramp several rings wide. `off` is indexed by welded
+ * representative (buffer vertex), xyz.
+ */
+function relaxBand(band: FaceBand, off: Float32Array): void {
+  const n = band.verts.length;
+  const next = new Float32Array(n * 3);
+  for (let it = 0; it < BAND_ITERS; it++) {
+    for (let k = 0; k < n; k++) {
+      const a = band.nStart[k], b = band.nStart[k + 1];
+      let x = 0, y = 0, z = 0;
+      for (let j = a; j < b; j++) {
+        const o = band.nIdx[j] * 3;
+        x += off[o]; y += off[o + 1]; z += off[o + 2];
+      }
+      const inv = 1 / Math.max(1, b - a);
+      const w = band.weight[k] * 0.8;
+      const o = band.verts[k] * 3;
+      next[k * 3] = off[o] + (x * inv - off[o]) * w;
+      next[k * 3 + 1] = off[o + 1] + (y * inv - off[o + 1]) * w;
+      next[k * 3 + 2] = off[o + 2] + (z * inv - off[o + 2]) * w;
+    }
+    for (let k = 0; k < n; k++) {
+      const o = band.verts[k] * 3;
+      off[o] = next[k * 3]; off[o + 1] = next[k * 3 + 1]; off[o + 2] = next[k * 3 + 2];
+    }
+  }
 }
 
 /** Area-weighted face normals accumulated over the affected triangles and
@@ -1373,11 +1476,21 @@ function morphGeometry(fm: FaceMap, pool: FacePool, variant: number): THREE.Buff
 
   const d0 = fm.sec.delta / 2 + variant * fm.sec.count * 3;
   const s = pool.file.scale;
+  // offsets gathered per welded representative (unmoved stay zero), relaxed
+  // over the jaw/neck band, then scattered back to every duplicate
+  const off = new Float32Array(pos.length);
   for (const i of fm.moved) {
-    const p = fm.map[i] * 3;
-    pos[i * 3] += pool.delta[d0 + p] * s;
-    pos[i * 3 + 1] += pool.delta[d0 + p + 1] * s;
-    pos[i * 3 + 2] += pool.delta[d0 + p + 2] * s;
+    const p = fm.map[i] * 3, r = fm.weld[i] * 3;
+    off[r] = pool.delta[d0 + p] * s;
+    off[r + 1] = pool.delta[d0 + p + 1] * s;
+    off[r + 2] = pool.delta[d0 + p + 2] * s;
+  }
+  if (fm.band && !NO_RELAX_DEBUG) relaxBand(fm.band, off);
+  for (const i of fm.moved) {
+    const r = fm.weld[i] * 3;
+    pos[i * 3] += off[r];
+    pos[i * 3 + 1] += off[r + 1];
+    pos[i * 3 + 2] += off[r + 2];
   }
   accumulateNormals(fm, pos, nor);
   for (let k = 0; k < fm.moved.length; k++) {
@@ -2276,6 +2389,12 @@ function buildFaceMask(arch: Archetype): THREE.CanvasTexture | null {
  * resolve, which is the whole point: it adds surface, never colour, and it
  * cannot fight the photographed skin it sits on.
  */
+const NO_RELAX_DEBUG = typeof location !== 'undefined' && /[?&]norelax=1/.test(location.search);
+const NO_FACES_DEBUG = typeof location !== 'undefined' && /[?&]nofaces=1/.test(location.search);
+/** Texels of the pore tile per octave-1 cell (256 / period 32). */
+const PORE_PERIOD = 32;
+/** Target size of one pore cell on the body, metres; the face lands here at 1x. */
+const PORE_CELL_M = 0.0015;
 let poreTexture: THREE.DataTexture | null = null;
 function poreNormal(): THREE.Texture {
   if (poreTexture) return poreTexture;
@@ -2432,6 +2551,23 @@ function queueSkinShading(mat: THREE.MeshStandardMaterial, o: SkinShadingOptions
       `#include <common>\n${SKIN_UNIFORMS}`);
     if (SKIN_PARS) frag = frag.replace('#include <lights_physical_pars_fragment>', SKIN_PARS);
     frag = frag.replace('#include <opaque_fragment>', `${SKIN_RIM}\n  #include <opaque_fragment>`);
+    // The pore tile repeats at one rate across the whole atlas, but the atlas
+    // spends ~3x the texels per metre on the face that it does on a forearm, so
+    // a millimetre pore on the cheek became a 3 mm scale on the arm and every
+    // arm read as lizard skin. Measure metres per normal-map UV from the screen
+    // derivatives and step the tile frequency up (1x, 2x, 4x, blended) until one
+    // pore cell is back near PORE_CELL_M wherever it lands.
+    shader.uniforms.ss26PoreCell = { value: PORE_CELL_M };
+    frag = frag.replace('#include <common>', '#include <common>\nuniform float ss26PoreCell;')
+      .replace('#include <normal_fragment_maps>', THREE.ShaderChunk.normal_fragment_maps.replace(
+        'vec3 mapN = texture2D( normalMap, vNormalMapUv ).xyz * 2.0 - 1.0;', `
+        float ss26Dp = length( fwidth( vViewPosition ) );
+        float ss26Duv = max( length( fwidth( vNormalMapUv ) ), 1e-7 );
+        float ss26Cell = ( ss26Dp / ss26Duv ) / ${PORE_PERIOD.toFixed(1)};
+        float ss26K = clamp( log2( max( ss26Cell / ss26PoreCell, 1.0 ) ), 0.0, 2.0 );
+        float ss26F0 = exp2( floor( ss26K ) );
+        vec3 mapN = mix( texture2D( normalMap, vNormalMapUv * ss26F0 ).xyz,
+          texture2D( normalMap, vNormalMapUv * ss26F0 * 2.0 ).xyz, fract( ss26K ) ) * 2.0 - 1.0;`));
 
     if (o.sockMask && o.sockColor) {
       shader.uniforms.ss26SockMask = { value: o.sockMask };
@@ -2663,7 +2799,7 @@ export class CharacterRig {
         return;
       }
       const fm = arch.faces ? arch.faceMaps.get(sane) : undefined;
-      if (fm) mesh.geometry = morphGeometry(fm, arch.faces!, look.variant);
+      if (fm && !NO_FACES_DEBUG) mesh.geometry = morphGeometry(fm, arch.faces!, look.variant);
     });
     for (const d of drop) d.removeFromParent();
 

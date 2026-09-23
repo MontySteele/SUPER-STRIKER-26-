@@ -51,6 +51,8 @@ const players = arg('players', '');
 // `--quality medium` / `retro` — an ad-hoc look at another level, exactly as
 // `npm run capture -- --quality` means it: not a baseline, just a check
 const quality = arg('quality', '');
+// `--query a=1&b=2` — extra page params passed through verbatim (debug toggles)
+const extraQuery = arg('query', '');
 const size = (arg('size', '1440x810').match(/^(\d+)x(\d+)$/) ?? [null, '1440', '810']).slice(1);
 const perShotTimeout = Number(arg('timeout', 180)) * 1000;
 
@@ -90,7 +92,8 @@ function shoot(shot) {
   const file = path.join(outDir, `${shot}${label ? `-${label}` : ''}.png`);
   const query = `?capture=${encodeURIComponent(shot)}`
     + (players ? `&players=${encodeURIComponent(players)}` : '')
-    + (quality ? `&quality=${encodeURIComponent(quality)}` : '');
+    + (quality ? `&quality=${encodeURIComponent(quality)}` : '')
+    + (extraQuery ? `&${extraQuery}` : '');
   return new Promise((resolve) => {
     const child = spawn(electronBin, [path.join(ROOT, 'electron', 'main.cjs')], {
       cwd: ROOT,

@@ -88,6 +88,7 @@ on and screenshots the DEVICE pixels.
 node tools/gpu-stills.mjs                              # the default four
 node tools/gpu-stills.mjs --shots tele_endzone --label after
 node tools/gpu-stills.mjs --size 1440x810 --out captures/foo
+node tools/gpu-stills.mjs --shots face_closeup --query nofaces=1   # debug page params (nofaces=1, norelax=1)
 ```
 
 It is a companion to `npm run capture`, never a replacement: these PNGs are not

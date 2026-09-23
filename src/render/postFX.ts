@@ -180,9 +180,14 @@ export const TonemapGradeShader = {
       // blends toward it by its own circle of confusion. Sharp pixels carry
       // ~no weight in that copy, so a player in focus does not halo into the
       // crowd behind him.
+      // how far this pixel went toward the blur buffer; the full-res sharpen
+      // and AO below read the UN-blurred frame, so they fade out by it or they
+      // print crisp one-pixel rims back onto a defocused background
+      float dofMix = 0.0;
       if (dofAmount > 0.0) {
         float coc = cocAt(viewDistance(vUv));
         float m = smoothstep(0.02, 0.30, coc);
+        dofMix = m;
         if (m > 0.0) {
           vec3 blurred = texture2D(tDofBlur, vUv).rgb;
           c.rgb = mix(c.rgb, blurred, m);
@@ -200,8 +205,8 @@ export const TonemapGradeShader = {
         float r2 = clamp(dot(d, d) * 2.0, 0.0, 1.0);         // 0 centre, 1 corner
         vec2 dirUv = d * inversesqrt(max(dot(d, d), 1e-8));
         vec2 shift = dirUv * (chroma * r2) * texel;
-        c.r += texture2D(tDiffuse, vUv + shift).r - base.r;
-        c.b += texture2D(tDiffuse, vUv - shift).b - base.b;
+        c.r += (texture2D(tDiffuse, vUv + shift).r - base.r) * (1.0 - dofMix);
+        c.b += (texture2D(tDiffuse, vUv - shift).b - base.b) * (1.0 - dofMix);
       }
 
       // ---- contrast-adaptive sharpen, in linear light ----
@@ -218,7 +223,8 @@ export const TonemapGradeShader = {
         // the clamp is the whole trick: a pixel may only be pushed as far as
         // its own neighbours already go, so an edge gets crisper and never
         // grows the bright fringe an unclamped unsharp mask paints
-        c.rgb = clamp(c.rgb + (c.rgb - blur) * sharpen, min(lo, c.rgb), max(hi, c.rgb));
+        c.rgb = mix(clamp(c.rgb + (c.rgb - blur) * sharpen, min(lo, c.rgb), max(hi, c.rgb)),
+          c.rgb, dofMix);
       }
 
       // ---- ambient occlusion (§7A.6b) ----
@@ -247,7 +253,7 @@ export const TonemapGradeShader = {
           + texture2D(tAO, vUv + vec2(-o.x, -o.y)).r);
         float lum0 = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
         float ambientish = 1.0 - smoothstep(0.22, 1.10, lum0);
-        c.rgb *= mix(1.0, ao, aoAmount * (0.35 + 0.65 * ambientish));
+        c.rgb *= mix(1.0, ao, aoAmount * (0.35 + 0.65 * ambientish) * (1.0 - dofMix));
       }
 
       // ---- the one and only tone-map ----
