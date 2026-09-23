@@ -44,14 +44,14 @@
     },
     {
       "name": "stadium_establishing",
-      "note": "The whole bowl from a high corner at night: roof line, three tiers, all four floodlight banks. The venue-scale and floodlight-bloom shot.",
+      "note": "The whole bowl from high over the main stand at night (off the corner diagonal, so no pylon stands in front of the pitch): roof line, three tiers, all four floodlight banks. The venue-scale and floodlight-bloom shot.",
       "seed": 12648430,
       "home": "cze",
       "away": "ger",
       "frames": 600,
       "timeOfDay": "night",
       "stadium": "mega",
-      "cam": { "pos": [152, 128, 138], "look": [0, 2, 0], "fov": 36 }
+      "cam": { "pos": [38, 134, 132], "look": [0, 0, -10], "fov": 40 }
     },
     {
       "name": "pitch_stripes_low_sun",
@@ -521,7 +521,7 @@
     },
     {
       "name": "weather_night_establishing",
-      "note": "NIGHT (\u00a77A.4c). The national bowl from a high corner under weather=night: near-black sky with the bowl's haze glow over the roof line, the four pylon heads blooming, the pitch the brightest thing in frame with its pools under the pylons, and the roofs and upper tiers falling away into the dark.",
+      "note": "NIGHT (\u00a77A.4c). The national bowl from high over the main stand under weather=night: near-black sky with the bowl's haze glow over the roof line, the four pylon heads blooming, the pitch the brightest thing in frame with its pools under the pylons, and the roofs and upper tiers falling away into the dark.",
       "seed": 12648430,
       "home": "cze",
       "away": "ger",
@@ -529,7 +529,7 @@
       "timeOfDay": "day",
       "weather": "night",
       "stadium": "national",
-      "cam": { "pos": [118, 52, 96], "look": [0, 4, 0], "fov": 42 }
+      "cam": { "pos": [38, 95, 110], "look": [0, 0, -8], "fov": 42 }
     },
     {
       "name": "weather_night_closeup",

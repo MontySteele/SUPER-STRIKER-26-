@@ -428,7 +428,9 @@ THREE.MeshStandardMaterial {
         float ss26Into2 = -ss26Vr.z * ss26PhR;
         roughnessFactor = clamp(
           roughnessFactor
-            - ss26PhR * 0.12 * ( 1.0 - 0.5 * ss26Wet )
+            // (0.85 in the wet, not 0.5: near the wet floor a ±0.06 swing
+            // is a mirror band next to a matte one — the rain sheen banding)
+            - ss26PhR * 0.12 * ( 1.0 - 0.85 * ss26Wet )
             - ss26Sheen * 0.26
             // 0.085, not the 0.16 this started at. A grazing key on a
             // roughness-0.36 band is a gold BAR, not a mowing stripe: at

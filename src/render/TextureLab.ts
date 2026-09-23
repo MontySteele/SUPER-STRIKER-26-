@@ -1012,32 +1012,32 @@ export class TextureLab {
       const N = 256;
       const [c, ctx] = canvas2d(N, N);
       const g = ctx.createRadialGradient(N / 2, N / 2, 0, N / 2, N / 2, N / 2);
+      // A tight hot core and a long soft shoulder: that is what a broadcast
+      // camera makes of a floodlight head — the bloom pass does the rest.
       g.addColorStop(0, 'rgba(255,252,240,1)');
-      g.addColorStop(0.18, 'rgba(255,244,214,0.55)');
-      g.addColorStop(0.5, 'rgba(190,214,255,0.13)');
+      g.addColorStop(0.07, 'rgba(255,248,228,0.62)');
+      g.addColorStop(0.2, 'rgba(255,242,215,0.2)');
+      g.addColorStop(0.5, 'rgba(190,214,255,0.05)');
       g.addColorStop(1, 'rgba(140,180,255,0)');
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, N, N);
 
-      // The STARBURST. A floodlight through a real broadcast lens does not
-      // make a disc: the iris blades diffract it into an even number of
-      // spokes, and that shape is most of what says "this is a photograph of a
-      // very bright light" rather than "this is a white circle". Six blades,
-      // so twelve spokes, at two lengths so the pattern is not a snowflake.
+      // Diffraction spikes, and only a hint of them. v1 drew twelve spokes out
+      // to the sprite's rim — at 22m that is a star-filter cross the size of
+      // a stand, which is a 1990s music video, not a match broadcast. A real
+      // zoom lens's iris gives short, faint spikes that die inside the glow:
+      // six of them, a third of the radius, a fraction of the core.
       ctx.globalCompositeOperation = 'lighter';
       ctx.translate(N / 2, N / 2);
-      const SPOKES = 12;
+      const SPOKES = 6;
       for (let i = 0; i < SPOKES; i++) {
-        const long = i % 2 === 0;
-        const len = (N / 2) * (long ? 0.98 : 0.54);
-        const halfWidth = long ? 0.020 : 0.013;
+        const len = (N / 2) * (i % 2 === 0 ? 0.34 : 0.24);
+        const halfWidth = 0.006;
         ctx.save();
         ctx.rotate((i / SPOKES) * Math.PI * 2 + 0.13);
-        // a spike is a triangle with a gradient along it, not a stroked line:
-        // it has to be wide and bright at the core and vanish to nothing
         const sg = ctx.createLinearGradient(0, 0, len, 0);
-        sg.addColorStop(0, 'rgba(255,250,235,0.85)');
-        sg.addColorStop(0.22, 'rgba(255,246,220,0.22)');
+        sg.addColorStop(0, 'rgba(255,250,235,0.30)');
+        sg.addColorStop(0.3, 'rgba(255,246,220,0.07)');
         sg.addColorStop(1, 'rgba(200,220,255,0)');
         ctx.fillStyle = sg;
         ctx.beginPath();

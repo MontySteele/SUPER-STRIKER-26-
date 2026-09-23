@@ -1136,23 +1136,9 @@ export class Stadium {
     // §7A.4d: dimmer and less blue than it was — four of these at 62m washed
     // the whole night sky navy; the bowl's own air glow now lives in sky.ts
     if (haloMat) haloMat.color.setRGB(0.30, 0.33, 0.42, THREE.LinearSRGBColorSpace);
-    // ...and the anamorphic streak, on its own texture because a 15:1 sprite
-    // wearing the radial flare is an ellipse, not a streak (see TextureLab)
-    const streakMat = night && !this.retro ? new THREE.SpriteMaterial({
-      map: this.lab.streakTexture(),
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      transparent: true,
-      fog: false,
-      // a sprite that rotates with the camera roll would smear diagonally; the
-      // streak is a property of the LENS and stays level with the frame
-      rotation: 0,
-    }) : null;
-    if (streakMat) {
-      streakMat.color.setRGB(this.hdrLamps ? 1.35 : 0.8, this.hdrLamps ? 1.3 : 0.78,
-        this.hdrLamps ? 1.5 : 0.9, THREE.LinearSRGBColorSpace);
-    }
-
+    // (v1 also hung a 96m anamorphic streak on every head. A broadcast zoom
+    // is a spherical lens: it has no anamorphic flare, and four 15:1 smears
+    // plus the old twelve-spoke star read as a cross-filter, not a camera.)
     for (const [x, z] of [[-1, -1], [-1, 1], [1, -1], [1, 1]]) {
       const px = x * (HALF_L + 22);
       const pz = z * (HALF_W + 24);
@@ -1190,13 +1176,6 @@ export class Stadium {
         halo.position.copy(head.position);
         halo.scale.setScalar(62);
         scene.add(halo);
-      }
-      if (streakMat) {
-        const streak = new THREE.Sprite(streakMat);
-        streak.position.copy(head.position);
-        // 15:1 — long enough to be a lens artefact and not a lit cloud
-        streak.scale.set(96, 6.4, 1);
-        scene.add(streak);
       }
     }
   }

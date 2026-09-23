@@ -19,7 +19,7 @@ import { TextureLab } from './TextureLab';
 import { BallMesh } from './ballMesh';
 import { CameraDirector, type CamMode, type ModeOptions } from './camera';
 import { Rain } from './rain';
-import { effectiveTimeOfDay, weatherProfile } from './weather';
+import { effectiveTimeOfDay, floodlightsLit, weatherProfile } from './weather';
 import { HALF_L, SIM_DT } from '../sim/constants';
 
 /**
@@ -320,7 +320,11 @@ export class GameRenderer {
     const wx = weatherProfile();
     if (wx.rain > 0 && !this.sceneMgr.profile.retro) {
       this.rain = new Rain(this.sceneMgr.scene, this.lab.stream(0x2a17),
-        wx.rain, timeOfDay === 'night' ? 0xdce8ff : 0xc6d4e4);
+        wx.rain, timeOfDay === 'night' ? 0xdce8ff : 0xc6d4e4, {
+          lamps: this.stadium.floodlightHeads.map((h) => h.position),
+          lit: floodlightsLit(timeOfDay),
+          night: effectiveTimeOfDay(timeOfDay) === 'night',
+        });
     }
     // ...but the >60m impostors are unlit billboards, and their material is
     // only minted when a player first crosses the threshold. Registering them
@@ -380,7 +384,6 @@ export class GameRenderer {
       this.sceneMgr.setDepthOfField(0, 10);
     }
   }
-
 
   /**
    * Pick every player's detail tier against the camera that is about to draw

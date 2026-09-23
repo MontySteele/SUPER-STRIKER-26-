@@ -480,15 +480,26 @@ export class CameraDirector {
 
       // ------------------------------------------------------------ cards
       case 'beauty': {
-        // slow stadium crane: half-time, full-time, pre-match attract
+        // slow stadium crane: half-time, full-time, pre-match attract.
+        //
+        // It SWINGS, it does not orbit. The pylons stand on the corner
+        // diagonals (azimuth ±38° / ±142° for every tier), and a crane that
+        // sweeps through one of them parks a floodlight mast dead centre in
+        // the establishing shot. So the arc lives on the main-stand side
+        // between the two near pylons — 64°..96°, 26° clear of either mast —
+        // and eases back and forth at the old orbit's peak angular speed.
+        // Off the diagonal there is no corner gap to look through, so the
+        // crane climbs (x1.6) and comes in (x0.85) until the near stand's
+        // roof drops out of the bottom of a 40° frame and the view is over
+        // it, blimp-style, with the far stands and pylon heads still in.
         const t = this.modeT;
-        const a = 0.9 + t * 0.055;
-        const r = this.beautyRadius + Math.sin(t * 0.09) * 8;
+        const a = 1.40 - 0.28 * Math.cos(t * 0.055 / 0.28);
+        const r = this.beautyRadius * 0.85 + Math.sin(t * 0.09) * 6;
         tx = Math.cos(a) * r;
         tz = Math.sin(a) * r;
-        ty = this.beautyHeight + Math.sin(t * 0.07) * 5;
-        lx = 0; ly = 4 + Math.sin(t * 0.05) * 2; lz = 0;
-        fovT = 32;
+        ty = this.beautyHeight * 1.6 + Math.sin(t * 0.07) * 4;
+        lx = 0; ly = 2 + Math.sin(t * 0.05) * 2; lz = -6;
+        fovT = 40;
         break;
       }
 
