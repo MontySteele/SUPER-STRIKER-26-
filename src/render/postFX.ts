@@ -7,9 +7,11 @@
 // is what produced the grey halo the spec calls out: the second curve pulls
 // the bloom's colour toward white before it ever reaches the screen.
 //
-// Order matters downstream too. OutputPass reads renderer.toneMapping at draw
-// time, so with NoToneMapping it degrades to a pure sRGB encode — put anything
-// after the grade that tone-maps again and the halo comes straight back.
+// Order matters downstream too. The grade is also where the frame is encoded
+// to sRGB, so everything after it (SMAA on HIGH, FXAA on MEDIUM) sees display
+// values and writes them straight to the screen. There is no OutputPass on
+// these levels: it would be one more full-screen read and write of a
+// 3840x2160 buffer to do a curve this pass can do for free.
 
 import * as THREE from 'three';
 import { Pass, FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
@@ -127,6 +129,11 @@ export const TonemapGradeShader = {
         / (cameraRange.y + cameraRange.x - z * (cameraRange.y - cameraRange.x));
     }
     ${DOF_COC_GLSL}
+
+    /** the exact sRGB transfer curve (display encode) */
+    vec3 toSRGB(vec3 x) {
+      return mix(x * 12.92, 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, x));
+    }
 
     /** interleaved-gradient noise: a pure function of the pixel, so a capture
      *  of the same shot is the same pixels (§7A.9) */
@@ -280,6 +287,15 @@ export const TonemapGradeShader = {
       float d = distance(vUv, vec2(0.5));
       c.rgb *= 1.0 - vignette * smoothstep(0.32, 0.92, d);
 
+      // ---- display encode ----
+      // Encoded HERE, not in an OutputPass after the anti-aliasing. SMAA's
+      // edge detector is a fixed 0.1 threshold on whatever values it is given:
+      // fed linear light, a dark edge (0.02 against 0.05 — a player's shadow
+      // on turf, a night crowd, a boot against its own shadow) never crosses
+      // it and is left jagged, while the same edge in sRGB (0.15 against 0.25)
+      // is caught. SMAA and FXAA are both designed for display-encoded input.
+      c.rgb = toSRGB(clamp(c.rgb, 0.0, 1.0));
+
       // ---- output dither ----
       // The whole chain up to here is half-float. The screen is 8 bits. A sky
       // gradient that crosses 200 pixels while changing by four code values
@@ -293,9 +309,9 @@ export const TonemapGradeShader = {
       // differenced) is the right shape: uniform noise leaves a residual bias
       // at the band edges that reads as a faint remaining stripe.
       //
-      // Applied here rather than in OutputPass because this is the last place
-      // the value is still linear-ish and, more importantly, the last pass
-      // that is already reading and writing this pixel.
+      // AFTER the encode, so the noise is one code value everywhere. Dithered
+      // in linear light, the encode's slope (12.9x near black) blew it up
+      // into a visible grain in exactly the night shadows that show it most.
       vec2 dp = gl_FragCoord.xy;
       float r0 = fract(sin(dot(dp, vec2(12.9898, 78.233))) * 43758.5453);
       float r1 = fract(sin(dot(dp + 17.31, vec2(12.9898, 78.233))) * 43758.5453);

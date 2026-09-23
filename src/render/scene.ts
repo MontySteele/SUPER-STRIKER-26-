@@ -7,9 +7,10 @@
 //         → DepthAO (half-res, 8 taps, writes no colour)
 //         → UnrealBloom(per-preset threshold/strength)
 //         → GradePass — ACES, AO, bokeh, aberration, lift/gain/contrast,
-//                       split-tone, sharpen, vignette, dither: ONE pass
-//         → SMAA → OutputPass(sRGB)                      … HIGH
-//         → OutputPass(sRGB) → FXAA                      … MEDIUM
+//                       split-tone, sharpen, vignette, sRGB encode, dither:
+//                       ONE pass
+//         → SMAA (to screen)                             … HIGH
+//         → FXAA (to screen)                             … MEDIUM
 //
 // RETRO chain is the v1.1 stack, untouched: renderer-level ACES, bloom on the
 // tone-mapped image, the old contrast/saturation grade, OutputPass. No depth
@@ -317,12 +318,11 @@ export class SceneManager {
         ? (this.basePixelRatio >= 1.75 ? 0.30 : 0.22) : 0;
       this.composer.addPass(this.gradePass);
 
-      if (this.profile.aa === 'smaa') {
-        // SMAA wants the tone-mapped image, so it sits after the grade
-        this.composer.addPass(new SMAAPass());
-      }
-      this.composer.addPass(new OutputPass());
-      // ...whereas FXAA wants sRGB, which only exists after OutputPass
+      // Both AA filters want display-encoded input, which the grade now
+      // writes (see TonemapGradeShader), and both write straight to the
+      // screen: no OutputPass, one less full-screen pass. With no AA at all
+      // the grade itself is the last pass and goes to the screen.
+      if (this.profile.aa === 'smaa') this.composer.addPass(new SMAAPass());
       if (this.profile.aa === 'fxaa') this.composer.addPass(new FXAAPass());
     }
     this.composer.setSize(w, h);
