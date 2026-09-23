@@ -28,6 +28,9 @@ export interface QualityProfile {
   /** cascades in the CSM rig (ignored when retro) */
   cascades: number;
   shadowMapSize: number;
+  /** the NEAREST cascade's map, which alone covers the players; the far ones
+   *  keep shadowMapSize. 0 = same as the rest. */
+  nearShadowMapSize: number;
   /** MSAA samples on the composer's HDR buffers (0 = none) */
   samples: number;
   /** bloom's internal working resolution as a fraction of the frame */
@@ -45,6 +48,9 @@ export interface QualityProfile {
    * of the grass instead of in it.
    */
   ao: number;
+  /** depth taps per AO pixel (render/ao.ts). The pass is priced per tap at
+   *  half resolution, so this is the cheap dial on its noise. */
+  aoTaps: number;
   /** shell layers in the turf (§7A.3b, render/grass.ts); 0 = no shell turf */
   grassShells: number;
   /** metres from the lens at which the shells have faded back into the plane */
@@ -64,12 +70,18 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
   // (see samples below).
   high: {
     level: 'high', retro: false, cascades: 3, shadowMapSize: 2048,
+    // ...except the near one, which is everything a player's own shadow ever
+    // lands in: at 4096 its ~1cm texels give a boot a toe and a heel, and the
+    // extra 48MB is one map, rendered from the ~3k-triangle casting proxies.
+    nearShadowMapSize: 4096,
     // MSAA is bought per DEVICE pixel and paid for twice on a Retina panel:
     // see effectiveSamples() — at pixel ratio 2 this is spent as 0 and SMAA
     // carries the edges alone. The 4 is what a 1x display gets.
     samples: 4, bloomScale: 1, aa: 'smaa', grade: true, env: true,
-    // §7A.6b: half-res, 8 taps, applied inside the grade. ~0.35ms at DPR 2.
-    ao: 0.85,
+    // §7A.6b: half-res, applied inside the grade. 16 taps rather than 8
+    // halves the per-pixel variance the grade's 4-tap blur has to hide — the
+    // difference between contact shading and a crawling grey film at the boot.
+    ao: 0.85, aoTaps: 16,
     // §7A.3b. Both numbers were set by measurement, not by taste — see the
     // table in render/grass.ts. Shells are priced per SCREEN PIXEL COVERED,
     // so the radius is the expensive dial and the layer count is the cheap
@@ -84,17 +96,17 @@ const PROFILES: Record<QualityLevel, QualityProfile> = {
   // bloom at half res, FXAA. MEDIUM is what a machine that cannot hold HIGH
   // at 60 should land on, not a different art direction.
   medium: {
-    level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024,
+    level: 'medium', retro: false, cascades: 2, shadowMapSize: 1024, nearShadowMapSize: 0,
     samples: 0, bloomScale: 0.5, aa: 'fxaa', grade: false, env: true,
-    ao: 0.55,
+    ao: 0.55, aoTaps: 8,
     grassShells: 5, grassRadius: 18,
     divots: 16,
   },
   retro: {
-    level: 'retro', retro: true, cascades: 0, shadowMapSize: 2048,
+    level: 'retro', retro: true, cascades: 0, shadowMapSize: 2048, nearShadowMapSize: 0,
     samples: 0, bloomScale: 1, aa: 'none', grade: true, env: false,
     // RETRO has no depth texture and no AO pass: it is the v1.1 chain
-    ao: 0,
+    ao: 0, aoTaps: 0,
     // RETRO is the v1.1 renderer on purpose; it had a flat pitch and keeps one
     grassShells: 0, grassRadius: 0,
     // ...and a pitch that never remembers a tackle, for the same reason

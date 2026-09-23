@@ -571,7 +571,15 @@ export class Atmosphere {
       lightMargin: 120,
     });
     lightSeesShadowPass(this.hemi, this.bounce);
+    // CSM gives every cascade one map size; the near one may want more. It
+    // must be set before the first shadow render allocates the map. CSM's
+    // texel snap still divides by shadowMapSize, i.e. it snaps the near
+    // cascade to every other texel — coarser, but still a whole number of
+    // texels, which is all the snap needs to stop the shadows swimming.
+    const nearSize = profile.nearShadowMapSize || profile.shadowMapSize;
+    this.csm.lights[0]?.shadow.mapSize.set(nearSize, nearSize);
     for (const light of this.csm.lights) {
+      const size = light.shadow.mapSize.x;
       light.color.set(p.keyColor);
       lightSeesShadowPass(light);
       // NOT light.shadow.camera.layers: three never consults the shadow
@@ -590,12 +598,20 @@ export class Atmosphere {
       // edge. 3.0 texels at 2048 is slightly CRISPER than 2.2 at 1024 and
       // still five Vogel taps wide, which is the trade we want: sharper
       // contact, same softness class.
-      const fine = profile.shadowMapSize >= 2048;
-      light.shadow.normalBias = fine ? 0.018 : 0.035;
+      //
+      // At 4096 (HIGH's near cascade) the same logic goes one step further:
+      // half the texel, so half the normal push (the boot sits down in its
+      // shadow instead of on a sliver of lit turf) and 4.5 texels of radius,
+      // i.e. three quarters of the 2048 penumbra in metres — a crisper
+      // contact shadow that is still wider than one texel's staircase.
+      const texels = size >= 4096 ? 2 : size >= 2048 ? 1 : 0;
+      light.shadow.normalBias = [0.035, 0.018, 0.009][texels];
+      if (texels === 2) light.shadow.bias = -0.00015;
       // ...plus the weather's own softening. An overcast shadow is a wide,
       // shallow smudge and a rain shadow barely exists; both are the SAME
-      // five Vogel taps, spread further apart.
-      light.shadow.radius = (fine ? 3.0 : 2.2) + this.weather.shadowSoft;
+      // five Vogel taps, spread further apart (twice as many texels on a map
+      // with twice as many, so the weather softens by the same metres).
+      light.shadow.radius = [2.2, 3.0, 4.5][texels] + this.weather.shadowSoft * (texels === 2 ? 2 : 1);
       // three counts this the other way round: `intensity` is how much light
       // the shadow REMOVES. See Preset.shadowLift.
       light.shadow.intensity = 1 - p.shadowLift;

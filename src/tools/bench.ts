@@ -17,8 +17,8 @@
 //
 //  • FPS AND COST ARE DIFFERENT NUMBERS. rAF is vsync-paced, so "fps" tops out
 //    at the display's refresh rate and only ever tells you when we MISS it.
-//    The frame-time column is measured around the draw with a gl.finish(), so
-//    it is the real CPU+GPU cost of the frame and the headroom column
+//    The frame-time column is measured around the draw with a 1px readback
+//    (gpuSync — NOT gl.finish, see below), so it is the real CPU+GPU cost of the frame and the headroom column
 //    (1000/cost) is what says how much room is left.
 //
 //  • NO DETERMINISTIC ENV. The capture harness replaces performance.now with a
@@ -26,6 +26,7 @@
 //    sim is still seeded, so the situations are the same football every run.
 
 import type * as THREE from 'three';
+import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
 import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import { preloadCharacters } from '../render/characterAssets';
@@ -61,12 +62,13 @@ const PREROLL_MS = 2500;
 //     answers "does it hold 60".
 //
 //  2. The BURST phase then redraws the settled frame back to back, off rAF, in
-//     chunks ending in a gl.finish(), and divides. This is the number that
-//     answers "how much room is left", and it has to be measured this way:
-//     a per-frame finish inside a paced loop reports ~5ms for a frame that
-//     demonstrably takes 33ms to present, because ANGLE-on-Metal's finish
-//     returns when OUR commands are done and not when the frame is on screen.
-//     A saturated queue has nowhere to hide that difference.
+//     chunks ending in a 1px readPixels, and divides. This is the number that
+//     answers "how much room is left". It USED to end each chunk in
+//     gl.finish(), on the theory that a saturated queue has nowhere to hide
+//     — but under Chromium/ANGLE-Metal finish() does not wait for the GPU at
+//     all, so the column was CPU submission time: ~2ms for a HIGH frame that
+//     really takes ~25ms at 3840x2160. A readback cannot return before the
+//     pixels exist. `&livefinish=1` does the same per paced frame.
 //
 // Both are tunable from the URL (`&burst=12x16`) for one reason: this is a
 // LAPTOP, and a laptop runs other things. When the machine is loaded, every
@@ -87,6 +89,12 @@ let ABLATE = false;
  *  camera, crowd, shadow prep, each composer pass's submission, ...) by
  *  wrapping the live instances' methods. Nothing in src/render is touched. */
 let CPUPROF = false;
+/** `&livefinish=1`: a GPU sync (gpuSync) after every paced frame, timed — the
+ *  GPU tail of a REAL frame, where burst only ever sees the steady state of
+ *  one frame redrawn. It serialises CPU and GPU, so presented fps under this
+ *  flag is not the game's; the gpuTail column is the point. */
+let LIVEFINISH = false;
+const px1 = new Uint8Array(4);
 
 /** Wrap obj[name] so every call adds its wall time to acc[label]. Returns the undo. */
 function timeMethod(obj: object | null | undefined, name: string, label: string,
@@ -180,7 +188,9 @@ export interface BenchResult {
   spikes: { i: number; ms: number; calls: number; tris: number; sim: number }[];
   /** main-thread cost per presented frame: sim steps, and renderer.update
    *  (animation, skinning, culling and the WebGL submission) */
-  cpuMs: { sim: { p50: number; p95: number; max: number }; update: { p50: number; p95: number; max: number } };
+  cpuMs: { sim: { p50: number; p95: number; max: number }; update: { p50: number; p95: number; max: number };
+    /** `&livefinish=1` only: wait for the GPU after each real frame */
+    gpuTail?: { p50: number; p95: number; max: number } };
   /** `&cpuprof=1` only: mean main-thread ms per paced frame, by section */
   cpuSections?: Record<string, number>;
   /** `&cpuprof=1` only: the sections of every frame whose update ran over 20ms */
@@ -252,14 +262,22 @@ function pinnedSize(mode: string | null): { w: number; h: number; ratio: number 
 }
 
 /** Best-of-chunks burst cost of the settled frame, as the burst phase measures it. */
+/** Block until the GPU has finished everything submitted so far. */
+function gpuSync(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px1);
+}
+
 function burstMin(renderer: GameRenderer, gl: WebGLRenderingContext | WebGL2RenderingContext): { ms: number; calls: number } {
   const info = renderer.sceneMgr.renderer.info;
   let best = Infinity;
-  gl.finish();
+  // NOT gl.finish(): under Chromium/ANGLE-Metal it returns without waiting
+  // for the GPU, which made this column CPU submission time (~2ms on HIGH)
+  // while the real frame was ~25ms. A 1px readback has to wait.
+  gpuSync(gl);
   for (let c = 0; c < BURST_CHUNKS; c++) {
     const t0 = performance.now();
     for (let i = 0; i < BURST_PER_CHUNK; i++) renderer.renderStillLive();
-    gl.finish();
+    gpuSync(gl);
     best = Math.min(best, (performance.now() - t0) / BURST_PER_CHUNK);
   }
   // renderStillLive resets info per frame, so this is ONE frame's calls
@@ -294,6 +312,50 @@ async function ablate(
       () => { pass.enabled = false; }, () => { pass.enabled = true; });
   }
   await probe('shadows', () => { sm.benchSkipShadows = true; }, () => { sm.benchSkipShadows = false; });
+  type Loose = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  const grass = (sm.scene.userData.ss26Grass as Loose | undefined)?.mesh as THREE.Mesh | undefined;
+  if (grass) {
+    await probe('grass shells', () => { grass.visible = false; }, () => { grass.visible = true; });
+  }
+
+  // ---- cheaper VARIANTS rather than absences: what a setting change buys
+  const smx = sm as unknown as Loose;
+  const comp = sm.composer as unknown as Loose;
+  const resize = (): void => sm.composer.setSize(comp._width, comp._height);
+  const bloom = smx.bloom as Loose | undefined;
+  if (bloom && bloom.scale === 1) {
+    await probe('variant: bloom at half res',
+      () => { bloom.scale = 0.5; resize(); }, () => { bloom.scale = 1; resize(); });
+  }
+  const smaaAt = sm.composer.passes.findIndex((p) => p.constructor.name === 'SMAAPass');
+  if (smaaAt >= 0) {
+    const smaa = sm.composer.passes[smaaAt];
+    const fxaa = new FXAAPass();
+    fxaa.renderToScreen = smaa.renderToScreen;
+    await probe('variant: FXAA instead of SMAA',
+      () => { sm.composer.passes[smaaAt] = fxaa; resize(); },
+      () => { sm.composer.passes[smaaAt] = smaa; resize(); });
+    fxaa.dispose();
+  }
+  const aoMat = (smx.aoPass as Loose | null)?.material as THREE.ShaderMaterial | undefined;
+  const taps = aoMat?.defines?.N_TAPS as number | undefined;
+  if (aoMat && taps && taps > 8) {
+    await probe(`variant: AO ${taps} -> 8 taps`,
+      () => { aoMat.defines.N_TAPS = 8; aoMat.needsUpdate = true; burstMin(renderer, gl); },
+      () => { aoMat.defines.N_TAPS = taps; aoMat.needsUpdate = true; burstMin(renderer, gl); });
+  }
+  const near = ((smx.atmos as Loose).csm as Loose | null)?.lights?.[0] as THREE.DirectionalLight | undefined;
+  const nearSize = near?.shadow.mapSize.x ?? 0;
+  if (near && nearSize > 2048) {
+    const setNear = (n: number): void => {
+      near.shadow.mapSize.set(n, n);
+      near.shadow.map?.dispose();
+      near.shadow.map = null;
+      burstMin(renderer, gl);
+    };
+    await probe(`variant: near cascade ${nearSize} -> 2048`, () => setNear(2048), () => setNear(nearSize));
+  }
   await probe('geometry (all)', () => { sm.scene.visible = false; }, () => { sm.scene.visible = true; });
   // top-level scene children, grouped by name so a thousand loose props are
   // one probe, and only the biggest groups
@@ -303,12 +365,16 @@ async function ablate(
     let meshes = 0;
     child.traverse((o) => { if ((o as THREE.Mesh).isMesh) meshes++; });
     if (!meshes) continue;
-    const key = child.name || `${child.type}:${child.children[0]?.name ?? ''}`;
+    const m = child as THREE.Mesh;
+    const matName = m.isMesh && !Array.isArray(m.material) ? m.material.name : '';
+    const matType = m.isMesh && !Array.isArray(m.material) ? m.material.type : '';
+    const key = child.name || m.geometry?.name || matName
+      || `${child.type}:${child.children[0]?.name ?? matType}`;
     const g = groups.get(key) ?? { objs: [], meshes: 0 };
     g.objs.push(child); g.meshes += meshes;
     groups.set(key, g);
   }
-  const ranked = [...groups.entries()].sort((a, b) => b[1].meshes - a[1].meshes).slice(0, 16);
+  const ranked = [...groups.entries()].sort((a, b) => b[1].meshes - a[1].meshes).slice(0, 24);
   for (const [key, g] of ranked) {
     await probe(`hide ${key} (${g.objs.length} obj/${g.meshes} mesh)`,
       () => { for (const o of g.objs) o.visible = false; },
@@ -364,6 +430,7 @@ async function runSituation(
   info.autoReset = false;
 
   const intervals: number[] = [];
+  const gpuTail: number[] = [];
   const costs: number[] = [];
   const tris: number[] = [];
   const calls: number[] = [];
@@ -462,6 +529,10 @@ async function runSituation(
       const progsBefore = CPUPROF ? new Set(info.programs ?? []) : null;
       renderer.update(dt, alpha);
       const tEnd = performance.now();
+      if (LIVEFINISH) {
+        gpuSync(renderer.sceneMgr.renderer.getContext());
+        if (collecting) gpuTail.push(performance.now() - tEnd);
+      }
       profFrames++;
       if (secBefore && tEnd - tUpd > 20 && cpuSpikes.length < 12) {
         const sections: Record<string, number> = {};
@@ -512,7 +583,7 @@ async function runSituation(
     info.reset();
     const t0 = performance.now();
     for (let i = 0; i < BURST_PER_CHUNK; i++) renderer.renderStillLive();
-    gl.finish();
+    gpuSync(gl);
     costs.push((performance.now() - t0) / BURST_PER_CHUNK);
     tris.push(info.render.triangles / BURST_PER_CHUNK);
     calls.push(info.render.calls / BURST_PER_CHUNK);
@@ -536,7 +607,8 @@ async function runSituation(
   };
   const result: BenchResult = {
     spikes,
-    cpuMs: { sim: cpuStat(simMs), update: cpuStat(updMs) },
+    cpuMs: { sim: cpuStat(simMs), update: cpuStat(updMs),
+      ...(gpuTail.length ? { gpuTail: cpuStat(gpuTail) } : {}) },
     cpuSections,
     cpuSpikes: CPUPROF ? cpuSpikes : undefined,
     ablation,
@@ -646,6 +718,7 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
     const burst = params.get('burst')?.match(/^(\d+)x(\d+)$/);
     ABLATE = params.get('ablate') === '1';
     CPUPROF = params.get('cpuprof') === '1';
+    LIVEFINISH = params.get('livefinish') === '1';
     if (burst) { BURST_CHUNKS = Number(burst[1]); BURST_PER_CHUNK = Number(burst[2]); }
     const list = (wanted
       ? wanted.map((n) => {

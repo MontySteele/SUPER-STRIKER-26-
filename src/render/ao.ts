@@ -13,7 +13,8 @@
 //     Screen-space normals from ddx/ddy are wrong on a silhouette and right
 //     everywhere else, and AO on a silhouette is hidden by the silhouette.
 //
-// Cost is therefore ONE fullscreen draw at HALF resolution with 8 depth taps.
+// Cost is therefore ONE fullscreen draw at HALF resolution with a handful of
+// depth taps (QualityProfile.aoTaps: 16 on HIGH, 8 on MEDIUM).
 // The blur and the application both ride inside the grade pass, which is
 // already reading and writing every pixel — see TonemapGradeShader.
 //
@@ -75,7 +76,7 @@ const AO_SHADER = {
       return v.xyz / v.w;
     }
 
-    // Eight directions on a spiral, rotated per pixel. The rotation is
+    // N_TAPS directions on a spiral, rotated per pixel. The rotation is
     // interleaved-gradient noise, which is a pure function of the pixel — the
     // capture contract says "same commit, same pixels", so nothing here may
     // depend on a frame counter or a clock.
@@ -100,7 +101,6 @@ const AO_SHADER = {
 
       float a0 = ign(gl_FragCoord.xy) * 6.2831853;
       float occ = 0.0;
-      const int N_TAPS = 8;
       for (int i = 0; i < N_TAPS; i++) {
         float t = (float(i) + 0.5) / float(N_TAPS);
         float ang = a0 + t * 6.2831853 * 2.4;     // ~2.4 turns of spiral
@@ -139,7 +139,7 @@ export class DepthAOPass extends Pass {
   private material: THREE.ShaderMaterial;
   private quad: FullScreenQuad;
 
-  constructor(private camera: THREE.PerspectiveCamera) {
+  constructor(private camera: THREE.PerspectiveCamera, taps = 8) {
     super();
     this.needsSwap = false;
     this.target = new THREE.WebGLRenderTarget(1, 1, {
@@ -155,6 +155,7 @@ export class DepthAOPass extends Pass {
       uniforms: THREE.UniformsUtils.clone(AO_SHADER.uniforms),
       vertexShader: AO_SHADER.vertexShader,
       fragmentShader: AO_SHADER.fragmentShader,
+      defines: { N_TAPS: Math.max(1, Math.round(taps)) },
       depthTest: false,
       depthWrite: false,
     });

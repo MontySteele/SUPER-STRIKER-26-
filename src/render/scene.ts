@@ -73,8 +73,13 @@ export type TimeOfDay = 'day' | 'sunset' | 'night';
 //  • frames longer than STALL_MS are neither hot nor cool — a shader compile,
 //    a texture upload or a window drag is not fill-rate pressure and must not
 //    cost pixels;
-//  • and the first WARMUP_MS of a renderer's life is ignored outright, which
-//    is where every one of those stalls lives.
+//  • the first WARMUP_MS of a renderer's life is ignored outright, which
+//    is where every one of those stalls lives;
+//  • and every drop is put on trial: once the smaller buffer has settled we
+//    watch DROP_TRIAL seconds of it, and if the miss rate did not fall by at
+//    least a third the misses were never fill-rate (the sim, GC, another app
+//    eating the SoC) — so the pixels come straight back and further drops are
+//    refused for FUTILE_HOLD seconds, doubling on each repeat.
 const RATIO_STEPS: Record<QualityLevel, number[]> = {
   // HIGH floors at 0.85: below that a Retina panel reads as soft, and a
   // machine that cannot hold HIGH at 0.85 wants MEDIUM, not a blurrier HIGH.
@@ -101,6 +106,13 @@ const RAISE_AFTER_MAX = 20;
 const PROMOTION_REGRET = 4.0;
 /** frames right after a resolution change are re-allocation, not gameplay */
 const SETTLE = 0.35;
+/** seconds of post-drop frames a demotion is judged on */
+const DROP_TRIAL = 2.0;
+/** a drop must cut the miss rate to at most this fraction of what it was */
+const DROP_MUST_REACH = 0.67;
+/** after a futile drop, refuse drops for this long (doubles per repeat) */
+const FUTILE_HOLD = 20;
+const FUTILE_HOLD_MAX = 160;
 
 /** What the resolution valve is doing right now — for the `?gfx=1` overlay,
  *  the bench report and anyone debugging "why is it soft". */
@@ -163,6 +175,11 @@ export class SceneManager {
   private settleLeft = 0;
   private raiseAfter = RAISE_AFTER;
   private sinceRaise = Infinity;
+  /** the drop currently on trial: miss rate before it, and what we've seen since */
+  private trial: { before: number; left: number; frames: number; misses: number } | null = null;
+  /** drops are refused while this is > 0 (a recent drop bought nothing) */
+  private futileLeft = 0;
+  private futileHold = FUTILE_HOLD;
   /** rolling one-second window of presented intervals, for the overlay */
   private recent: number[] = [];
   private recentMs = 0;
@@ -255,7 +272,7 @@ export class SceneManager {
       // AO first, straight off the depth the RenderPass just wrote. It adds no
       // colour pass of its own — the grade blurs and applies it.
       if (this.profile.ao > 0) {
-        this.aoPass = new DepthAOPass(this.camera);
+        this.aoPass = new DepthAOPass(this.camera, this.profile.aoTaps);
         this.aoPass.setIntensity(1.0);
         this.composer.addPass(this.aoPass);
       }
@@ -423,6 +440,31 @@ export class SceneManager {
     );
 
     const missed = ms > this.vsyncMs * MISS_FACTOR;
+    if (this.futileLeft > 0) this.futileLeft -= dtReal;
+
+    // a drop on trial: did giving up pixels actually stop the misses?
+    if (this.trial) {
+      const t = this.trial;
+      t.frames++;
+      if (missed) t.misses++;
+      t.left -= dtReal;
+      if (t.left > 0) {
+        this.lastNote = `trial ${t.misses}/${t.frames} missed (was ${(t.before * 100) | 0}%)`;
+        return;
+      }
+      this.trial = null;
+      const after = t.misses / Math.max(1, t.frames);
+      if (after > t.before * DROP_MUST_REACH) {
+        // not fill-rate: take the pixels back and stop trading them away
+        this.futileLeft = this.futileHold;
+        this.futileHold = Math.min(this.futileHold * 2, FUTILE_HOLD_MAX);
+        this.setRatioStep(this.ratioIdx - 1,
+          `undone: drop left misses at ${(after * 100) | 0}% (was ${(t.before * 100) | 0}%)`);
+        return;
+      }
+      this.futileHold = FUTILE_HOLD;
+    }
+
     if (missed) {
       this.coolFor = 0;
       this.hotFor += dtReal;
@@ -433,18 +475,33 @@ export class SceneManager {
       this.hotFor = Math.max(0, this.hotFor - dtReal * 0.5);
     }
 
-    if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1) {
+    if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1 && this.futileLeft > 0) {
+      this.lastNote = `hot, but drops bought nothing (hold ${this.futileLeft.toFixed(0)}s)`;
+    } else if (this.hotFor >= DROP_AFTER && this.ratioIdx < this.steps.length - 1) {
       // a promotion that got us here was a mistake; be more patient next time
       if (this.sinceRaise < PROMOTION_REGRET) {
         this.raiseAfter = Math.min(this.raiseAfter * 2, RAISE_AFTER_MAX);
       }
+      const before = this.recentMissRate();
       this.setRatioStep(this.ratioIdx + 1, 'dropped: missed vsyncs for 1s');
+      this.trial = { before, left: DROP_TRIAL, frames: 0, misses: 0 };
     } else if (this.coolFor >= this.raiseAfter && this.ratioIdx > 0) {
       this.setRatioStep(this.ratioIdx - 1, 'restored: 1s+ clean');
       this.sinceRaise = 0;
     } else {
       this.lastNote = missed ? `hot ${this.hotFor.toFixed(2)}s` : `ok ${this.coolFor.toFixed(1)}s`;
     }
+  }
+
+  /** share of the last second's non-stall frames that missed a vsync */
+  private recentMissRate(): number {
+    let n = 0, miss = 0;
+    for (const ms of this.recent) {
+      if (ms > STALL_MS) continue;
+      n++;
+      if (ms > this.vsyncMs * MISS_FACTOR) miss++;
+    }
+    return n ? miss / n : 0;
   }
 
   private setRatioStep(idx: number, why: string): void {

@@ -2086,6 +2086,56 @@ function buildShadowGeometry(scene: THREE.Group): THREE.BufferGeometry | null {
   return merged;
 }
 
+/** `?kitmerge=0`: draw shirt and shorts separately, as before (A/B). */
+const KIT_UNMERGED = typeof location !== 'undefined' && /[?&]kitmerge=0/.test(location.search);
+
+/**
+ * Shirt + shorts as one indexed geometry with a per-vertex `ss26Garment`
+ * (0 = shirt, 1 = shorts) — see CharacterRig.mergeKit(). Only the attributes
+ * both parts carry survive; null if that leaves them unmergeable.
+ */
+function mergeKitGeometry(shirt: THREE.BufferGeometry, shorts: THREE.BufferGeometry):
+THREE.BufferGeometry | null {
+  if (!shirt.getIndex() || !shorts.getIndex()) return null;
+  if (Object.keys(shirt.morphAttributes).length || Object.keys(shorts.morphAttributes).length) return null;
+  const parts = [shirt.clone(), shorts.clone()];
+  const common = Object.keys(parts[0].attributes).filter((n) => parts[1].getAttribute(n));
+  parts.forEach((g, i) => {
+    for (const n of Object.keys(g.attributes)) if (!common.includes(n)) g.deleteAttribute(n);
+    const count = g.getAttribute('position').count;
+    g.setAttribute('ss26Garment', new THREE.BufferAttribute(new Float32Array(count).fill(i), 1));
+    g.clearGroups();
+  });
+  const merged = mergeGeometries(parts, false);
+  for (const g of parts) g.dispose();
+  if (merged) merged.name = `${shirt.name || 'shirt'}+${shorts.name || 'shorts'}`;
+  return merged;
+}
+
+/** The merged kit's one shader difference from a plain shirt: where
+ *  `ss26Garment` says shorts, the diffuse comes from the team's shorts. */
+function queueKitShorts(mat: THREE.MeshStandardMaterial, shortsTex: THREE.Texture): void {
+  queueShaderPatch(mat, (shader) => {
+    shader.uniforms.ss26ShortsMap = { value: shortsTex };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>
+        attribute float ss26Garment;
+        varying float vSS26Garment;`)
+      .replace('#include <uv_vertex>', `#include <uv_vertex>
+        vSS26Garment = ss26Garment;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform sampler2D ss26ShortsMap;
+        varying float vSS26Garment;`)
+      // both taps every pixel: the choice is constant across a triangle but a
+      // branch around texture2D would take the mip derivatives with it
+      .replace('#include <map_fragment>', THREE.ShaderChunk.map_fragment.replace(
+        'vec4 sampledDiffuseColor = texture2D( map, vMapUv );',
+        `vec4 sampledDiffuseColor = mix( texture2D( map, vMapUv ),
+          texture2D( ss26ShortsMap, vMapUv ), step( 0.5, vSS26Garment ) );`));
+  });
+}
+
 /** Which garment a mesh is, tolerant of the asset pipeline renaming things
  *  underneath us: the mesh name and the material name both get a look. */
 const nameOf = (m: THREE.Mesh): string => {
@@ -3232,6 +3282,11 @@ export class CharacterRig {
   private kitShirtBase = new Map<string, HTMLCanvasElement>();
   private shirtMats = new Map<string, THREE.MeshStandardMaterial>();
   private shortsMats = new Map<string, THREE.MeshStandardMaterial>();
+  /** the team's painted shorts, shared by the shorts material and the
+   *  merged kit (see mergeKit) */
+  private shortsTexs = new Map<string, THREE.CanvasTexture | null>();
+  /** shirt+shorts geometry per archetype detail level, keyed on the pair */
+  private kitGeos = new Map<string, THREE.BufferGeometry | null>();
   private bootMats = new Map<string, THREE.MeshStandardMaterial>();
   private owned: (THREE.Material | THREE.Texture | THREE.BufferGeometry)[] = [];
   private nextArchetype = 0;
@@ -3345,6 +3400,7 @@ export class CharacterRig {
           meshes.push(m);
         });
       }
+      if (!KIT_UNMERGED) this.mergeKit(meshes, kit, arch);
       const fringes: THREE.SkinnedMesh[] = [];
       for (const mesh of meshes) {
         mesh.frustumCulled = false;
@@ -3417,12 +3473,58 @@ export class CharacterRig {
     };
   }
 
+  /**
+   * Shirt and shorts as ONE skinned draw.
+   *
+   * They were already one shading model — same weave normal, same cloth
+   * roughness, both double-sided, both the 'ss26-kit' program — and differed
+   * only in which picture they wore. So the pair is merged into one geometry
+   * carrying a per-vertex `ss26Garment` (0 shirt, 1 shorts), and the shirt's
+   * material samples the team's shorts texture where that is set: one draw a
+   * player at every detail level, and no atlas, so no texture is repainted,
+   * resized or duplicated. Boots stay apart on purpose — the glossy moulded
+   * upper is a different material, and folding it into the cloth would cost
+   * the one hard highlight a player's feet have.
+   *
+   * Anything unexpected (no painted shorts, the two parts on different
+   * skeletons or binds, attribute sets that will not merge) leaves the pair
+   * as it was: two draws, exactly as before.
+   */
+  private mergeKit(meshes: THREE.SkinnedMesh[], kit: KitSpec, arch: Archetype): void {
+    const shirt = meshes.find((m) => m.isSkinnedMesh && isShirt(m));
+    const shorts = meshes.find((m) => m.isSkinnedMesh && isShorts(m));
+    if (!shirt || !shorts || !shirt.parent || shirt.parent !== shorts.parent) return;
+    if (shirt.skeleton !== shorts.skeleton || !shirt.bindMatrix.equals(shorts.bindMatrix)) return;
+    if (!this.shortsTexture(kit, arch)) return;
+
+    const key = `${shirt.geometry.uuid}|${shorts.geometry.uuid}`;
+    let geo = this.kitGeos.get(key);
+    if (geo === undefined) {
+      geo = mergeKitGeometry(shirt.geometry, shorts.geometry);
+      this.kitGeos.set(key, geo);
+      if (geo) this.owned.push(geo);
+    }
+    if (!geo) return;
+
+    const m = new THREE.SkinnedMesh(geo, shirt.material as THREE.Material);
+    m.name = `${shirt.name}+${shorts.name}`;
+    m.userData.ss26Kit = true;
+    m.bindMode = shirt.bindMode;
+    m.bind(shirt.skeleton, shirt.bindMatrix);
+    shirt.parent.add(m);
+    shirt.removeFromParent();
+    shorts.removeFromParent();
+    meshes.splice(meshes.indexOf(shirt), 1, m);
+    meshes.splice(meshes.indexOf(shorts), 1);
+  }
+
   /** Which material a mesh wears. Kit parts are shared per team (the shirt per
    *  player, because of the number); everything else is the archetype's own
    *  material, copied once per match — except the body, which also carries the
    *  team's socks and is therefore copied per team. */
   private dress(mesh: THREE.SkinnedMesh, kit: KitSpec, data: PlayerData,
     arch: Archetype, look: Appearance): THREE.Material {
+    if (mesh.userData.ss26Kit) return this.shirtMaterial(kit, data, arch, this.shortsTexture(kit, arch));
     if (isShirt(mesh)) return this.shirtMaterial(kit, data, arch);
     if (isShorts(mesh)) return this.shortsMaterial(kit, arch);
     if (isShoes(mesh)) return this.bootMaterial(kit, arch);
@@ -3738,9 +3840,9 @@ export class CharacterRig {
     return c;
   }
 
-  private shirtMaterial(kit: KitSpec, data: PlayerData, arch: Archetype):
-  THREE.MeshStandardMaterial {
-    const key = `${kit.shirt}|${kit.shorts}|${data.num}|${data.name}`;
+  private shirtMaterial(kit: KitSpec, data: PlayerData, arch: Archetype,
+    shortsTex: THREE.Texture | null = null): THREE.MeshStandardMaterial {
+    const key = `${kit.shirt}|${kit.shorts}|${data.num}|${data.name}${shortsTex ? '|kit' : ''}`;
     const hit = this.shirtMats.get(key);
     if (hit) return hit;
 
@@ -3786,11 +3888,64 @@ export class CharacterRig {
       normalScale: new THREE.Vector2(0.55, 0.55),
       alphaTest: 0.5, side: THREE.DoubleSide, shadowSide: THREE.DoubleSide,
     });
-    mat.customProgramCacheKey = (): string => 'ss26-kit';
+    mat.customProgramCacheKey = (): string => (shortsTex ? 'ss26-kit-merged' : 'ss26-kit');
     queueBroadcastSkin(mat, { wrap: 0.24, wrapTint: 0xf2ece6, rim: 0.075, rimPower: 3.6 });
+    if (shortsTex) queueKitShorts(mat, shortsTex);
     this.shirtMats.set(key, mat);
     this.owned.push(mat, tex);
     return mat;
+  }
+
+  /** The team's shorts, painted through the archetype's garment map: the
+   *  kit colour, a contrast hem and the weave. Null when the archetype has
+   *  no usable shorts map (the material then tints the neutral one). */
+  private shortsTexture(kit: KitSpec, arch: Archetype): THREE.CanvasTexture | null {
+    const key = `${kit.shorts}|${kit.shirt}`;
+    const hit = this.shortsTexs.get(key);
+    if (hit !== undefined) return hit;
+    const map = this.shortsMap(arch);
+    if (!map) {
+      this.shortsTexs.set(key, null);
+      return null;
+    }
+    const t0 = this.kitClock();
+    const N = map.n;
+    const [c, ctx] = canvas2d(N, N);
+    const base = new THREE.Color(kit.shorts);
+    const trim = new THREE.Color(kit.shirt);
+    const img = ctx.createImageData(N, N);
+    const out = img.data;
+    const src = map.data;
+    for (let i = 0; i < N * N; i++) {
+      const o = i * 4;
+      if (src[o + 3] === 0) continue;
+      const up = src[o + 1] / 255;
+      // The hem band, and only the hem band. A side flash was tried and
+      // dropped: `across` is the x extent of BOTH legs, and the outer few
+      // per cent of that is a wide swath of a cylindrical surface, so a
+      // "thin stripe" came out as a wedge across the whole hip.
+      const col = up < 0.055 ? trim : base;
+      const k = 1.04 - 0.16 * (1 - up);
+      out[o] = Math.min(255, col.r * 255 * k);
+      out[o + 1] = Math.min(255, col.g * 255 * k);
+      out[o + 2] = Math.min(255, col.b * 255 * k);
+      out[o + 3] = 255;
+    }
+    dilate(img, 4);
+    ctx.putImageData(img, 0, 0);
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = ctx.createPattern(this.lab.kitWeaveTile(), 'repeat')!;
+    ctx.fillRect(0, 0, N, N);
+    ctx.restore();
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.flipY = false;
+    t.anisotropy = 8;
+    this.kitMs += this.kitClock() - t0;
+    this.owned.push(t);
+    this.shortsTexs.set(key, t);
+    return t;
   }
 
   /**
@@ -3802,50 +3957,11 @@ export class CharacterRig {
     const key = `${kit.shorts}|${kit.shirt}`;
     const hit = this.shortsMats.get(key);
     if (hit) return hit;
-    const map = this.shortsMap(arch);
-    let tex: THREE.Texture | null = arch.shortsMap;
-    if (map) {
-      const t0 = this.kitClock();
-      const N = map.n;
-      const [c, ctx] = canvas2d(N, N);
-      const base = new THREE.Color(kit.shorts);
-      const trim = new THREE.Color(kit.shirt);
-      const img = ctx.createImageData(N, N);
-      const out = img.data;
-      const src = map.data;
-      for (let i = 0; i < N * N; i++) {
-        const o = i * 4;
-        if (src[o + 3] === 0) continue;
-        const up = src[o + 1] / 255;
-        // The hem band, and only the hem band. A side flash was tried and
-        // dropped: `across` is the x extent of BOTH legs, and the outer few
-        // per cent of that is a wide swath of a cylindrical surface, so a
-        // "thin stripe" came out as a wedge across the whole hip.
-        const col = up < 0.055 ? trim : base;
-        const k = 1.04 - 0.16 * (1 - up);
-        out[o] = Math.min(255, col.r * 255 * k);
-        out[o + 1] = Math.min(255, col.g * 255 * k);
-        out[o + 2] = Math.min(255, col.b * 255 * k);
-        out[o + 3] = 255;
-      }
-      dilate(img, 4);
-      ctx.putImageData(img, 0, 0);
-      ctx.save();
-      ctx.globalAlpha = 0.3;
-      ctx.fillStyle = ctx.createPattern(this.lab.kitWeaveTile(), 'repeat')!;
-      ctx.fillRect(0, 0, N, N);
-      ctx.restore();
-      const t = new THREE.CanvasTexture(c);
-      t.colorSpace = THREE.SRGBColorSpace;
-      t.flipY = false;
-      t.anisotropy = 8;
-      tex = t;
-      this.owned.push(t);
-      this.kitMs += this.kitClock() - t0;
-    }
+    const painted = this.shortsTexture(kit, arch);
+    const tex: THREE.Texture | null = painted ?? arch.shortsMap;
     const mat = new THREE.MeshStandardMaterial({
       map: tex,
-      color: map ? 0xffffff : new THREE.Color(kit.shorts),
+      color: painted ? 0xffffff : new THREE.Color(kit.shorts),
       normalMap: this.lab.kitWeaveNormalMap(),
       normalScale: new THREE.Vector2(0.5, 0.5),
       roughness: 0.86, metalness: 0, envMapIntensity: 0.45,
@@ -3924,6 +4040,8 @@ export class CharacterRig {
     this.matClones.clear();
     this.shirtMats.clear();
     this.shortsMats.clear();
+    this.shortsTexs.clear();
+    this.kitGeos.clear();
     this.bootMats.clear();
     this.kitShirtBase.clear();
   }
