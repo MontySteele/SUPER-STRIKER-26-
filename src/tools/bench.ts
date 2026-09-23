@@ -25,6 +25,7 @@
 //    virtual clock; a benchmark that did that would be timing a fiction. The
 //    sim is still seeded, so the situations are the same football every run.
 
+import type * as THREE from 'three';
 import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import { preloadCharacters } from '../render/characterAssets';
@@ -78,6 +79,28 @@ const DEFAULT_BURST_CHUNKS = 6;
 const DEFAULT_BURST_PER_CHUNK = 8;
 let BURST_CHUNKS = DEFAULT_BURST_CHUNKS;
 let BURST_PER_CHUNK = DEFAULT_BURST_PER_CHUNK;
+/** `&ablate=1`: after the burst, re-run it with one thing switched off at a
+ *  time (each composer pass, the shadow pass, each top-level scene group) and
+ *  report what each one saved. The pipeline's cost breakdown, on the real GPU. */
+let ABLATE = false;
+/** `&cpuprof=1`: time the main-thread sections of every paced frame (players,
+ *  camera, crowd, shadow prep, each composer pass's submission, ...) by
+ *  wrapping the live instances' methods. Nothing in src/render is touched. */
+let CPUPROF = false;
+
+/** Wrap obj[name] so every call adds its wall time to acc[label]. Returns the undo. */
+function timeMethod(obj: object | null | undefined, name: string, label: string,
+  acc: Map<string, number>): () => void {
+  const o = obj as Record<string, unknown> | null | undefined;
+  const orig = o?.[name];
+  if (!o || typeof orig !== 'function') return () => {};
+  o[name] = function (this: unknown, ...args: unknown[]) {
+    const t0 = performance.now();
+    try { return (orig as (...a: unknown[]) => unknown).apply(this, args); }
+    finally { acc.set(label, (acc.get(label) ?? 0) + performance.now() - t0); }
+  };
+  return () => { o[name] = orig; };
+}
 
 export interface BenchSituation {
   name: string;
@@ -155,6 +178,15 @@ export interface BenchResult {
   drawCalls: { avg: number; max: number };
   /** presented intervals over 25 ms: roll index, ms, draw calls, sim steps in */
   spikes: { i: number; ms: number; calls: number; tris: number; sim: number }[];
+  /** main-thread cost per presented frame: sim steps, and renderer.update
+   *  (animation, skinning, culling and the WebGL submission) */
+  cpuMs: { sim: { p50: number; p95: number; max: number }; update: { p50: number; p95: number; max: number } };
+  /** `&cpuprof=1` only: mean main-thread ms per paced frame, by section */
+  cpuSections?: Record<string, number>;
+  /** `&cpuprof=1` only: the sections of every frame whose update ran over 20ms */
+  cpuSpikes?: { frame: number; updateMs: number; sections: Record<string, number> }[];
+  /** `&ablate=1` only: burst-min ms saved by switching each thing off */
+  ablation?: { what: string; savedMs: number; calls: number }[];
 }
 
 export interface BenchReport {
@@ -219,6 +251,72 @@ function pinnedSize(mode: string | null): { w: number; h: number; ratio: number 
   return { w: BENCH_W, h: BENCH_H, ratio: BENCH_RATIO };
 }
 
+/** Best-of-chunks burst cost of the settled frame, as the burst phase measures it. */
+function burstMin(renderer: GameRenderer, gl: WebGLRenderingContext | WebGL2RenderingContext): { ms: number; calls: number } {
+  const info = renderer.sceneMgr.renderer.info;
+  let best = Infinity;
+  gl.finish();
+  for (let c = 0; c < BURST_CHUNKS; c++) {
+    const t0 = performance.now();
+    for (let i = 0; i < BURST_PER_CHUNK; i++) renderer.renderStillLive();
+    gl.finish();
+    best = Math.min(best, (performance.now() - t0) / BURST_PER_CHUNK);
+  }
+  // renderStillLive resets info per frame, so this is ONE frame's calls
+  return { ms: best, calls: info.render.calls };
+}
+
+/**
+ * `&ablate=1` — what each part of the frame costs, by switching it off.
+ *
+ * GPU timer queries were tried first and are useless here: ANGLE-on-Metal's
+ * EXT_disjoint_timer_query_webgl2 reports 30-60ms per pass on a 2.5ms frame.
+ * So this is the burst measurement (best of chunks, queue saturated) with one
+ * thing off at a time, the baseline re-measured beside every probe. On a
+ * loaded machine the small numbers are noise; the big ones are real.
+ */
+async function ablate(
+  renderer: GameRenderer, gl: WebGLRenderingContext | WebGL2RenderingContext,
+): Promise<{ what: string; savedMs: number; calls: number }[]> {
+  const sm = renderer.sceneMgr;
+  const out: { what: string; savedMs: number; calls: number }[] = [];
+  const probe = async (what: string, off: () => void, on: () => void): Promise<void> => {
+    const base = burstMin(renderer, gl);
+    off();
+    let cut: { ms: number; calls: number };
+    try { cut = burstMin(renderer, gl); } finally { on(); }
+    out.push({ what, savedMs: r2(base.ms - cut.ms), calls: base.calls - cut.calls });
+    await breathe();
+  };
+  for (const [i, pass] of sm.composer.passes.entries()) {
+    if (i === 0 || !pass.enabled) continue;
+    await probe(`pass:${(pass as { constructor: { name: string } }).constructor.name}`,
+      () => { pass.enabled = false; }, () => { pass.enabled = true; });
+  }
+  await probe('shadows', () => { sm.benchSkipShadows = true; }, () => { sm.benchSkipShadows = false; });
+  await probe('geometry (all)', () => { sm.scene.visible = false; }, () => { sm.scene.visible = true; });
+  // top-level scene children, grouped by name so a thousand loose props are
+  // one probe, and only the biggest groups
+  const groups = new Map<string, { objs: THREE.Object3D[]; meshes: number }>();
+  for (const child of sm.scene.children) {
+    if (!child.visible || (child as THREE.Light).isLight) continue;
+    let meshes = 0;
+    child.traverse((o) => { if ((o as THREE.Mesh).isMesh) meshes++; });
+    if (!meshes) continue;
+    const key = child.name || `${child.type}:${child.children[0]?.name ?? ''}`;
+    const g = groups.get(key) ?? { objs: [], meshes: 0 };
+    g.objs.push(child); g.meshes += meshes;
+    groups.set(key, g);
+  }
+  const ranked = [...groups.entries()].sort((a, b) => b[1].meshes - a[1].meshes).slice(0, 16);
+  for (const [key, g] of ranked) {
+    await probe(`hide ${key} (${g.objs.length} obj/${g.meshes} mesh)`,
+      () => { for (const o of g.objs) o.visible = false; },
+      () => { for (const o of g.objs) o.visible = true; });
+  }
+  return out;
+}
+
 async function runSituation(
   canvas: HTMLCanvasElement, s: BenchSituation, pin: { w: number; h: number; ratio: number } | null,
 ): Promise<{
@@ -273,6 +371,57 @@ async function runSituation(
   // that is three identical spikes in every run is an EVENT, and the event is
   // found by when it happens, not by how bad the average is
   const spikes: { i: number; ms: number; calls: number; tris: number; sim: number }[] = [];
+  // `&cpuprof=1`: the slowest single draw of every frame, so a spike can say
+  // WHICH object it was (a first-use compile is one draw taking 100ms)
+  const slow = { ms: 0, what: '' };
+  if (CPUPROF) {
+    const rr = renderer.sceneMgr.renderer as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const orig = rr.renderBufferDirect;
+    rr.renderBufferDirect = function (this: unknown, ...args: unknown[]) {
+      const t0 = performance.now();
+      const out = orig.apply(this, args);
+      const ms = performance.now() - t0;
+      if (ms > slow.ms) {
+        const obj = args[4] as THREE.Mesh; const mat = args[3] as THREE.MeshStandardMaterial;
+        const path: string[] = [];
+        for (let o: THREE.Object3D | null = obj; o; o = o.parent) path.push(o.name || o.type);
+        slow.ms = ms;
+        slow.what = `${ms.toFixed(1)}ms cam=${(args[0] as THREE.Camera).type} mat=${mat.type}/${mat.name} map=${!!mat.map} at=${mat.alphaTest} obj=${path.join('<')} srcmat=${(obj.material as THREE.Material)?.type}/${(obj.material as THREE.Material)?.name} srcAt=${(obj.material as THREE.MeshStandardMaterial)?.alphaTest} vis=${obj.visible} layers=${obj.layers.mask}`;
+      }
+      return out;
+    };
+  }
+  const simMs: number[] = [];
+  const updMs: number[] = [];
+  const secAcc = new Map<string, number>();
+  const undo: (() => void)[] = [];
+  if (CPUPROF) {
+    const sm = renderer.sceneMgr;
+    const r = renderer as unknown as Record<string, unknown>;
+    renderer.playerMeshes.forEach((pm) => undo.push(timeMethod(pm, 'update', 'players', secAcc)));
+    undo.push(timeMethod(renderer.stadium, 'update', 'stadium(crowd)', secAcc));
+    undo.push(timeMethod(renderer.cam, 'update', 'camera', secAcc));
+    undo.push(timeMethod(r.rain as object, 'update', 'rain', secAcc));
+    undo.push(timeMethod(r.divots as object, 'update', 'divots', secAcc));
+    undo.push(timeMethod(renderer, 'updateLOD', 'updateLOD', secAcc));
+    undo.push(timeMethod(renderer, 'syncLens', 'syncLens', secAcc));
+    undo.push(timeMethod(renderer, 'cutscene', 'cutscene', secAcc));
+    undo.push(timeMethod(sm.atmos, 'update', 'atmos', secAcc));
+    undo.push(timeMethod(sm.scene.userData.ss26Grass as object, 'update', 'grass', secAcc));
+    undo.push(timeMethod(sm, 'prepareShadowCasters', 'shadowPrep', secAcc));
+    undo.push(timeMethod(sm, 'drawShadows', 'shadows(total)', secAcc));
+    undo.push(timeMethod(sm, 'render', 'sceneMgr.render(total)', secAcc));
+    sm.composer.passes.forEach((p, i) => undo.push(timeMethod(p, 'render',
+      `pass${i}:${(p as { constructor: { name: string } }).constructor.name}`, secAcc)));
+    undo.push(timeMethod(match, 'update', 'sim', secAcc));
+    undo.push(timeMethod(sm.scene, 'updateMatrixWorld', 'scene.updateMatrixWorld', secAcc));
+    undo.push(timeMethod(sm.renderer.shadowMap, 'render', 'shadowMap.render', secAcc));
+    let nodes = 0, meshes = 0, bones = 0;
+    sm.scene.traverse((o) => { nodes++; if ((o as THREE.Mesh).isMesh) meshes++; if ((o as THREE.Bone).isBone) bones++; });
+    secAcc.set(`graph: ${nodes} nodes / ${meshes} meshes / ${bones} bones (x frames)`, 0);
+  }
+  let profFrames = 0;
+  const cpuSpikes: { frame: number; updateMs: number; sections: Record<string, number> }[] = [];
 
   await new Promise<void>((resolve) => {
     let acc = 0;
@@ -289,6 +438,7 @@ async function runSituation(
       last = now;
 
       // the same loop main.ts runs, minus input and the pause machine
+      const tSim = performance.now();
       const hold = present?.frame() ?? false;
       if (!hold) {
         acc += dt;
@@ -306,7 +456,28 @@ async function runSituation(
       const alpha = Math.min(acc / SIM_DT, 1);
 
       info.reset();
+      const tUpd = performance.now();
+      const secBefore = CPUPROF ? new Map(secAcc) : null;
+      slow.ms = 0; slow.what = '';
+      const progsBefore = CPUPROF ? new Set(info.programs ?? []) : null;
       renderer.update(dt, alpha);
+      const tEnd = performance.now();
+      profFrames++;
+      if (secBefore && tEnd - tUpd > 20 && cpuSpikes.length < 12) {
+        const sections: Record<string, number> = {};
+        for (const [k, v] of secAcc) {
+          const d = v - (secBefore.get(k) ?? 0);
+          if (d > 0.5) sections[k] = r2(d);
+        }
+        sections[`SLOWEST DRAW ${slow.what}`] = 0;
+        // a first-use shader compile is the usual suspect: name what was built
+        for (const pr of info.programs ?? []) {
+          if (progsBefore?.has(pr)) continue;
+          const p = pr as unknown as { name: string; cacheKey: string };
+          sections[`NEW PROGRAM ${p.name}: ${p.cacheKey.slice(0, 200)}`] = 0;
+        }
+        cpuSpikes.push({ frame: profFrames, updateMs: r2(tEnd - tUpd), sections });
+      }
 
       frame++;
       if (!collecting && (frame >= PREROLL_FRAMES || now >= prerollUntil)) {
@@ -316,6 +487,8 @@ async function runSituation(
         intervals.push(interval);
         tris.push(info.render.triangles);
         calls.push(info.render.calls);
+        simMs.push(tUpd - tSim);
+        updMs.push(tEnd - tUpd);
         if (interval > 25) {
           spikes.push({ i: intervals.length - 1, ms: r1(interval), calls: info.render.calls,
             tris: info.render.triangles, sim: simSteps });
@@ -328,6 +501,12 @@ async function runSituation(
     requestAnimationFrame(tick);
   });
 
+  for (const u of undo) u();
+  // preroll frames are in the accumulators too, so divide by every frame drawn
+  const cpuSections = CPUPROF ? Object.fromEntries([...secAcc.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => [k, r2(v / Math.max(profFrames, 1))])) : undefined;
+
   // ---- burst: the same settled frame, redrawn with the queue saturated
   for (let c = 0; c < BURST_CHUNKS; c++) {
     info.reset();
@@ -339,6 +518,8 @@ async function runSituation(
     calls.push(info.render.calls / BURST_PER_CHUNK);
   }
 
+  const ablation = ABLATE ? await ablate(renderer, gl) : undefined;
+
   info.autoReset = prevAutoReset;
   const buffer = renderer.sceneMgr.bufferSize();
   // taken BEFORE dispose(): under `&pin=off` this is the whole point of the
@@ -349,8 +530,16 @@ async function runSituation(
   const sortedCost = costs.slice().sort((a, b) => a - b);
   const sortedInterval = intervals.slice().sort((a, b) => a - b);
   const span = intervals.reduce((a, b) => a + b, 0);
+  const cpuStat = (xs: number[]): { p50: number; p95: number; max: number } => {
+    const so = xs.slice().sort((a, b) => a - b);
+    return { p50: r2(pct(so, 0.5)), p95: r2(pct(so, 0.95)), max: r2(Math.max(...xs, 0)) };
+  };
   const result: BenchResult = {
     spikes,
+    cpuMs: { sim: cpuStat(simMs), update: cpuStat(updMs) },
+    cpuSections,
+    cpuSpikes: CPUPROF ? cpuSpikes : undefined,
+    ablation,
     name: s.name,
     note: s.note,
     frames: intervals.length + costs.length,
@@ -455,6 +644,8 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
       ? arg.split(',').map((x) => x.trim()).filter(Boolean) : null;
     const secs = Number(params.get('secs') || 0);
     const burst = params.get('burst')?.match(/^(\d+)x(\d+)$/);
+    ABLATE = params.get('ablate') === '1';
+    CPUPROF = params.get('cpuprof') === '1';
     if (burst) { BURST_CHUNKS = Number(burst[1]); BURST_PER_CHUNK = Number(burst[2]); }
     const list = (wanted
       ? wanted.map((n) => {

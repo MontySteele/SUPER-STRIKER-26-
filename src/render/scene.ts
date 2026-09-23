@@ -82,8 +82,6 @@ const RATIO_STEPS: Record<QualityLevel, number[]> = {
   retro: [1, 0.85, 0.72, 0.6],
 };
 
-/** A mesh on SHADOW_LAYER and nothing else — i.e. a shadow proxy. */
-const PROXY_MASK = 1 << SHADOW_LAYER;
 /** a frame this long is a stall, not fill-rate pressure */
 const STALL_MS = 90;
 /** ignore everything for this long after the renderer is built */
@@ -152,9 +150,8 @@ export class SceneManager {
   /** set by pinRenderSize(): while this holds, neither the adaptive-resolution
    *  valve nor a window resize may touch the drawing buffer */
   private pinned: { w: number; h: number; ratio: number } | null = null;
-  /** see drawShadows(): a camera that sees the proxy layer and nothing else */
-  private shadowProbe = new THREE.PerspectiveCamera(1, 1, 0.01, 0.02);
-  private shadowScratch = new THREE.WebGLRenderTarget(1, 1);
+  /** bench ablation only (`&ablate=1`): skip the shadow pass to price it */
+  benchSkipShadows = false;
 
   // ---- adaptive-resolution state (see RATIO_STEPS above)
   private steps: number[];
@@ -186,15 +183,7 @@ export class SceneManager {
     // 16x is the difference between grain and a crawling moire at DPR 2
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
     this.renderer.shadowMap.enabled = true;
-    // We drive the shadow pass by hand (see drawShadows): three's automatic one
-    // runs inside renderer.render() with the VIEW camera's layer mask, which
-    // is exactly the mask the shadow proxies are hidden from.
-    this.renderer.shadowMap.autoUpdate = false;
-    // the probe: under the world, looking at nothing, and seeing ONLY the
-    // shadow-caster layer (see drawShadows)
-    this.shadowProbe.position.set(0, -5000, 0);
-    this.shadowProbe.layers.set(SHADOW_LAYER);
-    this.shadowProbe.updateMatrixWorld();
+    this.letShadowsSeeProxies();
     // Do NOT "upgrade" this to PCFSoftShadowMap. r185 dropped that path:
     // generateShadowMapTypeDefine() only knows PCF and VSM, so PCFSoftShadowMap
     // falls through to SHADOWMAP_TYPE_BASIC — ONE hard comparison tap, i.e.
@@ -384,7 +373,6 @@ export class SceneManager {
       (pass as { dispose?: () => void }).dispose?.();
     }
     this.composer.dispose();
-    this.shadowScratch.dispose();
     this.renderer.dispose();
   }
 
@@ -641,7 +629,7 @@ export class SceneManager {
   }
 
   /**
-   * The shadow pass, run as its own render — and the reason it has to be.
+   * The shadow pass sees SHADOW_LAYER — from inside the one real render.
    *
    * three r185 decides what goes into a shadow map with
    *
@@ -649,65 +637,36 @@ export class SceneManager {
    *
    * where `camera` is the VIEW camera, not the shadow camera. The skinned
    * players cast off decimated proxies parked on SHADOW_LAYER precisely so the
-   * view camera will not draw them (§7A.2) — so that test fails for every proxy
-   * in the game and 22 players cast NOTHING. Enabling the layer on
-   * light.shadow.camera (which is what the rig used to do) changes nothing: the
-   * shadow camera's own mask is never consulted.
+   * view camera will not draw them (§7A.2), and so do the roof casters — so
+   * with the stock renderer that test fails for every proxy in the game and 22
+   * players cast NOTHING. The shadow camera's own mask is never consulted.
    *
-   * Calling renderer.shadowMap.render() by hand does not work either — it
-   * reaches into the renderer's per-render state, which only exists inside
-   * renderer.render(). So the shadow maps are filled by a real render that
-   * draws (almost) nothing: a probe camera parked 5km under the pitch, with a
-   * 1-degree 1cm-deep frustum and a layer mask of SHADOW_LAYER and nothing
-   * else. prepareShadowCasters() puts every caster in the scene on that layer,
-   * so the shadow pass sees all of them, while the render list the probe builds
-   * is culled away to nothing by its own frustum.
+   * This used to be answered with a whole second renderer.render() a frame,
+   * from a probe camera that saw only SHADOW_LAYER, plus a per-frame traversal
+   * putting every caster on that layer. Measured with `&cpuprof=1`, that
+   * probe render cost as much main-thread time as the beauty pass itself: a
+   * second full-graph updateMatrixWorld (1.8k nodes, 1.1k of them bones), a
+   * second projectObject, a second light setup and a second skeleton upload.
    *
-   * The mask has to be SHADOW_LAYER *only*, not "layer 0 plus SHADOW_LAYER":
-   * the character meshes carry frustumCulled = false, so a probe that could see
-   * layer 0 would skip the cull and re-draw all 22 players at full detail into
-   * a 1x1 target. Measured: 4.8ms -> 26ms a frame. Ask how I know.
+   * The render already calls shadowMap.render(lights, scene, camera) AFTER it
+   * has built its own render list (WebGLRenderer.render: projectObject, then
+   * shadows, then draws). So the view camera is given SHADOW_LAYER for exactly
+   * the length of that call: the beauty list, already built, never sees a
+   * proxy, and the shadow pass sees every caster on layer 0 plus every proxy.
    */
-  private drawShadows(): void {
-    this.prepareShadowCasters();
-    const sm = this.renderer.shadowMap;
-    const prevTarget = this.renderer.getRenderTarget();
-    sm.autoUpdate = true;
-    this.renderer.setRenderTarget(this.shadowScratch);
-    this.renderer.render(this.scene, this.shadowProbe);
-    // ...and the composer's own render must not do it all over again
-    sm.autoUpdate = false;
-    sm.needsUpdate = false;
-    this.renderer.setRenderTarget(prevTarget);
-  }
-
-  /**
-   * Two jobs, one traversal, both run before the shadow pass.
-   *
-   * 1. Put every shadow caster on SHADOW_LAYER, so the probe camera (which sees
-   *    that layer and nothing else) can find them. Idempotent bit-setting on a
-   *    ~1.5k-object scene: ~0.05ms.
-   *
-   * 2. The compatibility shim. The skinned rig's shadow proxy IS its lowest LOD
-   *    mesh, and the LOD picker hides every level except the one being drawn —
-   *    so the proxy of a player at LOD 0 or 1 is `visible = false`, and three's
-   *    shadow pass skips invisible objects before it looks at anything else.
-   *    With 2 players at LOD 0 and 20 at LOD 1, that was 22 players casting
-   *    nothing. A mesh whose layer mask is SHADOW_LAYER *only* is by definition
-   *    invisible to the game camera, so forcing it visible cannot put a
-   *    low-poly duplicate on screen. (When the proxy IS the drawn level the rig
-   *    puts layer 0 back on it, and the mask test leaves it alone.)
-   *
-   *    The real fix belongs in the character pipeline — a shadow proxy should
-   *    not share a visibility flag with the LOD level it is built from.
-   */
-  private prepareShadowCasters(): void {
-    this.scene.traverse((o) => {
-      if (!(o as THREE.Mesh).isMesh) return;
-      // the proxy test first: enabling the layer below would change the mask
-      if (!o.visible && o.layers.mask === PROXY_MASK) o.visible = true;
-      if ((o as THREE.Mesh).castShadow) o.layers.enable(SHADOW_LAYER);
-    });
+  private letShadowsSeeProxies(): void {
+    const shadowMap = this.renderer.shadowMap;
+    const drawMaps = shadowMap.render.bind(shadowMap);
+    shadowMap.render = (lights, scene, camera) => {
+      if (this.benchSkipShadows) return;
+      const mask = camera.layers.mask;
+      camera.layers.enable(SHADOW_LAYER);
+      try {
+        drawMaps(lights, scene, camera);
+      } finally {
+        camera.layers.mask = mask;
+      }
+    };
   }
 
   render(): void {
@@ -728,7 +687,6 @@ export class SceneManager {
     // the cascades are fitted to where the camera IS, not where it was a frame
     // ago — the capture harness re-poses it between draws
     this.camera.updateMatrixWorld();
-    this.drawShadows();
     this.composer.render();
     if (this.debug) this.updateDebug();
   }

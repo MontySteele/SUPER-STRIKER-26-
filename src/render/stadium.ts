@@ -307,8 +307,8 @@ export class Stadium {
    * The shadow-caster proxy (see `casters`). One InstancedMesh whose layer mask
    * is SHADOW_LAYER and nothing else, which is the project's standing
    * convention for "drawn by the cascades, invisible to the game camera" — the
-   * same one the skinned players' shadow proxies use, so SceneManager.
-   * prepareShadowCasters() already knows what to do with it.
+   * same one the skinned players' shadow proxies use (see SceneManager.
+   * letShadowsSeeProxies).
    */
   private flushCasters(scene: THREE.Scene): void {
     if (this.retro || this.casters.length === 0) return;

@@ -3393,8 +3393,8 @@ export class CharacterRig {
       m.receiveShadow = false;
       m.frustumCulled = false;
       // permanently visible and permanently invisible: SHADOW_LAYER is drawn
-      // by the cascade cameras and by scene.ts's shadow probe, and by nothing
-      // the player ever looks at
+      // by the cascades (scene.ts lends the view camera the layer for the
+      // shadow pass only) and by nothing the player ever looks at
       m.visible = true;
       m.layers.set(SHADOW_LAYER);
     }

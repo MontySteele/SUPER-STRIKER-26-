@@ -365,6 +365,17 @@ export class GameRenderer {
    * and unculled, the lens open, one full frame through shadows and the
    * composer, then everything put back exactly as it was. Anything created
    * later (confetti, replay props) still pays on first use.
+   *
+   * TWO frames, not one. Inside renderer.render() the shadow maps are drawn
+   * BEFORE the frame's lights are set up, so on the very first render every
+   * shadow depth program is built for a scene with zero lights. Depth
+   * materials never look at lights, so that is harmless — until one of them
+   * has to rebuild: three's shared depth material is handed `material.map`
+   * from every caster, and a textured caster with no alphaTest flips it to a
+   * map variant, which is then compiled against the REAL light count. That was
+   * the walkout's lone 90-130ms frame, found with the bench's `&cpuprof=1`.
+   * The second frame here compiles those variants with the counts the game
+   * will actually use.
    */
   private prewarm(): void {
     // `?prewarm=0` — the A/B switch for the bench
@@ -378,6 +389,7 @@ export class GameRenderer {
     });
     this.sceneMgr.setDepthOfField(1, 10);
     try {
+      this.sceneMgr.render();
       this.sceneMgr.render();
     } finally {
       for (const [o, v, f] of saved) { o.visible = v; o.frustumCulled = f; }

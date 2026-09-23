@@ -110,13 +110,12 @@ const dir = (x: number, y: number, z: number): THREE.Vector3 =>
 /**
  * Put a light on SHADOW_LAYER as well as its own.
  *
- * SceneManager's shadow pass runs from a probe camera whose mask is
- * SHADOW_LAYER alone (see drawShadows), and three collects the lights for a
- * render by testing each one against THAT mask. A light the probe cannot see
- * is a light with no shadow map. Every light in the rig goes on the layer, not
- * just the shadow-casting key: the probe and the real render must agree on the
- * light counts or every material in the scene gets compiled twice, once per
- * camera, and swaps programs every frame.
+ * Belt and braces since the shadow probe went (SceneManager.
+ * letShadowsSeeProxies): three collects a render's lights by testing each one
+ * against the view camera's mask, and the view camera only holds SHADOW_LAYER
+ * for the shadow-map call, after the lights are collected. Keeping every light
+ * on both layers means any camera that can see either one agrees on the light
+ * count — a disagreement compiles every material twice.
  */
 const lightSeesShadowPass = (...lights: (THREE.Light | null)[]): void => {
   for (const l of lights) l?.layers.enable(SHADOW_LAYER);
@@ -577,10 +576,9 @@ export class Atmosphere {
       lightSeesShadowPass(light);
       // NOT light.shadow.camera.layers: three never consults the shadow
       // camera's mask. What decides a shadow map's contents is the mask of the
-      // camera passed to WebGLShadowMap.render, which is why the shadow pass
-      // is driven from SceneManager.drawShadows() by a probe camera that sees
-      // SHADOW_LAYER — and why the light above has to be on it as well, or the
-      // probe collects no lights and quietly renders no shadows at all.
+      // camera passed to WebGLShadowMap.render, which is why SceneManager
+      // lends the view camera SHADOW_LAYER for exactly that call (see
+      // letShadowsSeeProxies).
       // CSM has no knob for either of these. normalBias kills the acne a 105m
       // pitch under a low sun would otherwise show everywhere; radius is what
       // the PCF tap kernel spreads by, i.e. how soft the edge reads.
