@@ -847,8 +847,12 @@ interface GarmentMap {
   n: number;
   /** R = across, G = up, B = part × 51, A = coverage */
   data: Uint8ClampedArray;
+  /** body-space x, y in metres per covered texel (2 floats), unquantised */
+  body: Float32Array;
   back: TextFrame | null;
   front: TextFrame | null;
+  /** body-space extent of the confident front panel: [loX, hiX, loY, hiY] */
+  frontBox: [number, number, number, number] | null;
 }
 
 /**
@@ -881,6 +885,7 @@ function buildGarmentMap(mesh: THREE.Mesh, classify: (
 
   const N = GARMENT_PX;
   const data = new Uint8ClampedArray(N * N * 4);
+  const body = new Float32Array(N * N * 2);
   const tri = index ? index.count / 3 : pos.count / 3;
 
   // least-squares accumulators for the two panel fits: u,v = a·x + b·y + c
@@ -955,6 +960,8 @@ function buildGarmentMap(mesh: THREE.Mesh, classify: (
         data[o + 1] = (ay[0] * l0 + ay[1] * l1 + ay[2] * l2) * 255;
         data[o + 2] = part * 51;
         data[o + 3] = 255;
+        body[(y * N + x) * 2] = px[0] * l0 + px[1] * l1 + px[2] * l2;
+        body[(y * N + x) * 2 + 1] = py[0] * l0 + py[1] * l1 + py[2] * l2;
       }
     }
   }
@@ -986,7 +993,11 @@ function buildGarmentMap(mesh: THREE.Mesh, classify: (
       ppm: Math.hypot(rx, ry) || 1,
     };
   };
-  return { n: N, data, back: solve(fit[1]), front: solve(fit[0]) };
+  const fr = fit[0];
+  return {
+    n: N, data, body, back: solve(fit[1]), front: solve(fit[0]),
+    frontBox: fr.s1 >= 12 ? [fr.lox, fr.hix, fr.loy, fr.hiy] : null,
+  };
 }
 
 /**
@@ -1056,6 +1067,55 @@ function dilate(img: ImageData, passes: number): void {
       }
     }
   }
+}
+
+/**
+ * Print onto a garment's FRONT in body space. `draw` gets a scratch canvas whose
+ * pixels are body metres × `ppm` (x right = body +x, y down = body −y) and a
+ * mapper from body metres to those pixels; the result is resampled, bilinear
+ * and premultiplied, onto every covered front texel of `ctx` through the map's
+ * body coordinates. `ppm` is 1.5× the garment's own texel density on the front,
+ * so the resample neither aliases nor wastes a big canvas.
+ */
+function printFront(ctx: CanvasRenderingContext2D, map: GarmentMap,
+  draw: (p: CanvasRenderingContext2D, at: (x: number, y: number) => [number, number],
+    ppm: number) => void): void {
+  const [lx, hx, ly, hy] = map.frontBox!;
+  const N = map.n, d = map.data, b = map.body;
+  let texels = 0;
+  for (let i = 0; i < N * N; i++) {
+    if (d[i * 4 + 3] && Math.round(d[i * 4 + 2] / 51) === Part.Front
+      && b[i * 2] >= lx && b[i * 2] <= hx && b[i * 2 + 1] >= ly && b[i * 2 + 1] <= hy) texels++;
+  }
+  const ppm = 1.5 * Math.sqrt(texels / Math.max(1e-4, (hx - lx) * (hy - ly)));
+  if (!(ppm > 1)) return;
+  const pad = 0.02, x0 = lx - pad, y1 = hy + pad;
+  const W = Math.ceil((hx - lx + 2 * pad) * ppm), H = Math.ceil((hy - ly + 2 * pad) * ppm);
+  const [, pc] = canvas2d(W, H);
+  draw(pc, (x, y) => [(x - x0) * ppm, (y1 - y) * ppm], ppm);
+  const src = pc.getImageData(0, 0, W, H).data;
+  const img = ctx.getImageData(0, 0, N, N);
+  const out = img.data;
+  for (let i = 0; i < N * N; i++) {
+    const o = i * 4;
+    if (d[o + 3] === 0 || Math.round(d[o + 2] / 51) !== Part.Front) continue;
+    const fx = (b[i * 2] - x0) * ppm - 0.5, fy = (y1 - b[i * 2 + 1]) * ppm - 0.5;
+    if (fx < 0 || fy < 0 || fx >= W - 1 || fy >= H - 1) continue;
+    const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
+    let r = 0, g = 0, bl = 0, a = 0;
+    for (let k = 0; k < 4; k++) {
+      const dx = k & 1, dy = k >> 1;
+      const wt = (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty);
+      const q = ((iy + dy) * W + ix + dx) * 4;
+      const qa = (src[q + 3] / 255) * wt;
+      r += src[q] * qa; g += src[q + 1] * qa; bl += src[q + 2] * qa; a += qa;
+    }
+    if (a < 0.002) continue;
+    out[o] = out[o] * (1 - a) + r;
+    out[o + 1] = out[o + 1] * (1 - a) + g;
+    out[o + 2] = out[o + 2] * (1 - a) + bl;
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 /**
@@ -3110,25 +3170,55 @@ export class CharacterRig {
     ctx.fillRect(0, 0, N, N);
     ctx.restore();
 
-    // crest and sponsor, placed as FRACTIONS of the panel the fit measured, so
-    // they land on the chest of whatever garment the pipeline is using
-    if (map.front) {
-      const f = map.front;
+    // Crest, sponsor and maker's mark are printed in BODY space and pulled onto
+    // the garment texel by texel through the map's own body coordinates.
+    // Printing through one affine panel fit (as the back still does) assumes
+    // the front is one UV island; the polo's front is several, split at the
+    // placket, so the fit averaged them: the sponsor landed off-centre on the
+    // belly, the crest skewed, and at walkout distance all three blurred into
+    // one smudge. Body space has no seams to get wrong.
+    if (map.frontBox) {
+      const [lx, hx, ly, hy] = map.frontBox;
+      const w = hx - lx, h = hy - ly, midX = (lx + hx) / 2;
+      const chestY = ly + 0.76 * h;
       const ink = luminance(kit.shirt) > 0.5 ? '#141820' : '#f6f8fc';
-      panelFrame(ctx, f, false);
-      const crestPx = 0.46 * f.halfW * f.ppm;
+      const edge = luminance(kit.shirt) > 0.5 ? '#f6f8fc' : '#141820';
       const crest = this.lab.kitCrestCanvas(kit, layout, crestInitials(layout.seed));
-      ctx.drawImage(crest, -0.52 * f.halfW * f.ppm - crestPx / 2,
-        -0.62 * f.halfH * f.ppm - crestPx / 2, crestPx, crestPx);
-      ctx.fillStyle = ink;
-      ctx.strokeStyle = luminance(kit.shirt) > 0.5 ? '#f6f8fc' : '#141820';
-      ctx.lineJoin = 'round';
-      ctx.textAlign = 'center';
-      ctx.font = `bold ${Math.round(0.24 * f.halfW * f.ppm)}px Helvetica, Arial, sans-serif`;
-      ctx.lineWidth = 0.02 * f.halfW * f.ppm;
-      ctx.strokeText(layout.sponsor, 0, -0.02 * f.halfH * f.ppm);
-      ctx.fillText(layout.sponsor, 0, -0.02 * f.halfH * f.ppm);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      printFront(ctx, map, (p, at, ppm) => {
+        // crest on the wearer's left breast, which is the viewer's right (+x)
+        const cs = 0.085 * ppm;
+        const [cx, cy] = at(midX + 0.24 * w, chestY);
+        p.drawImage(crest, cx - cs / 2, cy - cs / 2, cs, cs);
+        // a fictional maker's mark opposite it: two stacked chevrons
+        const mk = 0.02 * ppm;
+        const [mx, my] = at(midX - 0.24 * w, chestY);
+        p.strokeStyle = ink;
+        p.lineWidth = mk * 0.34;
+        p.lineCap = 'round';
+        p.lineJoin = 'round';
+        for (const dy of [-0.35, 0.35]) {
+          p.beginPath();
+          p.moveTo(mx - mk, my + (dy + 0.4) * mk);
+          p.lineTo(mx, my + (dy - 0.4) * mk);
+          p.lineTo(mx + mk, my + (dy + 0.4) * mk);
+          p.stroke();
+        }
+        // the sponsor: the one print on a club shirt that reads from the
+        // stand, so a bold block across the chest, fitted to its width
+        const [sx, sy] = at(midX, ly + 0.55 * h);
+        let fpx = 0.075 * ppm;
+        p.font = `900 ${Math.round(fpx)}px Helvetica, Arial, sans-serif`;
+        const wide = p.measureText(layout.sponsor).width;
+        if (wide > 0.62 * w * ppm) fpx *= (0.62 * w * ppm) / wide;
+        p.font = `900 ${Math.round(fpx)}px Helvetica, Arial, sans-serif`;
+        p.textAlign = 'center';
+        p.textBaseline = 'middle';
+        p.strokeStyle = edge;
+        p.lineWidth = fpx * 0.1;
+        p.strokeText(layout.sponsor, sx, sy);
+        p.fillStyle = ink;
+        p.fillText(layout.sponsor, sx, sy);
+      });
     }
 
     this.kitShirtBase.set(key, c);
@@ -3175,21 +3265,6 @@ export class CharacterRig {
       ctx.fillText(String(data.num), 0, 0.22 * b.halfH * b.ppm);
       ctx.setTransform(1, 0, 0, 1, 0, 0);
     }
-    // FRONT: the small chest number, opposite the crest
-    if (map?.front) {
-      const f = map.front;
-      panelFrame(ctx, f, false);
-      ctx.textAlign = 'center';
-      ctx.fillStyle = ink;
-      ctx.strokeStyle = outline;
-      ctx.lineJoin = 'round';
-      ctx.font = `bold ${Math.round(0.38 * f.halfW * f.ppm)}px Helvetica, Arial, sans-serif`;
-      ctx.lineWidth = 0.03 * f.halfW * f.ppm;
-      ctx.strokeText(String(data.num), 0.55 * f.halfW * f.ppm, -0.52 * f.halfH * f.ppm);
-      ctx.fillText(String(data.num), 0.55 * f.halfW * f.ppm, -0.52 * f.halfH * f.ppm);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-    }
-
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
     // glTF UVs have their origin at the TOP left, so a canvas painted in the

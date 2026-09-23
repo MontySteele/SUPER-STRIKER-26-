@@ -15,7 +15,7 @@ import { Presentation } from '../present/director';
 import type { CamMode } from '../render/camera';
 import { preloadCharacters } from '../render/characterAssets';
 import { preloadCrowd } from '../render/crowd';
-import { forceQuality, type QualityLevel } from '../render/quality';
+import { forceQuality, overrideProfile, type QualityLevel, type QualityProfile } from '../render/quality';
 import { forceWeather, type Weather } from '../render/weather';
 import type { TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
@@ -277,6 +277,19 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
     const level = override === 'high' || override === 'medium' || override === 'retro'
       ? override : shot.quality ?? 'high';
     forceQuality(level);
+    // `&profile=bloomScale:0,grade:false` — the bench's one-setting A/B, for a
+    // still: "is this halo the bloom" answered by two shots, not a rebuild.
+    // Ad-hoc like &quality=; a still taken this way is not a baseline.
+    const profileArg = new URLSearchParams(location.search).get('profile');
+    if (profileArg) {
+      const over: Record<string, unknown> = {};
+      for (const pair of profileArg.split(',').filter(Boolean)) {
+        const [k, v] = pair.split(':');
+        over[k] = v === 'true' ? true : v === 'false' ? false
+          : Number.isNaN(Number(v)) ? v : Number(v);
+      }
+      overrideProfile(over as Partial<QualityProfile>);
+    }
     // ...and the same rule for the weather: the shot's own, or an ad-hoc
     // `&weather=` for a look at one the contract doesn't ask for.
     const wOverride = new URLSearchParams(location.search).get('weather');
