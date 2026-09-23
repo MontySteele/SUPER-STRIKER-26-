@@ -28,6 +28,7 @@
 import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import { preloadCharacters } from '../render/characterAssets';
+import { preloadCrowd } from '../render/crowd';
 import { forceQuality, overrideProfile, type QualityLevel, type QualityProfile } from '../render/quality';
 import type { GfxStats, TimeOfDay } from '../render/scene';
 import type { StadiumSize } from '../render/stadium';
@@ -451,6 +452,7 @@ export async function runBench(canvas: HTMLCanvasElement, arg: string): Promise<
       : SITUATIONS).map((s) => (secs > 0 ? { ...s, seconds: secs } : s));
 
     if (skinnedPlayersWanted()) await preloadCharacters();
+    await preloadCrowd();   // crowd v2 atlas: never shoot an empty stand
 
     const pin = pinnedSize(params.get('pin'));
     const results: BenchResult[] = [];

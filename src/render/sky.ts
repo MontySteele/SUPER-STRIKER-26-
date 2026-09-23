@@ -56,6 +56,16 @@ export interface SkyPreset {
   /** metres per noise cell at the deck, and the seeded world offset */
   cloudScale?: number;
   cloudOffset?: [number, number];
+
+  /**
+   * §7A.4d. The glow a floodlit bowl throws into its own air: a wide, soft
+   * band hugging the roof line that the haze term cannot be (the haze is the
+   * HORIZON's colour, and at night the horizon is black). It also lights the
+   * cloud deck from below, strongest over the bowl. 0 / omitted = none.
+   */
+  bowlGlow?: number;
+  /** how fast the glow falls off with elevation; higher = a tighter band */
+  bowlGlowWidth?: number;
 }
 
 const VERT = /* glsl */ `
@@ -82,6 +92,8 @@ const FRAG = /* glsl */ `
   uniform vec3 cloudShadow;
   uniform float cloudScale;
   uniform vec2 cloudOffset;
+  uniform vec3 bowlGlow;
+  uniform float bowlGlowWidth;
   varying vec3 vDir;
 
   // ---- value noise. Deterministic, seeded only through cloudOffset.
@@ -137,6 +149,9 @@ const FRAG = /* glsl */ `
     c = mix(c, horizon * 1.25, exp(-abs(h) * 12.0) * haze);
     c = mix(c, horizon * 1.42, exp(-abs(h) * 46.0) * haze * 0.65);
     c *= gain;
+    // the bowl's own light pollution, above the line only
+    float glowK = exp(-max(h, 0.0) * bowlGlowWidth) * smoothstep(-0.06, 0.02, h);
+    c += bowlGlow * glowK;
 
     // sun: a hot core plus two glow lobes (tight bloom seed, wide sky wash)
     float cosA = dot(d, sunDir);
@@ -175,6 +190,8 @@ const FRAG = /* glsl */ `
       vec3 body = mix(cloudShadow, cloudColor, lit);
       // ...and the sun still rims whatever is in front of it
       body += sunColor * wide * 0.5 * (1.0 - lit) * step(0.01, sunIntensity);
+      // ...and a floodlit bowl lights the underside of whatever is over it
+      body += bowlGlow * exp(-h * bowlGlowWidth * 0.45) * (1.2 - 0.6 * lit);
       c = mix(c, body * gain, cover);
     }
 
@@ -204,6 +221,8 @@ export function makeSkyMaterial(p: SkyPreset): THREE.ShaderMaterial {
       cloudOffset: {
         value: new THREE.Vector2(...(p.cloudOffset ?? [17.31, 42.07])),
       },
+      bowlGlow: { value: new THREE.Color(p.bowlGlow ?? 0x000000) },
+      bowlGlowWidth: { value: p.bowlGlowWidth ?? 6 },
     },
     vertexShader: VERT,
     fragmentShader: FRAG,

@@ -35,6 +35,10 @@ import { Crowd, CROWD_DETAIL, type CrowdBlock, type CrowdReaction } from './crow
 import { applyShaderPatches, queueShaderPatch, SHADOW_LAYER } from './materials';
 import { floodlightsLit } from './weather';
 import { FACADE_TILE_M, TERRACE_TILE_M, TextureLab } from './TextureLab';
+import {
+  boardHousings, buildCarpets, dressPitchside, LedRibbon, perimeterWallTexture, pitchsideEnabled,
+  type BenchSpot, type PitchsideSink,
+} from './pitchside';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
 
@@ -151,6 +155,8 @@ export class Stadium {
     next: number;
   }[] = [];
   private adOffset = 0;
+  /** the board layout, kept for the housings behind the screens (§7A.5c) */
+  private boardSegments: { x: number; z: number; rotY: number; w: number }[] = [];
   /** virtual seconds since kick-off, driving every sway in the bowl */
   private clock = 0;
   private swayUniforms: { value: number }[] = [];
@@ -192,6 +198,13 @@ export class Stadium {
    * shadow-map aliasing.
    */
   private casters: Piece[] = [];
+  /** §7A.5c: every seated person outside the stands (dugouts, photographers,
+   *  stewards, officials), flushed as ONE Crowd.seatBench instance mesh */
+  private benchSpots: BenchSpot[] = [];
+  /** the balcony LED ribbon (pitchside.ts); null on RETRO / one-tier bowls */
+  private ribbon: LedRibbon | null = null;
+  /** balcony spans collected by buildBowl for the ribbon */
+  private ribbonSpans: { frame: THREE.Matrix4; len: number; h: number }[] = [];
 
   /**
    * `hdrLamps` drives the floodlight heads' and the LED boards' emissive
@@ -220,6 +233,7 @@ export class Stadium {
     this.buildFloodlights(scene, lampsLit);
     this.buildAdBoards(scene, lampsLit);
     this.buildCornerFlags(scene);
+    this.buildPitchside(scene, lampsLit);
     this.flushStructure(scene);
     const b = this.crowd.budget;
     console.info(`crowd: ${b.figures} 3D figures (${b.triangles} tris, ${b.drawCalls} calls)`
@@ -504,6 +518,16 @@ export class Stadium {
 
     const spec = SIZES[this.size];
     const facade = this.retro ? null : this.lab.standFacade();
+    // §7A.5c: the front wall under the first row is a run of static sponsor
+    // panels, not bare concrete — it is a 1.6m band across every tele frame
+    const wallSign = this.retro || !pitchsideEnabled() ? null : perimeterWallTexture();
+    const signMat = (len: number): THREE.Material => {
+      if (!wallSign) return concreteMat;
+      const map = wallSign.clone();
+      map.needsUpdate = true;
+      map.repeat.set(len / 16, 1);
+      return new THREE.MeshPhongMaterial({ map, shininess: 8 });
+    };
     stands.forEach((s, standIdx) => {
       const stand = new THREE.Group();
       const tiers = spec.tiers;
@@ -524,7 +548,7 @@ export class Stadium {
           // and for the tier with real people in it that count is the crowd's
           // own, which is what puts a seat under every figure instead of a
           // seat pattern behind them.
-          const rows = tierIdx === 0 && this.crowd.live
+          const rows = this.crowd.live   // crowd v2 seats every tier
             ? this.crowdRows(s.detail, rakeLen)
             : Math.max(2, Math.floor(rakeLen / CARD_STEP_Y));
           const floor = new THREE.Mesh(
@@ -533,13 +557,13 @@ export class Stadium {
           floor.rotation.x = -Math.PI / 2 - theta;
           floor.position.set(0, t.y0 + t.rise / 2, depth + t.run / 2);
           stand.add(floor);
-          if (tierIdx === 0 && this.crowd.live) {
-            // the tier you can actually see gets real people
+          if (this.crowd.live) {
+            // crowd v2 (crowd.ts): every tier gets the baked-human impostors
             const block: CrowdBlock = {
               cx: s.cx, cz: s.cz, rotY: s.rotY, len: s.len,
-              y0: t.y0, rise: t.rise, run: t.run, depth: 0,
-              detail: s.detail, gaps: s.gaps, gapTop: s.gapTop,
-              alle0: s.alle0, alle1: s.alle1,
+              y0: t.y0, rise: t.rise, run: t.run, depth,
+              detail: s.detail, gaps: tierIdx === 0 ? s.gaps : undefined, gapTop: s.gapTop,
+              alle0: s.alle0, alle1: s.alle1, tier: tierIdx, tierCount: tiers.length,
             };
             this.crowd.seat(scene, block);
           } else {
@@ -564,12 +588,13 @@ export class Stadium {
         if (s.tunnel && tierIdx === 0) {
           const half = (s.len / 2 - TUNNEL_HALF_W);
           for (const sx of [-1, 1]) {
-            const w = new THREE.Mesh(new THREE.BoxGeometry(half, wallH, 0.6), concreteMat);
+            const w = new THREE.Mesh(new THREE.BoxGeometry(half, wallH, 0.6), signMat(half));
             w.position.set(sx * (TUNNEL_HALF_W + half / 2), wallH / 2, depth - 0.3);
             stand.add(w);
           }
         } else {
-          const wall = new THREE.Mesh(new THREE.BoxGeometry(s.len, wallH, 0.6), concreteMat);
+          const wall = new THREE.Mesh(new THREE.BoxGeometry(s.len, wallH, 0.6),
+            tierIdx === 0 ? signMat(s.len) : concreteMat);
           wall.position.set(0, wallH / 2, depth - 0.3);
           stand.add(wall);
         }
@@ -596,6 +621,17 @@ export class Stadium {
       back.position.set(0, backH / 2, depth + 0.4);
       stand.add(back);
 
+      if (!this.retro && tiers.length >= 2 && pitchsideEnabled()) {
+        // The LED ribbon on the balcony of the second tier (§7A.5c): a
+        // parapet on top of that tier's front wall, carrying the strip.
+        const top = tiers[1].y0 + 0.2;
+        const ry = top + 0.4, rz = tierDepth[1] - 0.95;
+        this.piece(frame, 0, ry, rz + 0.14, s.len, 0.8, 0.24, 0x1a1e26, 0.8);
+        this.ribbonSpans.push({
+          frame: frame.clone().multiply(new THREE.Matrix4().makeTranslation(0, ry, rz)),
+          len: s.len, h: 0.72,
+        });
+      }
       if (!this.retro) {
         this.buildRoofStructure(frame, s.len, spec.roofY, depth, standIdx === 1);
         this.buildStandStructure(frame, s.len, spec.roofY, depth, tiers, tierDepth, s.gaps);
@@ -926,7 +962,9 @@ export class Stadium {
 
     const throat = new THREE.Mesh(
       new THREE.BoxGeometry(W, TUNNEL_H, TUNNEL_DEPTH), darkMat);
-    throat.position.set(0, TUNNEL_H / 2, -TUNNEL_DEPTH / 2 - 0.05);
+    // +0.01: the pitch plane now runs to the stand line (§7A.5c) and would
+    // z-fight the throat's floor for the last metre of the mouth
+    throat.position.set(0, TUNNEL_H / 2 + 0.01, -TUNNEL_DEPTH / 2 - 0.05);
     g.add(throat);
 
     // the block that holds the terrace up over the mouth: two piers and a lid
@@ -1018,7 +1056,7 @@ export class Stadium {
       for (let i = 0; i < 5; i++) {
         spots.push({
           x: sx * 14.5 + (i - 2) * 1.55 + rng.range(-0.18, 0.18),
-          y: 0.44,
+          y: 0.06,   // the FLOOR: the figure folds its lap to ~0.46 (pitchside.ts BenchSpot)
           z: z - 0.62,
           rotY: Math.PI + rng.range(-0.12, 0.12),
           alle: sx < 0 ? 1 : 0,
@@ -1026,7 +1064,42 @@ export class Stadium {
         });
       }
     });
-    this.crowd.seatBench(scene, spots);
+    // flushed with the rest of the pitch-side people in buildPitchside()
+    this.benchSpots.push(...spots);
+  }
+
+  // ------------------------------------------------------------- pitchside
+
+  /**
+   * §7A.5c: everything between the boards and the stands — see pitchside.ts.
+   * Boxes join the structure mesh, people join the bench mesh, and the ribbon
+   * and the camera carpets are one draw call each. RETRO keeps the v1.1 bowl.
+   */
+  private buildPitchside(scene: THREE.Scene, lit: boolean): void {
+    if (!this.retro && pitchsideEnabled()) {
+      const id = new THREE.Matrix4();
+      const q = new THREE.Quaternion();
+      const up = new THREE.Vector3(0, 1, 0);
+      const sink: PitchsideSink = {
+        box: (x, y, z, sx, sy, sz, hex, shade = 1, rotY = 0, tilt) => {
+          this.piece(id, x, y, z, sx, sy, sz, hex, shade, this.pieces,
+            tilt ? tilt.clone() : q.setFromAxisAngle(up, rotY).clone());
+        },
+        glow: (x, y, z, sx, sy, sz, c) => {
+          const m = new THREE.Matrix4().compose(new THREE.Vector3(x, y, z),
+            new THREE.Quaternion(), new THREE.Vector3(sx, sy, sz));
+          this.lamps.push({ m, c: c.clone() });
+        },
+        people: this.benchSpots,
+      };
+      dressPitchside(sink, this.lab.stream(0x9175e), lit, this.hdrLamps);
+      boardHousings(sink, this.boardSegments, 1.0);
+      if (this.ribbonSpans.length) {
+        this.ribbon = new LedRibbon(scene, this.ribbonSpans, lit, this.hdrLamps);
+      }
+      buildCarpets(scene);
+    }
+    this.crowd.seatBench(scene, this.benchSpots);
   }
 
   // ------------------------------------------------------------ floodlights
@@ -1060,7 +1133,9 @@ export class Stadium {
     // a second, much wider and much weaker sprite: the haze the rig throws
     // into the night air, which is what gives a floodlight its size
     const haloMat = flareMat ? flareMat.clone() : null;
-    if (haloMat) haloMat.color.setRGB(0.5, 0.55, 0.72, THREE.LinearSRGBColorSpace);
+    // §7A.4d: dimmer and less blue than it was — four of these at 62m washed
+    // the whole night sky navy; the bowl's own air glow now lives in sky.ts
+    if (haloMat) haloMat.color.setRGB(0.30, 0.33, 0.42, THREE.LinearSRGBColorSpace);
     // ...and the anamorphic streak, on its own texture because a 15:1 sprite
     // wearing the radial flare is an ellipse, not a streak (see TextureLab)
     const streakMat = night && !this.retro ? new THREE.SpriteMaterial({
@@ -1205,6 +1280,7 @@ export class Stadium {
       segments.push({ x: HALF_L + 3, z, rotY: -Math.PI / 2, w });
       segments.push({ x: -(HALF_L + 3), z, rotY: Math.PI / 2, w });
     }
+    this.boardSegments = segments;
     segments.forEach((s, i) => {
       // Each board cycles three messages. The message is drawn TWICE across
       // the texture and each board shows half of it, so a wrapping offset
@@ -1329,6 +1405,7 @@ export class Stadium {
     this.clock += dt;
     for (const u of this.swayUniforms) u.value = this.clock;
     this.crowd.update(dt);
+    this.ribbon?.update(this.clock);
     // the boards actually scroll: the message is drawn twice across the
     // texture and wrapS repeats, so the crawl never tears
     this.adOffset = (this.adOffset + dt * 0.045) % 1;

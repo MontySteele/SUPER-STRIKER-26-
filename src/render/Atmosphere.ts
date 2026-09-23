@@ -21,10 +21,13 @@
 import * as THREE from 'three';
 import { CSM } from 'three/examples/jsm/csm/CSM.js';
 import { Sky, type SkyPreset } from './sky';
-import { SHADOW_LAYER, applyShaderPatches } from './materials';
+import { SHADOW_LAYER, applyShaderPatches, queueShaderPatch, type ShaderPatch } from './materials';
 import type { QualityProfile } from './quality';
 import type { TimeOfDay } from './scene';
-import { effectiveTimeOfDay, weatherProfile, type WeatherProfile } from './weather';
+import {
+  effectiveTimeOfDay, weatherProfile, floodRigEnabled, NIGHT_KEY_DIR, type WeatherProfile,
+} from './weather';
+import { FloodRig } from './floodlights';
 
 /**
  * The broadcast grade (§7A.6c), per preset.
@@ -213,37 +216,55 @@ const PRESETS: Record<TimeOfDay, Preset> = {
     },
   },
   night: {
-    // no sun: the key IS the floodlight rig, high and cool, and the "sky"
-    // is a dim gradient with a moon-sized core so the bowl has a lid
+    // §7A.4d. No sun. The sky is near-black navy with a faint haze glow over
+    // the roof line (the bowl lighting its own air), the key is ONE floodlight
+    // bank — the pylon whose azimuth this is — and the other three are real
+    // SpotLights hung on the pylon heads by the flood rig (floodlights.ts).
+    //
+    // The v1 night was brighter than the day preset: a 2.9 key from almost
+    // straight overhead under a 1.35 exposure lit every roof, every seat and
+    // the pitch equally, and the only thing that said "night" was the LED
+    // boards. What a floodlit broadcast actually shows is a pitch that is the
+    // brightest thing in the frame and a bowl that falls away into the dark
+    // around it — so the exposure comes DOWN (which takes the unlit crowd,
+    // the terraces and the sky down with it) and the light on the pitch is
+    // made back up by lamps that only point at the pitch.
     sky: {
-      zenith: 0x03060f, horizon: 0x0e1c31, ground: 0x05080d,
-      sun: 0xc8d8ff, sunIntensity: 1.4, sunSize: 0.012, haze: 0.4,
+      zenith: 0x010209, horizon: 0x0b1322, ground: 0x030509,
+      // a moon, small and dim: enough to seed a speck of bloom if the crane
+      // ever frames it, not enough to read as a light source
+      sun: 0xc8d8ff, sunIntensity: 0.7, sunSize: 0.010, haze: 0.62,
       sunDir: dir(0.4, 0.5, -0.7), gain: 1.0,
-      // a thin deck, lit from BELOW by the bowl — the orange underglow over a
-      // floodlit ground, which is the one cue that says "night match" from
-      // outside the stadium
+      // a thin deck, lit from BELOW by the bowl
       cloud: 0.22, cloudSharp: 2.0,
-      cloudColor: 0x2c3a58, cloudShadow: 0x0d1424,
+      cloudColor: 0x1a2336, cloudShadow: 0x070b14,
       cloudScale: 1.15, cloudOffset: [5.02, 71.44],
+      bowlGlow: 0x3a4a66, bowlGlowWidth: 7.0,
     },
-    sunDir: dir(-0.3, 0.9, 0.32),
-    keyColor: 0xf0f5ff, keyIntensity: 2.9,
-    hemiSky: 0x24334f, hemiGround: 0x1a2c1c, hemiIntensity: 0.44,
-    bounceColor: 0xffe2b8, bounceIntensity: 0.2, bounceDir: dir(0.5, 0.5, -0.7),
-    fog: 0x070c18, fogNear: 190, fogFar: 580,
-    envIntensity: 0.5,
-    exposure: 1.35,
-    // the floodlight rig is four banks, so nothing under it is ever fully
-    // shadowed — a single-source blackout is what makes a night render look
-    // like a moon landing
+    // the key is the (-x, +z) pylon bank, from its azimuth but much steeper
+    // than the head really is: at the head's true 23 degrees the roof would
+    // throw its line across half the pitch, and even 58 put a roof-shadow
+    // edge through the tele cam's frame — which a floodlit pitch never has.
+    // At 68 it is the short, dense shadow under every man; the three long
+    // faint ones are the decals (floodlights.ts)
+    sunDir: dir(...NIGHT_KEY_DIR),
+    // metal halide: a touch cooler than daylight
+    keyColor: 0xe4ecff, keyIntensity: 1.35,
+    hemiSky: 0x1a2436, hemiGround: 0x15251a, hemiIntensity: 0.30,
+    bounceColor: 0xb8c8b0, bounceIntensity: 0.12, bounceDir: dir(0.5, 0.5, -0.7),
+    fog: 0x05080f, fogNear: 190, fogFar: 580,
+    envIntensity: 0.34,
+    exposure: 1.0,
+    // one bank of four: its shadow takes 70% of ITS light, which is about a
+    // quarter of what is on the pitch — the same as each fake decal takes
     shadowLift: 0.30,
     grade: {
-      contrast: 1.06,
-      lift: [0.003, 0.006, 0.015],
-      gain: [0.985, 1.0, 1.045],
-      saturation: 1.03, vignette: 0.22, chroma: 0.45,
-      shadowTint: [0.90, 0.97, 1.14], highlightTint: [1.02, 1.0, 0.99],
-      bloomStrength: 0.46, bloomThreshold: 1.25,
+      contrast: 1.07,
+      lift: [0.002, 0.004, 0.011],
+      gain: [0.98, 1.0, 1.04],
+      saturation: 0.97, vignette: 0.26, chroma: 0.45,
+      shadowTint: [0.90, 0.97, 1.15], highlightTint: [0.99, 1.0, 1.02],
+      bloomStrength: 0.52, bloomThreshold: 1.2,
     },
   },
 };
@@ -254,10 +275,23 @@ const PRESETS: Record<TimeOfDay, Preset> = {
  * WeatherProfile — which is what keeps "sunset in the rain" a real lighting
  * state rather than a fourth hand-tuned preset nobody maintains.
  */
-function applyWeather(p: Preset, w: WeatherProfile): Preset {
-  if (w.id === 'clear' || w.id === 'night') {
-    return { ...p, shadowLift: Math.max(p.shadowLift, w.shadowLift * 0.9) };
+function applyWeather(p: Preset, wIn: WeatherProfile, tod: TimeOfDay): Preset {
+  if (wIn.id === 'clear' || wIn.id === 'night') {
+    return { ...p, shadowLift: Math.max(p.shadowLift, wIn.shadowLift * 0.9) };
   }
+  // At night the key is a FLOODLIGHT, not the sun: a cloud deck does not dim
+  // it, does not grey it and does not turn the sky into a softbox. Rain at
+  // night is the same lamps through wet air — a little less key, a little
+  // more fill scattered back off the drizzle, and a fog that stays dark.
+  const w: WeatherProfile = tod !== 'night' ? wIn : {
+    ...wIn,
+    key: 0.85 + 0.15 * wIn.key,
+    keyGrey: 0,
+    hemi: 1 + (wIn.hemi - 1) * 0.35,
+    env: 1 + (wIn.env - 1) * 0.3,
+    fogTint: new THREE.Color(wIn.fogTint).multiplyScalar(0.16).getHex(),
+    exposure: 1,
+  };
   const mix = (hex: number, towards: number, t: number): number =>
     new THREE.Color(hex).lerp(new THREE.Color(towards), t).getHex();
   // Overcast daylight is 6500K and flat; the key keeps its own colour only in
@@ -275,7 +309,8 @@ function applyWeather(p: Preset, w: WeatherProfile): Preset {
       // the deck goes the colour of the fog, because under a solid lid the
       // deck IS the fog's light source
       cloudColor: mix(p.sky.cloudColor ?? 0xf2f6fb, w.fogTint, w.fogGrey * 0.8),
-      cloudShadow: mix(p.sky.cloudShadow ?? 0x8fa3ba, 0x555f6b, w.fogGrey * 0.7),
+      cloudShadow: mix(p.sky.cloudShadow ?? 0x8fa3ba, tod === 'night' ? 0x0a0e16 : 0x555f6b,
+        w.fogGrey * 0.7),
     },
     keyColor: mix(p.keyColor, OVERCAST_WHITE, w.keyGrey),
     keyIntensity: p.keyIntensity * w.key,
@@ -326,6 +361,84 @@ const RETRO_PRESETS: Record<TimeOfDay, RetroPreset> = {
   },
 };
 
+/**
+ * §7A.4d. At night the key is a floodlight bank, and a floodlight is AIMED:
+ * it lights the pitch and spills onto the lower tiers, and the roof tops, the
+ * upper tiers and the car park outside get next to nothing. A directional
+ * light lights everything it faces equally — which is how the v1 night rig
+ * came to have sunlit roofs under a black sky — so at night every lit
+ * material has the key scaled by a world-space footprint: 1 over the pitch,
+ * falling away across the stands and with height.
+ *
+ * World position is rebuilt from vViewPosition and three's own viewMatrix
+ * (rigid, so its inverse is a transpose), which keeps this free of uniforms
+ * and of any per-material bookkeeping.
+ */
+const KEY_ANCHOR = /getDirectionalLightInfo\(\s*[\w[\]]+\s*,\s*directLight\s*\);/g;
+/** three's spot-light block, up to the directional one that follows it in
+ *  CSM's chunk. NUM_SPOT_LIGHTS is substituted TEXTUALLY by three before the
+ *  preprocessor runs, so the block has to be cut out, not #undef'd away. */
+const SPOT_BLOCK = /#if \( NUM_SPOT_LIGHTS > 0 \) && defined\( RE_Direct \)[\s\S]*?(?=#if \( NUM_DIR_LIGHTS > 0 \))/;
+
+/** flat turf's replacement for the spot loops (FloodRig.groundMap) */
+interface FloodGround { tex: THREE.Texture; rect: THREE.Vector4 }
+
+/**
+ * `strip` cuts the three spot banks out of a material entirely. Only the
+ * players and the ball keep them — that is where a highlight from more than
+ * one bank is the whole point, and together they are a sliver of the frame.
+ * Everything else (the stands, the goal frames, the dressing) is lit by the
+ * masked key and the fill, which is what a floodlight's spill onto them
+ * looks like anyway; and flat ground takes the banks' exact diffuse from
+ * the baked map (`ground`), so the pools survive at the cost of one tap.
+ */
+function floodPatch(strip: boolean, ground: FloodGround | null): ShaderPatch {
+  return (shader) => {
+    const chunk = THREE.ShaderChunk.lights_fragment_begin;
+    if (!KEY_ANCHOR.test(chunk)) return;
+    KEY_ANCHOR.lastIndex = 0;
+    let body = chunk.replace(KEY_ANCHOR, '$& directLight.color *= ss26KeyMask;');
+    let tail = '';
+    if (strip && SPOT_BLOCK.test(body)) body = body.replace(SPOT_BLOCK, '');
+    else ground = null;
+    if (ground) {
+      shader.uniforms.ss26FloodMap = { value: ground.tex };
+      shader.uniforms.ss26FloodRect = { value: ground.rect };
+      shader.fragmentShader = shader.fragmentShader.replace('#include <common>', /* glsl */`
+        #include <common>
+        uniform sampler2D ss26FloodMap;
+        uniform vec4 ss26FloodRect;
+      `);
+      tail = /* glsl */`
+        reflectedLight.directDiffuse += texture2D( ss26FloodMap,
+          ( ss26W.xz - ss26FloodRect.xy ) * ss26FloodRect.zw ).rgb
+          #ifdef STANDARD
+          * BRDF_Lambert( material.diffuseContribution );
+          #else
+          * BRDF_Lambert( material.diffuseColor );
+          #endif
+      `;
+    }
+    shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_begin>', /* glsl */`
+      vec3 ss26W = transpose( mat3( viewMatrix ) ) * ( - vViewPosition - viewMatrix[ 3 ].xyz );
+      float ss26KeyMask;
+      {
+        // the bowl footprint: pitch + run-off is 1, the front of the stands
+        // is most of it, the back rows and beyond are almost none
+        // (mirrored in weather.ts floodFootprint — keep the two in step)
+        float r = length( vec2( ss26W.x / 64.0, ss26W.z / 45.0 ) );
+        float across = 1.0 - smoothstep( 1.0, 1.75, r );
+        float up = 1.0 - 0.88 * smoothstep( 2.5, 24.0, ss26W.y );
+        ss26KeyMask = max( across * up, 0.06 );
+      }
+      ${body}
+      ${tail}
+    `);
+  };
+}
+const spotPatch = floodPatch(false, null);
+const stripPatch = floodPatch(true, null);
+
 /** How far out the cascades bother to reach. The action lives inside ~150m;
  *  splitting the full 900m camera range would waste two of three cascades on
  *  the empty car park behind the stands. */
@@ -353,6 +466,18 @@ export class Atmosphere {
   private registered = new Set<THREE.Material>();
   private lastFov = 0;
   private lastAspect = 0;
+  /** §7A.4d: the three non-key floodlight banks and the fake criss-cross
+   *  shadows. Only ever built for a non-RETRO scene dressed for night. */
+  private flood: FloodRig | null = null;
+  /** direction TO the key, kept so the flood rig can tell which pylon the
+   *  key stands in for */
+  private keyDir = new THREE.Vector3(0, 1, 0);
+  /** how hard a shadow is in this weather (1 = clear night), for the decals */
+  private shadowScale = 1;
+  /** materials that take the baked ground irradiance instead of the spots */
+  private floodGroundMats = new Set<THREE.Material>();
+  /** materials that keep the real spot banks (players, ball) */
+  private floodSpotMats = new Set<THREE.Material>();
 
   constructor(
     private scene: THREE.Scene,
@@ -393,8 +518,10 @@ export class Atmosphere {
       return;
     }
 
-    const p = applyWeather(PRESETS[tod], this.weather);
+    const p = applyWeather(PRESETS[tod], this.weather, tod);
     this.exposure = p.exposure;
+    this.keyDir.copy(p.sunDir);
+    this.shadowScale = THREE.MathUtils.clamp(1.25 - p.shadowLift, 0.45, 1);
     const g = p.grade;
     this.grade = {
       exposure: p.exposure,
@@ -513,11 +640,40 @@ export class Atmosphere {
     // order is load-bearing: CSM.setupMaterial REPLACES onBeforeCompile, so
     // our own patches have to be hung on top of it afterwards
     this.csm?.setupMaterial(mat);
+    if (this.tod === 'night' && this.csm && floodRigEnabled()) {
+      // see floodPatch: spots on the players and the ball, the baked map on
+      // flat turf, and the masked key alone on everything else
+      const spots = !this.flood || this.floodSpotMats.has(mat);
+      const ground = !spots && this.flood && this.floodGroundMats.has(mat)
+        ? this.flood.groundMap() : null;
+      queueShaderPatch(mat, spots ? spotPatch : ground ? floodPatch(true, ground) : stripPatch);
+      // defines, so a program can never be handed to a material patched the
+      // other way (every patched material's onBeforeCompile has the same
+      // source text, and that is what three keys its program cache on)
+      mat.defines = { ...(mat.defines ?? {}), SS26_FLOOD_KEY: '' };
+      if (!spots) mat.defines.SS26_FLOOD_NOSPOT = '';
+      if (ground) mat.defines.SS26_FLOOD_GROUND = '';
+    }
     if (!this.profile.retro) applyShaderPatches(mat);
   }
 
   /** Walk a subtree and register every material it carries. */
   register(root: THREE.Object3D): void {
+    if (this.flood) {
+      // flat, up-facing planes at pitch level: the pitch, the run-off and
+      // the surround. Classified here because it takes the MESH to know.
+      const n = new THREE.Vector3();
+      root.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh || mesh.geometry?.type !== 'PlaneGeometry'
+          || (mesh as THREE.InstancedMesh).isInstancedMesh) return;
+        mesh.updateWorldMatrix(true, false);
+        n.set(0, 0, 1).transformDirection(mesh.matrixWorld);
+        if (n.y < 0.98 || Math.abs(mesh.matrixWorld.elements[13]) > 0.3) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const m of mats) if (!this.floodSpotMats.has(m)) this.floodGroundMats.add(m);
+      });
+    }
     root.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (!mesh.material) return;
@@ -526,9 +682,53 @@ export class Atmosphere {
     });
   }
 
+  /**
+   * §7A.4d: hang the floodlight banks on the stadium's pylon heads and give
+   * the fake shadows their casters. A no-op unless the scene is dressed for
+   * night on the full rig. Must run BEFORE the first frame draws: the three
+   * SpotLights change every lit material's program, and adding them after the
+   * first compile would recompile the whole scene mid-match.
+   */
+  attachFloodlights(heads: THREE.Vector3[], players: THREE.Object3D[],
+    ball: THREE.Object3D | null): void {
+    if (this.profile.retro || this.tod !== 'night' || heads.length < 2 || this.flood) return;
+    if (!floodRigEnabled()) return;
+    // the key stands in for the bank whose azimuth it shares
+    const kx = this.keyDir.x, kz = this.keyDir.z;
+    let keyHead = 0, best = -Infinity;
+    heads.forEach((h, i) => {
+      const d = (h.x * kx + h.z * kz) / Math.max(1e-3, Math.hypot(h.x, h.z));
+      if (d > best) { best = d; keyHead = i; }
+    });
+    this.flood = new FloodRig(this.scene, {
+      heads,
+      keyHead,
+      color: new THREE.Color(0xeef3ff),
+      // rain scatters the banks a little; the fill takes it back
+      intensity: 185 * (0.85 + 0.15 * this.weather.key),
+      decay: 1.2,
+      shadowStrength: 0.20 * this.shadowScale,
+    });
+    this.flood.setCasters(players, ball);
+    // the shell turf and the divots are ground too, found through the
+    // handles grass.ts and divots.ts publish on the scene
+    for (const key of ['ss26Grass', 'ss26Divots']) {
+      const gm = (this.scene.userData[key] as { mesh?: THREE.Mesh } | undefined)?.mesh?.material;
+      if (gm) for (const m of Array.isArray(gm) ? gm : [gm]) this.floodGroundMats.add(m);
+    }
+    // the players and the ball keep the real banks
+    for (const o of ball ? [...players, ball] : players) {
+      o.traverse((obj) => {
+        const m = (obj as THREE.Mesh).material;
+        if (m) for (const x of Array.isArray(m) ? m : [m]) this.floodSpotMats.add(x);
+      });
+    }
+  }
+
   /** Called once per drawn frame, before the composer runs. */
   update(): void {
     if (this.sky) this.sky.follow(this.camera);
+    this.flood?.update();
     if (!this.csm) return;
     // the capture harness re-poses the camera (and sometimes its fov) between
     // draws; cascades split on the projection, so they have to be rebuilt
@@ -553,6 +753,10 @@ export class Atmosphere {
    * to free, and a tournament builds one of these per match.
    */
   dispose(): void {
+    if (this.flood) {
+      this.flood.dispose();
+      this.flood = null;
+    }
     if (this.csm) {
       for (const light of this.csm.lights) light.shadow.dispose();
       this.csm.remove();
@@ -578,5 +782,7 @@ export class Atmosphere {
     this.hemi.dispose();
     this.scene.environment = null;
     this.registered.clear();
+    this.floodGroundMats.clear();
+    this.floodSpotMats.clear();
   }
 }

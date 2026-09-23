@@ -169,3 +169,89 @@ export function floodlightsLit(tod: TimeOfDay, w: Weather = weatherSetting()): b
   return effectiveTimeOfDay(tod, w) === 'night' || PROFILES[w].floodlights
     || (w === 'overcast' && tod !== 'day');
 }
+
+// ------------------------------------------------------ the floodlit night
+//
+// §7A.4d. The lighting signal every UNLIT stand consumer (the crowd, the
+// terrace shading, the impostor tints) should take at night, so the bowl
+// falls away around the pitch by the same rule the lit materials use. The
+// lit side of this lives in Atmosphere (the key footprint patch) and
+// floodlights.ts (the three spot banks and the fake shadows).
+
+let floodRig: boolean | null = null;
+
+/**
+ * `?flood=0` builds the night WITHOUT the §7A.4d floodlight rig (no spot
+ * banks, no fake shadows, no key footprint) — the preset numbers stay. It
+ * exists for one job: a same-tree A/B of the rig's cost on the real GPU,
+ * `npm run app:bench -- --query "weather=night&flood=0"` against
+ * `--query weather=night`.
+ */
+export function floodRigEnabled(): boolean {
+  if (floodRig === null) {
+    try {
+      floodRig = new URLSearchParams(location.search).get('flood') !== '0';
+    } catch { floodRig = true; }
+  }
+  return floodRig;
+}
+
+/** Direction TO the night key (the (-x, +z) pylon bank, steepened to 68°). */
+export const NIGHT_KEY_DIR: readonly [number, number, number] = (() => {
+  const v = [-0.295, 0.927, 0.23];
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l] as const;
+})();
+
+/**
+ * How much of the floodlight key reaches a point, 0.06..1. Mirrors the
+ * GLSL footprint in Atmosphere.ts exactly: 1 over the pitch and run-off,
+ * falling away across the stands (an ellipse 64m x 45m out to 1.75x that)
+ * and with height (a floodlight is aimed DOWN at the pitch; the back rows
+ * and the roof get its spill, not its beam). Cheap enough to bake per fan.
+ */
+export function floodFootprint(x: number, y: number, z: number): number {
+  const ss = (a: number, b: number, t: number): number => {
+    const k = Math.min(1, Math.max(0, (t - a) / (b - a)));
+    return k * k * (3 - 2 * k);
+  };
+  const r = Math.hypot(x / 64, z / 45);
+  const across = 1 - ss(1.0, 1.75, r);
+  const up = 1 - 0.88 * ss(2.5, 24.0, y);
+  return Math.max(across * up, 0.06);
+}
+
+/** Linear-radiance lighting for an unlit stand at night (crowd.ts shape). */
+export interface StandLight {
+  /** direction TO the key */
+  keyDir: [number, number, number];
+  /** key radiance; scale it per fan by floodFootprint() */
+  key: [number, number, number];
+  /** hemisphere top / bottom. `ground` is high on purpose: the brightest
+   *  thing in a floodlit bowl is the pitch, and it bounces onto every face
+   *  that looks at it */
+  sky: [number, number, number];
+  ground: [number, number, number];
+}
+
+/**
+ * The night stand light, with the weather already folded in the NIGHT way:
+ * rain at night dims the floodlights a little and scatters a little more
+ * into the fill — it does not collapse the key to a fifth the way it does
+ * the sun (never multiply a night key by WeatherProfile.key directly).
+ *
+ * Tuned against the §7A.4d rig at exposure 1.0 so the front rows sit about a
+ * stop under the pitch and the back rows two, dimmer than the v1 night crowd
+ * (which was lit like a day crowd under a 1.35 exposure).
+ */
+export function nightStandLight(w: Weather = weatherSetting()): StandLight {
+  const p = PROFILES[w];
+  const keyK = 0.85 + 0.15 * p.key;
+  const fillK = 1 + (p.hemi - 1) * 0.35;
+  return {
+    keyDir: [...NIGHT_KEY_DIR],
+    key: [0.30 * keyK, 0.32 * keyK, 0.37 * keyK],
+    sky: [0.10 * fillK, 0.11 * fillK, 0.15 * fillK],
+    ground: [0.17 * fillK, 0.19 * fillK, 0.18 * fillK],
+  };
+}

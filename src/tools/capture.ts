@@ -14,6 +14,7 @@ import { GameRenderer, skinnedPlayersWanted } from '../render/gameRenderer';
 import { Presentation } from '../present/director';
 import type { CamMode } from '../render/camera';
 import { preloadCharacters } from '../render/characterAssets';
+import { preloadCrowd } from '../render/crowd';
 import { forceQuality, type QualityLevel } from '../render/quality';
 import { forceWeather, type Weather } from '../render/weather';
 import type { TimeOfDay } from '../render/scene';
@@ -289,6 +290,7 @@ export async function runCapture(canvas: HTMLCanvasElement, shotName: string): P
     // back to capsules and the shot silently measures the wrong pipeline — so
     // this await is load-bearing, not politeness.
     if (skinnedPlayersWanted()) await preloadCharacters();
+    await preloadCrowd();   // crowd v2 atlas: never shoot an empty stand
 
     // both seats null = CPU vs CPU = the sim is a pure function of the seed
     const match = new Match({

@@ -1,0 +1,66 @@
+{
+ "cols": 12,
+ "rows": 10,
+ "cellW": 160,
+ "cellH": 320,
+ "cardW": 1.15,
+ "cardH": 2.3,
+ "foot": 0.05,
+ "tilt": 7.0,
+ "poses": [
+  "idle",
+  "idle_b",
+  "clap_open",
+  "clap_shut",
+  "arms_up",
+  "arms_v",
+  "fist",
+  "scarf_up",
+  "dismay",
+  "seated",
+  "seated_b",
+  "seated_fist"
+ ],
+ "bodies": [
+  {
+   "name": "m_jacket",
+   "scarf": true
+  },
+  {
+   "name": "m_denim",
+   "scarf": true
+  },
+  {
+   "name": "m_tee",
+   "scarf": false
+  },
+  {
+   "name": "m_old_jumper",
+   "scarf": true
+  },
+  {
+   "name": "m_check",
+   "scarf": false
+  },
+  {
+   "name": "m_replica",
+   "scarf": true
+  },
+  {
+   "name": "f_tee",
+   "scarf": true
+  },
+  {
+   "name": "f_jumper",
+   "scarf": false
+  },
+  {
+   "name": "m_heavy",
+   "scarf": true
+  },
+  {
+   "name": "f_bob",
+   "scarf": true
+  }
+ ]
+}

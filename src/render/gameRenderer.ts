@@ -306,6 +306,12 @@ export class GameRenderer {
     // non-CSM branch and receives the sun once PER CASCADE. Anything added
     // after this point (confetti, the ball trail, the star rings) is
     // unlit/basic and deliberately stays out of it.
+    // §7A.4d: at night the other three pylon banks become real lights (and the
+    // players' fake criss-cross shadows) — before the first compile, so the
+    // spot count is in every program from the start
+    this.sceneMgr.atmos.attachFloodlights(
+      this.stadium.floodlightHeads.map((h) => h.position),
+      this.playerMeshes.map((pm) => pm.root), this.ballMesh.root);
     this.sceneMgr.atmos.register(this.sceneMgr.scene);
 
     // §7A.4c weather: one instanced, camera-relative, seeded particle system,

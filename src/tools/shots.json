@@ -520,6 +520,49 @@
       "cam": "director"
     },
     {
+      "name": "weather_night_establishing",
+      "note": "NIGHT (\u00a77A.4c). The national bowl from a high corner under weather=night: near-black sky with the bowl's haze glow over the roof line, the four pylon heads blooming, the pitch the brightest thing in frame with its pools under the pylons, and the roofs and upper tiers falling away into the dark.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "day",
+      "weather": "night",
+      "stadium": "national",
+      "cam": { "pos": [118, 52, 96], "look": [0, 4, 0], "fov": 42 }
+    },
+    {
+      "name": "weather_night_closeup",
+      "note": "NIGHT. celebration_closeup's goal on the national bowl under weather=night, from higher and further out so the turf around his boots is in frame: the signature floodlit criss-cross of 3-4 faint soft shadows, and specular on the kit and skin from more than one lamp bank.",
+      "seed": 22343,
+      "home": "cze",
+      "away": "ger",
+      "frames": 0,
+      "seek": {
+        "playerAnim": "celebrate",
+        "playerAnimT": 2.6
+      },
+      "timeOfDay": "day",
+      "weather": "night",
+      "stadium": "national",
+      "cam": "keeper",
+      "camFacing": true,
+      "camOffset": [7.5, 4.2, 2.0],
+      "camAim": 0.6
+    },
+    {
+      "name": "weather_rain_night",
+      "note": "WEATHER. tele_midfield in rain with a NIGHT kickoff: the rain weather composed over the floodlit rig, so the streaks catch the lamps and the wet turf mirrors the pylon banks. The rain+night combination check.",
+      "seed": 12648430,
+      "home": "cze",
+      "away": "ger",
+      "frames": 600,
+      "timeOfDay": "night",
+      "weather": "rain",
+      "stadium": "national",
+      "cam": "director"
+    },
+    {
       "name": "weather_clear_sky",
       "note": "SKY (§7A.4c). A high corner of the national bowl tipped up at the cloud deck, so the procedural (seeded) clouds, their perspective foreshortening toward the horizon and the horizon band itself are the subject rather than an edge of the frame.",
       "seed": 12648430,

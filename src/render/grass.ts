@@ -48,9 +48,10 @@
 // ball is IN the grass instead of on a picture of it.
 
 import * as THREE from 'three';
-import { PITCH_LENGTH, PITCH_WIDTH } from '../sim/constants';
+import { HALF_L, PITCH_LENGTH, PITCH_WIDTH } from '../sim/constants';
 import { PITCH_MARGIN, SHELL_TILE_M, type TextureLab } from './TextureLab';
 import { queueShaderPatch } from './materials';
+import { TURF_PARS_GLSL } from './turf';
 import type { QualityProfile } from './quality';
 
 /** Mown match turf: 25-30mm. 42mm is a slightly generous read of that, which
@@ -224,6 +225,7 @@ export class GrassField {
       ss26ShellScale: { value: 1 / SHELL_TILE_M },
       ss26PitchSpan: { value: new THREE.Vector2(PITCH_SPAN_X, PITCH_SPAN_Y) },
       ss26StripeK: { value: Math.PI / stripePeriod },
+      ss26HalfPitch: { value: new THREE.Vector2(HALF_L, PITCH_WIDTH / 2) },
       ss26GrassH: { value: GRASS_H },
       ss26Time: { value: 0 },
       ss26Fade: { value: new THREE.Vector2(this.radius * FADE_FRACTION, this.radius) },
@@ -505,6 +507,8 @@ const FRAG_PARS = /* glsl */ `
   uniform sampler2D ss26Shell;
   uniform float ss26StripeK;
   uniform vec4 ss26Ball;
+  uniform vec2 ss26HalfPitch;
+  ${TURF_PARS_GLSL}
 
   varying float ss26vShell;
   varying float ss26vFade;
@@ -528,6 +532,11 @@ const FRAG_PARS = /* glsl */ `
     float w = max( fwidth( s ) * 1.2, 0.012 );
     return smoothstep( -w, w, s ) * 2.0 - 1.0;
   }
+  // ...and so is the fade of the pattern past the lines (pitch.ts)
+  float ss26StripeAmp() {
+    vec2 past = abs( ss26vWorld.xz ) - ss26HalfPitch;
+    return 1.0 - smoothstep( 1.2, 2.8, max( past.x, past.y ) );
+  }
 
 `;
 
@@ -548,7 +557,7 @@ const FRAG_PARS = /* glsl */ `
 const FRAG_DISCARD = /* glsl */ `
   ss26Blade = texture2D( ss26Shell, ss26vShellUv );
   if ( ss26Blade.r < ss26vShell + ss26vFade * 1.15 ) discard;
-  ss26Ph = ss26StripePhase();
+  ss26Ph = ss26StripePhase() * ss26StripeAmp();
   ss26View = normalize( cameraPosition - ss26vWorld );
 `;
 
@@ -579,6 +588,8 @@ const FRAG_MAP = /* glsl */ `
     vec2 ss26Dy = dFdy( vMapUv ) * ss26TexPx;
     float ss26Lod = 0.5 * log2( max( max( dot( ss26Dx, ss26Dx ), dot( ss26Dy, ss26Dy ) ), 1.0 ) );
     diffuseColor *= textureLod( map, vMapUv, ss26Lod );
+    // the plane's own grade and paint treatment (turf.ts)
+    diffuseColor.rgb = ss26TurfGrade( diffuseColor.rgb );
   }
 `;
 
@@ -598,8 +609,10 @@ const FRAG_COLOR = /* glsl */ `
 
     // ---- the mowing stripe, byte-for-byte the pitch's own treatment
     float ss26Graze = 1.0 - abs( ss26View.y );
-    float ss26Into = -ss26View.x * ss26Ph;
-    float ss26Stripe = 1.0 + ss26Ph * 0.030 + ss26Into * ss26Graze * 0.085;
+    // lean along Z, the mower's direction of travel — see pitch.ts
+    float ss26Into = -ss26View.z * ss26Ph;
+    float ss26Band = ss26Ph * 0.045 + ss26Into * ( 0.05 + ss26Graze * 0.12 );
+    vec3 ss26Stripe = 1.0 + ss26Band * vec3( 1.12, 1.0, 0.70 );
 
     // ---- the ball sitting IN the grass, not on it
     float ss26Grounded = 1.0 - smoothstep( 0.05, 0.85, ss26Ball.y );
@@ -644,7 +657,7 @@ const FRAG_NORMAL = /* glsl */ `
     normal = normalize( normal + ss26LeanV * ( 34.0 * ss26vShell ) );
     // ...plus the mowing lean, so a stripe reads across the turf and the plane
     // with one continuous shading gradient
-    vec3 ss26Axis = normalize( ( viewMatrix * vec4( 1.0, 0.0, 0.0, 0.0 ) ).xyz );
+    vec3 ss26Axis = normalize( ( viewMatrix * vec4( 0.0, 0.0, 1.0, 0.0 ) ).xyz );
     normal = normalize( normal + ss26Axis * ( ss26Ph * 0.20 ) );
   }
 `;
