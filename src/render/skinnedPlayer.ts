@@ -38,7 +38,7 @@
 import * as THREE from 'three';
 import type { PlayerData } from '../data/types';
 import type { ActionAnim } from '../sim/player';
-import { findBone, LOCO_CHAIN, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
+import { CLIP_TABLE, findBone, outfieldChain, GK_CHAIN, GK_SIDESTEP, type CharacterInstance, type CharacterRig,
   type ClipId, type PreparedClip } from './characterAssets';
 import type { KitSpec } from './playerMesh';
 
@@ -419,7 +419,7 @@ export class SkinnedPlayerMesh {
       .map((id) => this.entry(id))
       .filter((e): e is LocoEntry => e !== null)
       .sort((a, b) => a.speed - b.speed);
-    this.chainOutfield = chain(LOCO_CHAIN);
+    this.chainOutfield = chain(outfieldChain(hashStr(data.name + 'gait')));
     this.chainKeeper = chain(GK_CHAIN);
     this.entry(GK_SIDESTEP.left);
     this.entry(GK_SIDESTEP.right);
@@ -450,8 +450,14 @@ export class SkinnedPlayerMesh {
     const pc = this.rig.clip(id);
     if (!pc) return null;
     const e: LocoEntry = {
-      id, action: this.loop(pc), speed: pc.groundSpeed, dur: pc.clip.duration, w: 0,
+      // one stride CYCLE, which is what every phase calculation means by dur
+      id, action: this.loop(pc), speed: pc.groundSpeed,
+      dur: pc.clip.duration / Math.max(1, CLIP_TABLE[id].cycles ?? 1), w: 0,
     };
+    // His own point in every cycle. Clips pick up phase from the one they
+    // blend out of, so without this a squad leaving the same idle on the same
+    // frame (kickoff) strides in perfect unison for as long as it runs.
+    e.action.time = ((hashStr(`${this.data.name}|${id}`) % 1000) / 1000) * e.dur;
     this.locoById.set(id, e);
     return e;
   }

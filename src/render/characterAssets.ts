@@ -106,10 +106,16 @@ export interface ClipSpec {
   yawAtContact?: number;
   /** hand-set natural ground speed (m/s); otherwise measured from the hips. */
   groundSpeed?: number;
+  /** stride cycles in the clip (default 1). A locomotion blend keeps two
+   *  clips in step by their phase through ONE cycle, so a clip that loops
+   *  twice has to say so or it runs against its partner at half cadence. */
+  cycles?: number;
 }
 
 export type ClipId =
   | 'idle' | 'trudge' | 'walk' | 'jog' | 'run' | 'sprint'
+  // per-player alternates for the fast end of the chain (see outfieldChain)
+  | 'runB' | 'runC' | 'sprintB' | 'sprintC'
   | 'gkIdle' | 'gkHold' | 'gkStepL' | 'gkStepR' | 'gkGetUp'
   | 'gkThrow' | 'gkPunt'
   | 'kickA' | 'kickB' | 'kickC' | 'kickD' | 'header' | 'trap'
@@ -153,8 +159,21 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
   trudge: { anim: ['mx_Walking_Forward_In_A_Sad_Disposition', 'mx_Careful_Walk', 'cmu_16_33'] },
   walk: { anim: ['mx_Walking_Forward', 'mx_Walking', 'cmu_16_15'] },
   jog: { anim: ['mx_Soccer_Jog_Forward', 'mx_Jogging', 'cmu_16_21'] },
-  run: { anim: ['mx_Running_Forwards', 'mx_Running_Forward_Quickly', 'cmu_16_45'] },
-  sprint: { anim: ['mx_Sprinting_Forward', 'mx_Running_With_Intention'] },
+  // The run and sprint used to be mx_Running_Forwards and mx_Sprinting_Forward,
+  // and both retargeted with the ARMS FROZEN: one hand held up by the ear on
+  // the run, both arms locked straight back on the sprint — twenty men
+  // Naruto-running at kickoff. Filmstrip every candidate before promoting it
+  // (npm run shoot-model -- --clip <name> --frames 6 --angle side); two more
+  // (mx_Running_Forward, mx_Sprinting) are single-frame exports and useless.
+  run: { anim: ['mx_Standard_Running', 'mx_Running_Forward_Quickly', 'cmu_16_45'] },
+  sprint: { anim: ['mx_Standard_Sprint', 'mx_Full_Speed_Sprint_For_Two_Cycles', 'mx_Running_With_Intention'] },
+  // ...and the alternates, so a squad breaking at kickoff is several gaits
+  // rather than one. Each falls back to its base clip's first choice.
+  // (mx_Jogging was tried as a second jog: a low shuffle, three strides long.)
+  runB: { anim: ['mx_Running_Forward_Quickly', 'mx_Standard_Running'] },
+  runC: { anim: ['mx_Medium_Speed_Running', 'mx_Standard_Running'] },
+  sprintB: { anim: ['mx_Full_Speed_Sprint_For_Two_Cycles', 'mx_Standard_Sprint'], cycles: 2 },
+  sprintC: { anim: ['mx_Running_Fast', 'mx_Standard_Sprint'] },
 
   // --- the keeper. `idle` above is an OUTFIELD idle: a crouched, on-the-toes
   // ready stance, which is exactly right for a keeper facing a shot and
@@ -332,6 +351,20 @@ export const CLIP_TABLE: Record<ClipId, ClipSpec> = {
  * which is the thing that stops the feet skating.
  */
 export const LOCO_CHAIN: ClipId[] = ['idle', 'trudge', 'walk', 'jog', 'run', 'sprint'];
+
+const RUNS: ClipId[] = ['run', 'runB', 'runC'];
+const SPRINTS: ClipId[] = ['sprint', 'sprintB', 'sprintC'];
+
+/**
+ * One outfielder's own LOCO_CHAIN: the same slow end, and a run and a sprint
+ * picked off `seed` (a hash of his name, so he runs the same way all match
+ * and every replay). Nine combinations across a squad of eleven.
+ */
+export function outfieldChain(seed: number): ClipId[] {
+  const s = Math.abs(seed | 0);
+  return ['idle', 'trudge', 'walk', 'jog',
+    RUNS[s % RUNS.length], SPRINTS[Math.floor(s / RUNS.length) % SPRINTS.length]];
+}
 
 /**
  * The keeper's chain when the sim says he is not under threat: a standing
