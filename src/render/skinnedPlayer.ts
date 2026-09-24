@@ -814,6 +814,28 @@ export class SkinnedPlayerMesh {
       e.action.setEffectiveWeight(w);
       e.action.setEffectiveTimeScale(i === 0 ? 1 : rate);
     }
+
+    // Two MOVING clips in the blend (walk+jog, jog+run...) have to take their
+    // steps together. Their cycles are different lengths — a 1.37s walk
+    // against a 0.83s jog — so playing both at one rate lets them drift a
+    // half-step apart within a second, and a 66/34 average of a walk's
+    // straight leg and a jog's bent one at unrelated points of the gait is a
+    // crouched shuffle with the feet skating (the walkout, which spends the
+    // whole walk mid-blend, showed it worst). So both advance through their
+    // cycles at ONE rate, the one that makes the blended stride cover the
+    // real ground speed, and the lighter clip is pinned to the heavier one's
+    // phase so nothing can drift. The idle has no stride and keeps its own
+    // clock; an idle-plus-one-mover blend comes out exactly as before.
+    if (lo !== hi && loA.speed > 1e-3 && loA.w >= 1e-3 && loB.w >= 1e-3) {
+      const wSum = loA.w + loB.w;
+      const stride = (loA.w * loA.speed * loA.dur + loB.w * loB.speed * loB.dur) / wSum;
+      const cycles = locoSpeed / Math.max(stride, 1e-3);
+      for (const e of [loA, loB]) {
+        e.action.setEffectiveTimeScale(THREE.MathUtils.clamp(cycles * e.dur, RATE_MIN, RATE_MAX));
+      }
+      const [lead, follow] = loA.w >= loB.w ? [loA, loB] : [loB, loA];
+      follow.action.time = ((lead.action.time % lead.dur) / lead.dur) * follow.dur;
+    }
   }
 
   // ------------------------------------------------------ cutscene actor API

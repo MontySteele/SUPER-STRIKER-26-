@@ -2136,6 +2136,75 @@ function queueKitShorts(mat: THREE.MeshStandardMaterial, shortsTex: THREE.Textur
   });
 }
 
+/** `?hairclear=0`: leave the hair where the face morph put it (A/B). */
+const HAIR_NO_CLEAR = typeof location !== 'undefined' && /[?&]hairclear=0/.test(location.search);
+/** How far outside the scalp every hair vertex must sit, metres. The body is
+ *  ~1.5cm between head vertices, so a vertex's tangent plane under-reads a
+ *  convex skull between them by a couple of millimetres; this covers that. */
+const HAIR_CLEARANCE = 0.005;
+
+/**
+ * Push a haircut back out of the skull it is sitting on.
+ *
+ * The face pool reshapes the head per player (twelve variants of head shape
+ * a body), and it carries deltas for the hair too — but the hair's were
+ * fitted to the cap, not to the skull underneath, and on a rounder or taller
+ * variant the crown rises straight through a short cut's cap. What you see
+ * is skin where the hair should be: a bald spot, differently placed per head.
+ *
+ * So once both are morphed, every hair vertex is checked against the nearest
+ * scalp vertex and, if it is inside the skull or within HAIR_CLEARANCE of it,
+ * moved out along that vertex's normal. Hair that already clears the scalp
+ * (the long tail of a cut, anything off the head) is untouched. A spatial
+ * hash over the head vertices keeps it to a few ms a squad.
+ */
+function clearHairOfSkull(body: THREE.BufferGeometry, hair: THREE.BufferGeometry): void {
+  const bp = body.getAttribute('position') as THREE.BufferAttribute;
+  const bn = body.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  const hp = hair.getAttribute('position') as THREE.BufferAttribute;
+  if (!bn) return;
+  hair.computeBoundingBox();
+  const box = hair.boundingBox!.clone().expandByScalar(0.03);
+  const CELL = 0.02;
+  const cells = new Map<string, number[]>();
+  const key = (x: number, y: number, z: number): string =>
+    `${Math.floor(x / CELL)},${Math.floor(y / CELL)},${Math.floor(z / CELL)}`;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < bp.count; i++) {
+    v.fromBufferAttribute(bp, i);
+    if (!box.containsPoint(v)) continue;
+    const k = key(v.x, v.y, v.z);
+    const list = cells.get(k);
+    if (list) list.push(i); else cells.set(k, [i]);
+  }
+  if (!cells.size) return;
+  let moved = 0;
+  for (let i = 0; i < hp.count; i++) {
+    const x = hp.getX(i), y = hp.getY(i), z = hp.getZ(i);
+    const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL), cz = Math.floor(z / CELL);
+    let best = -1, bestD = Infinity;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+      const list = cells.get(`${cx + dx},${cy + dy},${cz + dz}`);
+      if (!list) continue;
+      for (const j of list) {
+        const d = (bp.getX(j) - x) ** 2 + (bp.getY(j) - y) ** 2 + (bp.getZ(j) - z) ** 2;
+        if (d < bestD) { bestD = d; best = j; }
+      }
+    }
+    if (best < 0) continue;
+    const nx = bn.getX(best), ny = bn.getY(best), nz = bn.getZ(best);
+    const out = (x - bp.getX(best)) * nx + (y - bp.getY(best)) * ny + (z - bp.getZ(best)) * nz;
+    if (out >= HAIR_CLEARANCE) continue;
+    const push = HAIR_CLEARANCE - out;
+    hp.setXYZ(i, x + nx * push, y + ny * push, z + nz * push);
+    moved++;
+  }
+  if (moved) {
+    hp.needsUpdate = true;
+    hair.computeBoundingSphere();
+  }
+}
+
 /** Which garment a mesh is, tolerant of the asset pipeline renaming things
  *  underneath us: the mesh name and the material name both get a look. */
 const nameOf = (m: THREE.Mesh): string => {
@@ -3350,6 +3419,8 @@ export class CharacterRig {
     // anything is dressed: the geometry swap is cheap (two arrays), and the
     // three cuts he is not wearing have to go before they cost a draw call.
     const drop: THREE.Object3D[] = [];
+    let body: THREE.SkinnedMesh | null = null;
+    let hair: THREE.SkinnedMesh | null = null;
     root.traverse((obj) => {
       const mesh = obj as THREE.SkinnedMesh;
       if (!mesh.isSkinnedMesh) return;
@@ -3360,8 +3431,23 @@ export class CharacterRig {
       }
       const fm = arch.faces ? arch.faceMaps.get(sane) : undefined;
       if (fm && !NO_FACES_DEBUG) mesh.geometry = morphGeometry(fm, arch.faces!, look.variant);
+      if (arch.faces && sane === saneName(arch.faces.file.name)) body = mesh;
+      if (sane === look.hair) hair = mesh;
     });
     for (const d of drop) d.removeFromParent();
+    // the face variant reshapes the skull, and on some head/cut pairs the
+    // crown comes up THROUGH the hair cap: a bald spot. See clearHairOfSkull.
+    if (body && hair && !NO_FACES_DEBUG && !HAIR_NO_CLEAR) {
+      const b = body as THREE.SkinnedMesh, h = hair as THREE.SkinnedMesh;
+      if (b.bindMatrix.equals(h.bindMatrix)) {
+        if (!arch.faceMaps.has(saneName(h.name))) {
+          // not morphed, so still the archetype's shared geometry: copy first
+          h.geometry = h.geometry.clone();
+          this.owned.push(h.geometry);
+        }
+        clearHairOfSkull(b.geometry, h.geometry);
+      }
+    }
 
     // SkeletonUtils.clone() gives every SkinnedMesh its OWN Skeleton, and a
     // Skeleton is a bone texture: ten meshes a player, twenty-two players, two
